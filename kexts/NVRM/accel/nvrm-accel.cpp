@@ -2963,7 +2963,7 @@ static bool nvAccelRestoreParkedForDirty(NVResource *res, NVVidMemory *vm, unsig
 {
     if (!res || !vm || !vm->fOwner || vm->fOwner->fDirect) return false;
     if (vm->fBacking) return true;
-    if (!vm->fParked || plane > 15 || vm->getLength() > vm->fParked->fReceipt.actualSize) return false;
+    if (!vm->fParked || plane > 15 || static_cast<IOAccelMemory *>(vm)->getLength() > vm->fParked->fReceipt.actualSize) return false;
     const NVBackingKey key = vm->fParked->key();
     _ZN16IOAccelVidMemory4wireEv(vm);
     return vm->fBacking && !vm->fParked && nvBackingKeyEqual(key, vm->fBacking->key());
