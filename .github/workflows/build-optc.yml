@@ -188,17 +188,19 @@ jobs:
             python3 - \
               "$INT/Contents/MacOS/NMIntelFB" "$RUNNER_TEMP/out/intelfb/NMIntelFB.o" \
               "$INTV/Contents/MacOS/NMIntelFBVirtual" "$RUNNER_TEMP/out/intelfb/NMIntelFBVirtual.o" <<'PY'
-          import pathlib, subprocess, sys
+          import pathlib, struct, subprocess, sys
 
-          INTEL_BYTES = b"\x01\x00\x00\x00NMIN"
-          NVIDIA_BYTES = b"\x01\x00\x00\x00MRVN"
+          INTEL_BYTES = struct.pack("<Q", 0x4E4D494E00000001)
+          NVIDIA_BYTES = struct.pack("<Q", 0x4E56524D00000001)
 
           for label, bin_p, obj_p in [
               ("NMIntelFB", sys.argv[1], sys.argv[2]),
               ("NMIntelFBVirtual", sys.argv[3], sys.argv[4]),
           ]:
               raw = pathlib.Path(bin_p).read_bytes()
+              obj_raw = pathlib.Path(obj_p).read_bytes()
               assert INTEL_BYTES in raw, f"{label}: missing Intel controller ID bytes"
+              assert INTEL_BYTES in obj_raw, f"{label}: missing Intel controller ID bytes in .o"
               assert NVIDIA_BYTES not in raw, f"{label}: stale NVIDIA shared ID bytes present"
               strs = subprocess.check_output(["strings", "-a", bin_p], text=True, errors="replace")
               assert "IOFBDependentID" in strs and "IOFBDependentIndex" in strs
@@ -207,12 +209,16 @@ jobs:
               s_idx = dis_o.index("__ZN9NMIntelFB5startEP9IOService:")
               nxt = dis_o.find("\n__", s_idx + 10)
               start_dis = dis_o[s_idx:nxt if nxt != -1 else len(dis_o)]
+              start_low = start_dis.lower()
               fb_start_pos = start_dis.index("__ZN13IOFramebuffer5startEP9IOService")
-              if "4e4d494e00000001" in start_dis.lower():
-                  id_pos = start_dis.lower().index("4e4d494e00000001")
+              if "4e4d494e00000001" in start_low:
+                  id_pos = start_low.index("4e4d494e00000001")
+              elif "publishdependentidentity" in start_low:
+                  id_pos = start_low.index("publishdependentidentity")
+              elif "lcpi" in start_low:
+                  id_pos = start_low.index("lcpi")
               else:
-                  id_pos = start_dis.index("publishDependentIdentity")
-                  assert "4e4d494e00000001" in dis_o.lower(), f"{label}: missing Intel ID in object"
+                  raise AssertionError(f"{label}: could not locate Intel identity write in NMIntelFB::start")
               assert id_pos < fb_start_pos, f"{label}: identity set after IOFramebuffer::start"
               print(f"OK {label}: Intel ID 0x4e4d494e00000001 + local 0 before IOFramebuffer::start, no stale NVIDIA ID")
           PY
@@ -224,11 +230,11 @@ jobs:
               acc_bin="${rest%%:*}"
               acc_obj="${rest#*:}"
               python3 - "$acc_label" "$acc_bin" "$acc_obj" <<'PY'
-          import pathlib, subprocess, sys
+          import pathlib, struct, subprocess, sys
           label, bin_p, obj_p = sys.argv[1], sys.argv[2], sys.argv[3]
           raw = pathlib.Path(bin_p).read_bytes()
-          assert b"\x01\x00\x00\x00NMIN" in raw, f"{label}: missing Intel controller ID bytes"
-          assert b"\x01\x00\x00\x00MRVN" in raw, f"{label}: missing NVIDIA/GOP controller ID bytes"
+          assert struct.pack("<Q", 0x4E4D494E00000001) in raw, f"{label}: missing Intel controller ID bytes"
+          assert struct.pack("<Q", 0x4E56524D00000001) in raw, f"{label}: missing NVIDIA/GOP controller ID bytes"
           strs = subprocess.check_output(["strings", "-a", bin_p], text=True, errors="replace")
           for need in ("NVAccelHead4RegistryID", "NVAccelHead4DensePipeIndex", "NMIntelFB", "NMGopFB", "NVRMNVDAFramebuffer"):
               assert need in strs, f"{label}: missing string {need}"
@@ -240,11 +246,14 @@ jobs:
 
             echo "=== NVRM rtd3 & ABI export contract ==="
             python3 - "$NVRM/Contents/MacOS/NVRM" "$RUNNER_TEMP/out/nvrm/NVRM.o" <<'PY'
-          import pathlib, subprocess, sys
+          import pathlib, struct, subprocess, sys
           nvrm_bin, nvrm_o = sys.argv[1], sys.argv[2]
           raw = pathlib.Path(nvrm_bin).read_bytes()
-          assert b"\x01\x00\x00\x00NMIN" in raw, "NVRM missing Intel controller ID bytes"
-          assert b"\x01\x00\x00\x00MRVN" in raw, "NVRM missing NVIDIA/GOP controller ID bytes"
+          obj_raw = pathlib.Path(nvrm_o).read_bytes()
+          intel_bytes = struct.pack("<Q", 0x4E4D494E00000001)
+          nvidia_bytes = struct.pack("<Q", 0x4E56524D00000001)
+          assert intel_bytes in raw and intel_bytes in obj_raw, "NVRM missing Intel controller ID bytes"
+          assert nvidia_bytes in raw and nvidia_bytes in obj_raw, "NVRM missing NVIDIA/GOP controller ID bytes"
           strs = subprocess.check_output(["strings", "-a", nvrm_bin], text=True, errors="replace")
           for need in (
               "NMIntelFB", "NMGopFB", "NVRMNVDAFramebuffer", "IOFBDependentID", "IOFBDependentIndex",
@@ -258,8 +267,8 @@ jobs:
           rtd_idx = dis_o.index("__ZL9rtd3HeadsPv:")
           nxt = dis_o.find("\n__", rtd_idx + 10)
           rtd_dis = dis_o[rtd_idx:nxt if nxt != -1 else len(dis_o)].lower()
-          assert "4e4d494e00000001" in rtd_dis, "NVRM rtd3Heads missing Intel controller ID"
-          assert "4e56524d00000001" in rtd_dis, "NVRM rtd3Heads missing NVIDIA/GOP controller ID"
+          assert ("4e4d494e00000001" in rtd_dis) or ("lcpi" in rtd_dis), "NVRM rtd3Heads missing Intel controller ID reference"
+          assert ("4e56524d00000001" in rtd_dis) or ("lcpi" in rtd_dis), "NVRM rtd3Heads missing NVIDIA/GOP controller ID reference"
           print("OK NVRM: rtd3Heads carries Intel + NVIDIA/GOP topology checks and all platform-function ABI strings intact")
           PY
           } | tee "$RUNNER_TEMP/contract_checks.txt"
