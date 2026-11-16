@@ -280,14 +280,16 @@ After the restart:
     log show --last boot --predicate 'eventMessage CONTAINS "hybrid:"' > hybrid.log   # to send us
     tools/hybrid_verify.sh hybrid.log
 
-It prints one line per step and a verdict: `copy proven`, `import proven`, `not proven: <first missing step>` or `off`.
+For EXP-013, the verifier requires the checked Intel local-0/logical-4 association and a positive completed-publication counter. It reports `publication observed; physical panel NOT_OBSERVED`: scanout-memory completion is not a physical latch, a Metal workload, or a visual observation. Supply counters from the same boot as the log. Full-frame publication does not require the removed changed-pixel counters.
+
+Historical 3.0 logs retain `copy proven`, `import proven`, `not proven: <first missing step>` or `off`. Their diagnostic table is retained below; it is not the EXP-013 transport contract.
 
 | step | log line (source) | what it proves |
 |---|---|---|
 | S1 | `hybrid: switch level N (boot-arg nmhybrid=N)` (accelerator) | the accelerator read the switch |
 | | `auto-go: hybrid: waiting up to 20 s for the other GPU's panel (head 4) before arming` then `the other GPU's panel published as head 4` (NVRM) | arming waited for the panel instead of arming without it |
 | S2 | `hybrid: provider NMIntelFB WxH pitch P display version V level N` or `hybrid: provider NMXGPUFB WxH pitch P` | the panel driver took the panel and adopted its mode |
-| S3 | `hybrid: first frame presented by copy (R rows, P pixels, head 4)` (accelerator) | WindowServer's first frame reached the panel |
+| S3 | `hybrid: first frame presented by copy (R rows, P pixels, head 4)` (accelerator) | legacy copy completed; no physical-panel observation |
 | S4 | `sysctl debug.nmhybrid_frames` above 0 and `debug.nmhybrid_words_skipped` above 0 | only changed pixels are stored |
 | S5 | `hybrid: import ring 4 slots x K KiB at table offset 0x... (entries a..b of n)` (level 2) | a run of unused translation-table entries was found and reserved |
 | S6 | `hybrid: zero-copy flip #1 surface 0x.. slot N live` (level 2) | the plane showed an imported surface (live surface register matched) |
@@ -304,17 +306,14 @@ Other lines you may see, none of them an error by itself:
   Send us this log.
 - `hybrid: plane back on the boot surface`: the copy path took over from an imported surface.
 
-Counters (all read-only sysctls): `debug.nmhybrid` (level), `nmhybrid_frames`, `nmhybrid_words`, `nmhybrid_words_skipped`,
-`nmhybrid_flips`, `nmhybrid_import_fail`. The existing `debug.nvaccel_iop_ok_h4` counts frames delivered to head 4.
+Current read-only publication counters: `debug.nmhybrid` (level), `nmhybrid_frames`, and
+`nmhybrid_{producer,publication,bounds,epoch,copy}_errors`. The frame counter advances only after matching synchronous completion; rejected and queued work does not advance it. The existing `debug.nvaccel_iop_ok_h4` counts completed transactions for head 4. Import counters remain available for the separate import paths.
 
-Measuring the cost: sample `nmhybrid_words` and `nmhybrid_words_skipped` over ten seconds of desktop use. Skipped over
-total is the share of the screen that did not need storing.
+Measure frame-count deltas over a known interval together with actual panel/workload observations. The old `nmhybrid_words` and `nmhybrid_words_skipped` counters were removed rather than reporting permanently zero optimization statistics.
 
 ## Why the pieces are shaped this way
 
-- The copy uses a shadow of the previous frame because stores to the panel's scan-out buffer are the slow part (write
-  combined, uncached reads), while reading ordinary memory is cheap. The first frame, a frame of another size, and the
-  first frame after the plane returns from an imported surface are stored in full.
+- The legacy copy used a previous-frame shadow to reduce stores. EXP-013 instead validates and publishes the complete final image through owned NVIDIA memory and a private Intel sink. Throughput and tearing require physical measurement; they are not inferred from allocation or completion counters.
 - Import writes only into table entries that already read as one repeated value (the unused or scratch entries), never
   into the firmware's surface range or the top 2 MiB, and every entry's address must fit the 46-bit field. If no such run of
   `4 x frame size` exists, import declines and the copy continues.

@@ -7,6 +7,7 @@
 - Populate the admitted framebuffer resource with the completed final image before synchronous, epoch-checked Intel publication. Failed preparation uses the family's real unwind without an unmatched completion.
 - Keep firmware scanout private: validate boot-video provenance, EFI reservation and live linear GGTT translation; expose owned shadow pages to framebuffer clients instead.
 - Use the stock Metal producer's private-image/readback and checked completion path in copy mode. Do not accept the legacy shared-memory/GPU-mark protocol or count queued/failed frames as completed publication.
+- Migrate log verification to checked Intel association and actual completed-publication counters; remove unused changed-pixel counters and keep physical-panel observation separate.
 - Add production-body ownership, failure-injection, transfer, console and producer regressions. Native linkage and physical Metal/desktop qualification remain separate admission requirements; this entry is not boot authorization.
 
 ## 3.0

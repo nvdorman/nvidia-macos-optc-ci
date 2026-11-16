@@ -25,8 +25,8 @@ Background and the meaning of each switch: `docs/HYBRID-LAPTOPS.md`. All switche
 
 Boot with `nmhybrid=1`. Optional if the machine froze before: `nmhybriddelay=10`.
 
-Should show: the desktop on the laptop panel, drawn by the NVIDIA GPU. `tools/hybrid_verify.sh` says `copy proven`.
-Send: `hybrid-1.log`; `sysctl debug.nmhybrid debug.nmhybrid_frames debug.nmhybrid_words debug.nmhybrid_words_skipped debug.nvaccel_iop_ok_h4`;
+Should show: the desktop on the laptop panel, drawn by the NVIDIA GPU. For EXP-013, `tools/hybrid_verify.sh` reports software publication separately from the still-required physical panel observation.
+Send: `hybrid-1.log`; `sysctl debug.nmhybrid debug.nmhybrid_frames debug.nmhybrid_producer_errors debug.nmhybrid_publication_errors debug.nmhybrid_bounds_errors debug.nmhybrid_epoch_errors debug.nmhybrid_copy_errors debug.nvaccel_iop_ok_h4`;
 whether tearing or flicker is visible, and a rough feel of smoothness.
 Unlocks: nothing else works without it. If `not proven: <step>` appears, that step names the next code fix (panel not taken, first frame not
 delivered, accelerator never armed).

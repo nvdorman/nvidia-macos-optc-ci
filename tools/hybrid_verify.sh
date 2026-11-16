@@ -5,7 +5,7 @@
 # NMH_SYSCTL_FILE=<file> supplies sysctls as "name value" lines instead of the live ones (tests).
 # Steps, in the order the path takes them (docs/HYBRID-LAPTOPS.md):
 #   S1 switch seen by the accelerator      S2 the other GPU's driver published the panel
-#   S3 first frame reached the panel       S4 only changed pixels are being stored
+#   S3 completed scanout-memory publication   S4 changed-pixel optimization in historical logs only
 #   S5 import ring built (level 2)         S6 first zero-copy flip landed (level 2)
 #   R1 the panel was relit after sleep (only when nmhybridresume=1 armed it and the log holds a wake)
 set -u
@@ -35,11 +35,21 @@ if [ "$LEVEL" = 0 ]; then
 fi
 
 step S1 $(has 'hybrid: switch level' && echo 1 || echo 0) "accelerator saw nmhybrid, level $LEVEL"
-step S2 $(has 'hybrid: provider NM' && echo 1 || echo 0) "the other GPU's driver published the panel (line: hybrid: provider ...)"
-step S3 $(has 'hybrid: first frame presented by copy' && echo 1 || echo 0) "first composited frame reached the panel by copy"
-FR=$(sc debug.nmhybrid_frames); SK=$(sc debug.nmhybrid_words_skipped)
-if [ -n "$FR" ] && [ -n "$SK" ]; then step S4 $([ "$FR" -gt 0 ] && [ "$SK" -gt 0 ] && echo 1 || echo 0) "frames $FR, pixels not stored because unchanged $SK"
-else step S4 0 "sysctls debug.nmhybrid_frames / _words_skipped not readable" 0; fi
+FR=$(sc debug.nmhybrid_frames)
+FINAL_IMAGE=0
+if [[ "$(sc debug.nmhybrid_producer_errors)" =~ ^[0-9]+$ ]]; then FINAL_IMAGE=1; fi
+if [ "$FINAL_IMAGE" = 1 ]; then
+    step S2 $(has 'hybrid: head4 association class=NMIntelFB .*localIdx=0 .*logical=4 dense=[0-9][0-9]* match=1$' && echo 1 || echo 0) "verified Intel local-0 / logical-4 association"
+    step S3 $([[ "$FR" =~ ^[0-9]+$ ]] && [ "$FR" -gt 0 ] && echo 1 || echo 0) "completed final-image publications: ${FR:-unreadable}; scanout memory only"
+    step S4 0 "full-frame publication does not use the legacy changed-pixel optimization" 0
+else
+    # Historical logs/counter captures retain their original diagnostic interpretation.
+    step S2 $(has 'hybrid: provider NM' && echo 1 || echo 0) "the other GPU's driver published the panel (line: hybrid: provider ...)"
+    step S3 $(has 'hybrid: first frame presented by copy' && echo 1 || echo 0) "legacy first copy completed; physical panel not observed"
+    SK=$(sc debug.nmhybrid_words_skipped)
+    if [ -n "$FR" ] && [ -n "$SK" ]; then step S4 $([ "$FR" -gt 0 ] && [ "$SK" -gt 0 ] && echo 1 || echo 0) "frames $FR, pixels not stored because unchanged $SK"
+    else step S4 0 "legacy changed-pixel counters not readable" 0; fi
+fi
 
 if [ "$LEVEL" = 2 ]; then
     if has 'hybrid: import unavailable'; then
@@ -71,7 +81,8 @@ if has 'hybrid: resume armed'; then
 fi
 
 if [ "$fail" = 0 ]; then
-    if [ "$LEVEL" = 2 ] && has 'hybrid: zero-copy flip #1'; then echo "VERDICT  import proven"
+    if [ "$FINAL_IMAGE" = 1 ]; then echo "VERDICT  publication observed; physical panel NOT_OBSERVED"
+    elif [ "$LEVEL" = 2 ] && has 'hybrid: zero-copy flip #1'; then echo "VERDICT  import proven"
     else echo "VERDICT  copy proven"; fi
     exit 0
 fi

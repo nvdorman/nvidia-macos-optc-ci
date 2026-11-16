@@ -460,6 +460,8 @@ jobs:
           path: |
             ${{ runner.temp }}/out/**/*.err
             ${{ runner.temp }}/*_build.log
+            ${{ runner.temp }}/tests.txt
+            ${{ runner.temp }}/contract_checks.txt
             ${{ runner.temp }}/optc-contracts/*.log
             ${{ runner.temp }}/optc-contracts/*.json
           if-no-files-found: warn

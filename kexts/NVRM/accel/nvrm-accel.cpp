@@ -2151,7 +2151,7 @@ static SInt64 gCntIopOkHead[kNvMaxFB];
 static SInt64 gCntIop30, gCntIopHalf;       // frames written to a 30-bit scanout; frames converted from half-float RGhA
 static SInt64 gCntIopL10r;                 // frames narrowed from 10-bit l10r (login window, lock screen)
 // hybrid laptops (nm_hybrid.h)
-static SInt64 gCntHyFrames, gCntHyWords, gCntHyWordsSkipped, gCntHyFlips, gCntHyImportFail, gCntHyOwned, gCntHyDma, gCntHyDmaTimeout, gCntHyP2p;
+static SInt64 gCntHyFrames, gCntHyFlips, gCntHyImportFail, gCntHyOwned, gCntHyDma, gCntHyDmaTimeout, gCntHyP2p;
 #define NVIOP_LOG_MAX 40
 static unsigned gIopLogs = 0;
 #define NVIOPLOG(fmt, ...) do { if (gIopLogs < NVIOP_LOG_MAX) { gIopLogs++; ALOG("iop: " fmt, ##__VA_ARGS__); } } while (0)
@@ -2606,7 +2606,7 @@ NVACCEL_CNT(nvaccel_iop_flip_refused, gCntIopFlipNo[7],   "copied because the fr
 static SInt64 gCntIopUnwritten, gCntIopCopyUnwritten;
 // hybrid laptops (nm_hybrid.h): boot-arg nmhybrid, default off
 SYSCTL_INT(_debug, OID_AUTO, nmhybrid, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &gNmHybrid, 0,
-           "hybrid laptop path: 0 off, 1 copy changed pixels to the other GPU's panel, 2 scan out the composited surface in place");
+           "hybrid laptop path: 0 off, 1 completed final-image publication, 2 requested import");
 NVACCEL_CNT(nmhybrid_owned,        gCntHyOwned,        "hybrid: frames written into the panel driver's own buffers and flipped to");
 NVACCEL_CNT(nmhybrid_dma,          gCntHyDma,          "hybrid: frames the copy engine wrote straight into the panel driver's buffers");
 NVACCEL_CNT(nmhybrid_dma_timeouts, gCntHyDmaTimeout,   "hybrid: copy-engine frames that timed out (buffer quarantined)");
@@ -2617,8 +2617,6 @@ NVACCEL_CNT(nmhybrid_publication_errors, gCntPresentPublication, "unproved IOSur
 NVACCEL_CNT(nmhybrid_bounds_errors, gCntPresentBounds, "source or target span refusals");
 NVACCEL_CNT(nmhybrid_epoch_errors, gCntPresentEpoch, "closed or stale presentation epoch");
 NVACCEL_CNT(nmhybrid_copy_errors, gCntPresentCopy, "final target or sink transfer errors");
-NVACCEL_CNT(nmhybrid_words,         gCntHyWords,        "hybrid: pixels stored to the other GPU's scan-out");
-NVACCEL_CNT(nmhybrid_words_skipped, gCntHyWordsSkipped, "hybrid: pixels not stored because they had not changed");
 NVACCEL_CNT(nmhybrid_flips,         gCntHyFlips,        "hybrid: frames scanned out in place (zero copy)");
 NVACCEL_CNT(nmhybrid_p2p,           gCntHyP2p,          "hybrid: frames scanned out of the NVIDIA GPU's memory through BAR1 (nmhybridp2p)");
 NVACCEL_CNT(nmhybrid_import_fail,   gCntHyImportFail,   "hybrid: surfaces that could not be scanned out in place (copied instead)");
@@ -2807,11 +2805,11 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nmflat_held);
     sysctl_register_oid(&sysctl__debug_nmhybrid_p2p); sysctl_register_oid(&sysctl__debug_nmhybrid_owned); sysctl_register_oid(&sysctl__debug_nmhybrid_dma); sysctl_register_oid(&sysctl__debug_nmhybrid_dma_timeouts);
     sysctl_register_oid(&sysctl__debug_nmhybrid);
-    sysctl_register_oid(&sysctl__debug_nmhybrid_frames);        sysctl_register_oid(&sysctl__debug_nmhybrid_words);
+    sysctl_register_oid(&sysctl__debug_nmhybrid_frames);
     sysctl_register_oid(&sysctl__debug_nmhybrid_producer_errors); sysctl_register_oid(&sysctl__debug_nmhybrid_publication_errors);
     sysctl_register_oid(&sysctl__debug_nmhybrid_bounds_errors); sysctl_register_oid(&sysctl__debug_nmhybrid_epoch_errors);
     sysctl_register_oid(&sysctl__debug_nmhybrid_copy_errors);
-    sysctl_register_oid(&sysctl__debug_nmhybrid_words_skipped); sysctl_register_oid(&sysctl__debug_nmhybrid_flips);
+    sysctl_register_oid(&sysctl__debug_nmhybrid_flips);
     sysctl_register_oid(&sysctl__debug_nmhybrid_import_fail);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h4);      sysctl_register_oid(&sysctl__debug_nvaccel_igpu);
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_published); sysctl_register_oid(&sysctl__debug_nvaccel_heads_registered);

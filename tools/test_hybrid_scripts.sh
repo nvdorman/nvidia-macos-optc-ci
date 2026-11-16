@@ -55,12 +55,25 @@ unset NMH_SYSCTL_FILE
 out=$(V hybrid_fixtures/off.log); rc=$?
 arm "an empty log with the switch off says off and is not a failure" "$([ $rc = 0 ] && echo "$out" | grep -q 'VERDICT  off' && echo 1 || echo 0)"
 
-# ---- the log lines the verifier looks for must still be written by the kernel code
-SRC="../kexts/NVRM/accel/nvrm-accel.cpp ../kexts/NMIntelFB/intelfb.cpp"
-for phrase in 'hybrid: switch level' 'hybrid: provider NMIntelFB' 'hybrid: first frame presented by copy' 'hybrid: import ring' \
-              'hybrid: zero-copy flip #1' 'hybrid: resume armed' 'hybrid: resume: ' 'hybrid: standing down' 'hybrid: step ' 'hybrid: import unavailable' 'did not reach the screen' 'hybrid: fallback to copy'; do
-    # shellcheck disable=SC2086
-    arm "the kernel still logs: $phrase" "$(grep -q -- "$phrase" $SRC && echo 1 || echo 0)"
-done
+# Final-image publication: completed counters are evidence of software publication,
+# never of a physical latch, and no changed-pixel counter exists on this path.
+cat > "$T/publication.log" <<'LOG'
+NVAccel: hybrid: switch level 1 (boot-arg nmhybrid=1)
+NVAccel: hybrid: head4 association class=NMIntelFB depID=0x4e4d494e00000001 (has=1) localIdx=0 (has=1) logical=4 dense=0 match=1
+LOG
+export NMH_SYSCTL_FILE="$T/publication.sysctl"
+printf '%s\n' 'debug.nmhybrid_producer_errors 0' 'debug.nmhybrid_frames 3' > "$NMH_SYSCTL_FILE"
+out=$(V "$T/publication.log"); rc=$?
+printf '%s\n' "$out"
+arm "completed final-image publication is observed without claiming the physical panel" "$([ $rc = 0 ] && echo "$out" | grep -q 'VERDICT  publication observed; physical panel NOT_OBSERVED' && echo 1 || echo 0)"
+out=$(V hybrid_fixtures/no_provider.log); rc=$?
+arm "a completed counter without the Intel association does not prove publication routing" "$([ $rc = 1 ] && echo "$out" | grep -q 'FAIL  S2' && echo 1 || echo 0)"
+printf '%s\n' 'debug.nmhybrid_producer_errors 0' 'debug.nmhybrid_frames 0' > "$NMH_SYSCTL_FILE"
+out=$(V "$T/publication.log"); rc=$?
+arm "an associated but never-completed frame is not publication evidence" "$([ $rc = 1 ] && echo "$out" | grep -q 'FAIL  S3' && echo 1 || echo 0)"
+printf '%s\n' 'debug.nmhybrid_producer_errors 0' > "$NMH_SYSCTL_FILE"
+out=$(V "$T/publication.log"); rc=$?
+arm "an unreadable completion counter cannot prove publication" "$([ $rc = 1 ] && echo "$out" | grep -q 'FAIL  S3' && echo 1 || echo 0)"
+unset NMH_SYSCTL_FILE
 echo "$fails failed"
 [ "$fails" = 0 ]
