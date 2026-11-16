@@ -118,6 +118,7 @@ jobs:
           echo "OGKM_DIR=$T" >> "$GITHUB_ENV"
 
       - name: Build all native payloads and require every result
+        id: native_build
         env:
           MINVER: "15.5"
           MACOSX_DEPLOYMENT_TARGET: "15.5"
@@ -326,6 +327,7 @@ jobs:
           } 2>&1 | tee "$RUNNER_TEMP/tests.txt"
 
       - name: Run generation, resource, console and producer contract fixtures
+        if: ${{ !cancelled() && steps.native_build.outcome == 'success' }}
         run: python3 -B tools/run_optc_contract_tests.py
 
       - name: Stage and verify Option C triple artifacts and complete manifest

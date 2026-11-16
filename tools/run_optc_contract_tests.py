@@ -63,15 +63,19 @@ def execute(name, command, compile_command=None):
     if compile_command:
         report['compile_command'] = compile_command
     (out / (name + '.json')).write_text(json.dumps(report, indent=2) + '\n')
-    if result.returncode:
-        raise SystemExit(result.returncode)
+    return result.returncode
 
+failures = []
 for name, compiler, standard in c_tests:
     binary = out / Path(name).stem
     compile_command = [compiler, '-std=' + standard, '-O1', '-Wall', '-Wextra', '-Werror',
                        '-Ikexts/NVRM', '-Ikexts/NVRM/accel', '-Ikexts/NMIntelFB',
                        'tools/' + name, '-o', str(binary)]
-    execute(Path(name).stem, [str(binary)], compile_command)
+    if execute(Path(name).stem, [str(binary)], compile_command):
+        failures.append(name)
 for name in python_tests:
-    execute(Path(name).stem, ['python3', '-B', 'tools/' + name])
+    if execute(Path(name).stem, ['python3', '-B', 'tools/' + name]):
+        failures.append(name)
 (out / 'source-files.json').write_text(json.dumps(source_files, indent=2) + '\n')
+if failures:
+    raise SystemExit("Failed production fixtures: " + ", ".join(failures))

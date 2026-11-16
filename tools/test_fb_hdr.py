@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
-"""HDR10 and 30-bit scanout, end to end across NVRMFB and NVAccel, off unless nvfbhdr=1 / nvfb10bit=1.
+"""Check CTA-861 HDR parsing and the unchanged NVRMFB HDR declarations.
 
-Pixel conversions are tested in tools/test_iop_10bit.c; here: the display's HDR block is read from a real CTA-861 layout, the
-scanout reply flag is the same bit on both sides, and the call sites are present: HDR timings advertised only for PQ
-displays, an HDR10 timing is a different mode from the SDR timing of the same raster, a 30-bit surface for the mode set,
-the infoframe/colorimetry/passthrough on every config with the gamma ramp off, and the accelerator's converter keyed on the
-reply flag. The control is the old driver: SDR only, an 8-bit surface, one copy loop."""
+Pixel conversion behavior is covered by test_iop_10bit.c and
+test_optc_frame_transfer.c, independently of the caller's source spelling.
+"""
 import filecmp, pathlib, subprocess, tempfile
 root = pathlib.Path(__file__).resolve().parents[1]
 fb = (root / 'kexts/NVRMFB/fb/nvrm-fb.cpp').read_text()
-acc = (root / 'kexts/NVRM/accel/nvrm-accel.cpp').read_text()
 for need in ['r.supportedDynamicRangeModes |= kIORangeDynamicRangeHDR10', 'if (gHdrOn && fHdrCapable) {',
              '(d.dynamicRange == kIODynamicRangeHDR10) == fHdrActive', 'NvKmsSurfaceMemoryFormatX2B10G10R10',
              'r->flags = fScan30 ? NVRM_VRAM_SCANOUT_30BIT : 0;', 'mc.hdrInfoFrame.eotf = NVKMS_INFOFRAME_EOTF_ST2084',
              'mc.colorimetry = NVKMS_OUTPUT_COLORIMETRY_BT2100', 'mc.postcompColorPassthrough = NV_TRUE', 'mc.olut.enabled = NV_FALSE',
              'attribute == kIOFBHDRMetaDataAttribute', 'PE_parse_boot_argn("nvfbhdr"', 'PE_parse_boot_argn("nvfb10bit"']:
     assert need in fb, 'missing in NVRMFB: ' + need
-for need in ['q.flags & NVRM_VRAM_SCANOUT_30BIT', 'nv_iop_convert_row(dp, sp, w, srcFmt, dst30)', 'fmt != NV_IOP_FMT_RGHA']:
-    assert need in acc, 'missing in NVAccel: ' + need
 for a in ['NVRMFB', 'NVRM', 'NMIntelFB']:
     assert 'NVRM_VRAM_SCANOUT_30BIT 0x1u' in (root / f'kexts/{a}/nvrm_vram_abi.h').read_text(), a
 assert filecmp.cmp(root / 'kexts/NVRMFB/nvrm_vram_abi.h', root / 'kexts/NVRM/nvrm_vram_abi.h', shallow=False)
