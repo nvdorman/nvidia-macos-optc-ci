@@ -1,0 +1,141 @@
+name: Build Option C Kexts (macOS 26 + 15)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-optc:
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Inspect Xcode and Kernel SDK
+        run: |
+          xcodebuild -version
+          xcrun --show-sdk-path
+          xcrun clang++ --version
+
+      - name: Download NVIDIA open-gpu-kernel-modules 620.70.06 & prepare headers
+        env:
+          NV_VERSION: "620.70.06"
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/ogkm_work"
+          mkdir -p "$WORK"
+          curl -fsSL "https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/${NV_VERSION}.tar.gz" -o "$WORK/ogkm.tar.gz"
+          tar -xzf "$WORK/ogkm.tar.gz" -C "$WORK"
+          PRISTINE="$WORK/open-gpu-kernel-modules-${NV_VERSION}"
+          test -d "$PRISTINE/src/nvidia"
+          bash tools/test_patch_chain.sh "$PRISTINE"
+          T="$WORK/ogkm-${NV_VERSION}"
+          cp -R "$PRISTINE" "$T"
+          : > "$T/.nm-patches"
+          for f in kexts/NVRM/patches/*.patch; do
+            ok=0
+            for root in "" "src/nvidia-modeset"; do
+              ( cd "$T/$root" && patch -p1 --fuzz=0 --dry-run < "$GITHUB_WORKSPACE/$f" >/dev/null 2>&1 && patch -p1 --fuzz=0 --no-backup-if-mismatch < "$GITHUB_WORKSPACE/$f" >/dev/null ) && { ok=1; break; }
+            done
+            [ "$ok" = 1 ] || { echo "Patch failed: $f"; exit 2; }
+            basename "$f" >> "$T/.nm-patches"
+          done
+          python3 - "$T" <<'PY'
+          import os, sys
+          t = sys.argv[1]
+          def edit(rel, old, new):
+              p = os.path.join(t, rel); s = open(p).read()
+              if new in s: return
+              assert s.count(old) == 1, f"{rel}: anchor found {s.count(old)} times"
+              s = s.replace(old, new); open(p + ".tmp", "w").write(s); os.replace(p + ".tmp", p)
+          edit("src/common/sdk/nvidia/inc/cpuopsys.h", "defined(__INTEGRITY) ) && !defined(nvmacosx)", "defined(__INTEGRITY) || defined(NV_DARWIN) ) && !defined(nvmacosx)")
+          for rel in ("src/common/inc/nvVer.h", "src/common/inc/nvUnixVersion.h"):
+              edit(rel, "defined(NV_QNX) || defined(NV_INTEGRITY) || \\", "defined(NV_QNX) || defined(NV_INTEGRITY) || defined(NV_DARWIN) || \\")
+          edit("src/common/inc/nvBldVer.h", "#if defined(NV_LINUX) || defined(NV_BSD) || defined(NV_SUNOS)\n", "#if defined(NV_LINUX) || defined(NV_BSD) || defined(NV_SUNOS) || defined(NV_DARWIN)\n")
+          PY
+          cd "$T/src/nvidia"
+          mkdir -p _out/Darwin_x86_64
+          make -n TARGET_OS=Darwin TARGET_ARCH=x86_64 NV_VERBOSE=1 2>/dev/null > "$WORK/make-n.txt"
+          grep -E "^echo .*version\.h" "$WORK/make-n.txt" > "$WORK/pre.sh"
+          bash "$WORK/pre.sh"
+          grep " -c " "$WORK/make-n.txt" | python3 -c '
+          import sys
+          for l in sys.stdin:
+              l = l.rstrip("\n")
+              assert l.startswith("cc "), l[:40]
+              l = "clang -arch x86_64 -mmacosx-version-min=15.0 -mkernel -DNV_DARWIN -fcf-protection=branch " + l[3:]
+              l = l.replace(" -mcmodel=kernel", "").replace(" -fno-pic", "")
+              print(l)' > _out/Darwin_x86_64/compile_cmds.sh
+          test -s _out/Darwin_x86_64/compile_cmds.sh
+          head -n 1 _out/Darwin_x86_64/compile_cmds.sh
+          echo "OGKM_DIR=$T" >> "$GITHUB_ENV"
+
+      - name: Build NMIntelFB.kext
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/out/intelfb"
+          bash kexts/NMIntelFB/build.sh "$OUT"
+
+      - name: Build NVAccel.kext (macOS 15 + macOS 26 Tahoe)
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/out/accel"
+          OGKM="$OGKM_DIR" bash build/accel_build_all.sh kexts/NVRM "$OUT"
+
+      - name: Verify kext libraries, Mach-O exports, and Info.plist
+        run: |
+          set -euo pipefail
+          INT="$RUNNER_TEMP/out/intelfb/NMIntelFB.kext"
+          ACC15="$RUNNER_TEMP/out/accel/15/NVAccel.kext"
+          ACC26="$RUNNER_TEMP/out/accel/26/NVAccel.kext"
+          bash build/check_kext_libraries.sh "$INT" "$ACC15" "$ACC26"
+          for K in "$INT" "$ACC15" "$ACC26"; do
+            n=$(basename "$K" .kext)
+            b="$K/Contents/MacOS/$n"
+            plutil -lint "$K/Contents/Info.plist"
+            xcrun otool -hv "$b"
+            xcrun otool -l "$b" | grep -A 3 LC_UUID || true
+            xcrun nm -g "$b" | grep -E "kmod_info|MetaClass" | head -n 10
+            xcrun nm -u "$b" > "$RUNNER_TEMP/${n}_imports.txt"
+            test -s "$RUNNER_TEMP/${n}_imports.txt"
+          done
+          xcrun nm -g "$INT/Contents/MacOS/NMIntelFB" > "$RUNNER_TEMP/NMIntelFB_symbols.txt"
+          xcrun nm -g "$ACC26/Contents/MacOS/NVAccel" > "$RUNNER_TEMP/NVAccel26_symbols.txt"
+
+      - name: Run Option C unit tests and upstream safety gates
+        run: |
+          set -euo pipefail
+          cc -O1 -Wall -Werror -I./kexts/NMIntelFB -I./kexts/NVRM/accel -I./kexts/NVRM \
+            tools/test_optc_policy.c -o "$RUNNER_TEMP/test_optc_policy"
+          "$RUNNER_TEMP/test_optc_policy"
+          cc -O1 -Wall -Werror -I./kexts/NVRM/accel \
+            tools/test_hybrid_present.c -o "$RUNNER_TEMP/test_hybrid_present"
+          "$RUNNER_TEMP/test_hybrid_present"
+          bash tools/hybrid_verify.sh
+          python3 tools/test_hybrid_wiring.py
+          python3 tools/test_sysctl_allowlist.py
+
+      - name: Stage and verify Option C artifacts
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/optc-artifact"
+          mkdir -p "$STAGE/26" "$STAGE/15" "$STAGE/logs"
+          cp -R "$RUNNER_TEMP/out/intelfb/NMIntelFB.kext" "$STAGE/NMIntelFB.kext"
+          cp -R "$RUNNER_TEMP/out/accel/26/NVAccel.kext" "$STAGE/26/NVAccel.kext"
+          cp -R "$RUNNER_TEMP/out/accel/15/NVAccel.kext" "$STAGE/15/NVAccel.kext"
+          cp "$RUNNER_TEMP/out/intelfb/NMIntelFB.err" "$STAGE/logs/" 2>/dev/null || true
+          cp "$RUNNER_TEMP/out/accel/26/accel.err" "$STAGE/logs/accel26.err"
+          cp "$RUNNER_TEMP/out/accel/26/accelld.err" "$STAGE/logs/accel26ld.err"
+          cp "$RUNNER_TEMP/NMIntelFB_imports.txt" "$RUNNER_TEMP/NMIntelFB_symbols.txt" \
+             "$RUNNER_TEMP/NVAccel_imports.txt" "$RUNNER_TEMP/NVAccel26_symbols.txt" "$STAGE/logs/"
+          ( cd "$STAGE" && shasum -a 256 NMIntelFB.kext/Contents/MacOS/NMIntelFB \
+            26/NVAccel.kext/Contents/MacOS/NVAccel \
+            15/NVAccel.kext/Contents/MacOS/NVAccel > SHA256SUMS.txt && cat SHA256SUMS.txt )
+
+      - name: Upload Option C kexts artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: optc-kexts-macos26
+          path: ${{ runner.temp }}/optc-artifact
+          if-no-files-found: error
