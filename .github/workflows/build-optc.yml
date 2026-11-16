@@ -126,6 +126,9 @@ jobs:
           test -f "$OUT/26/NVAccel.kext/Contents/MacOS/NVAccel"
 
       - name: Build NVRM.kext (fresh output dir)
+        env:
+          MINVER: "15.5"
+          MACOSX_DEPLOYMENT_TARGET: "15.5"
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/out/nvrm"

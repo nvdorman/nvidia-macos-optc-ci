@@ -51,7 +51,7 @@ RMDEFS=(); while read -r d; do RMDEFS+=("$d"); done < <(head -1 "$NV/_out/Darwin
 # -g0 and the prefix maps keep the object free of build paths, so the same sources give the same binary on any build host
 CFLAGS=( -arch x86_64 -fapple-kext -mkernel -nostdinc -I"$KHDR" -I"$SRC" "${RMINC[@]}" "${KMSINC[@]}"
   -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT "${RMDEFS[@]}"
-  -mmacosx-version-min=15.0 -g0 -ffile-prefix-map="$SRC"=driver -ffile-prefix-map="$OGKM"=nvidia -ffile-prefix-map="$HOME"=/build -fdebug-prefix-map="$HOME"=/build
+  -mmacosx-version-min=${MINVER:-15.0} -g0 -ffile-prefix-map="$SRC"=driver -ffile-prefix-map="$OGKM"=nvidia -ffile-prefix-map="$HOME"=/build -fdebug-prefix-map="$HOME"=/build
   -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fno-common
   -Wall -Wno-unused-parameter -Wno-inconsistent-missing-override -Wno-unused-function -O2 )
 OBJS=()
@@ -69,7 +69,7 @@ OBJS+=("$OUT/nvrm_pageoff.o")
 OGKM="$OGKM" python3 -B "$HERE/../kexts/NVRM/rmcc.py" "$SRC/nvrm_pmgr.c" "$OUT/nvrm_pmgr.o" 2>"$OUT/pmgr.err" || { echo "STOP: nvrm_pmgr.c did not compile"; tail "$OUT/pmgr.err"; exit 1; }
 OBJS+=("$OUT/nvrm_pmgr.o")
 bash "$HERE/warn_ceiling.sh" nvrm "$(cat "$OUT"/*.o.err "$OUT/kapi.err" "$OUT/pageoff.err" "$OUT/pmgr.err" | grep -c ': warning:')" || exit 4
-xcrun clang++ -arch x86_64 -mmacosx-version-min=15.0 -fapple-kext -nostdlib -Xlinker -kext -lkmodc++ -lkmod -lcc_kext "${OBJS[@]}" \
+xcrun clang++ -arch x86_64 -mmacosx-version-min=${MINVER:-15.0} -fapple-kext -nostdlib -Xlinker -kext -lkmodc++ -lkmod -lcc_kext "${OBJS[@]}" \
   "$NV/_out/Darwin_x86_64/libnvkernel.a" "$KMSLIB" -o "$OUT/NVRM.kext/Contents/MacOS/NVRM" 2>"$OUT/link.err" || { echo "STOP: link failed"; grep -v "built for newer" "$OUT/link.err" | head; exit 1; }
 bash "$HERE/warn_ceiling.sh" nvrm-link "$(grep -c 'warning' "$OUT/link.err")" "$OUT/link.err" || exit 4
 cp "$SRC/Info.plist" "$OUT/NVRM.kext/Contents/Info.plist"
