@@ -22,6 +22,7 @@
 #include "intelfb_console.h"
 #include <libkern/OSAtomic.h>
 #include "nvrm_vram_abi.h"
+#include "../NVRM/nvrm_fb_topology.h"
 #include "nm_hybrid.h"
 #include "nm_hybrid_abi.h"
 #include "nm_hybrid_resume.h"
@@ -300,6 +301,16 @@ private:
     uint32_t fPwmPeriod = 0;                     // firmware's PWM period; 0 = no brightness control
     NMIntelBacklight *fBacklight = nullptr;
     void publishBacklight();
+    bool publishDependentIdentity() {
+        if (!setProperty("IOFBDependentID", NVRM_FB_CONTROLLER_ID_INTEL, 64) ||
+            !setProperty("IOFBDependentIndex", (unsigned long long)NVRM_FB_INTEL_LOCAL_INDEX, 32)) {
+            removeProperty("IOFBDependentID");
+            removeProperty("IOFBDependentIndex");
+            IFBLOG("failed to publish independent Intel controller identity");
+            return false;
+        }
+        return true;
+    }
 public:
     bool setPanelPercent(uint32_t percent);      // from NMIntelBacklight's thread call; false if the write did not stick
 private:
@@ -351,11 +362,9 @@ public:
     IOReturn setCLUTWithEntries(IOColorEntry *, UInt32, UInt32, IOOptionBits) override { return kIOReturnSuccess; }
     IOReturn setApertureEnable(IOPixelAperture, IOOptionBits) override { return kIOReturnSuccess; }
     IOReturn setStartupDisplayMode(IODisplayModeID, IOIndex) override { return kIOReturnSuccess; }
-    // Power and connection handling copied from NVRMFB, which shares this controller (same IOFBDependentID). Left to
-    // IOFramebuffer's base class, a power change queues on the shared controller thread and waits for an acknowledge
-    // (IOFramebuffer::setPowerState returns a 45 s timeout, checkPowerWork -> setAttribute(kIOPowerStateAttribute));
-    // NVRMFB acknowledges at once and answers the power attributes itself. With NMIntelFB under NVRM the
-    // first WindowServer restart froze every display.
+    // Power and connection handling: acknowledge power transitions immediately instead of queuing on IOFramebuffer's
+    // base controller power-work timeout. NMIntelFB uses its own independent Intel controller (IOFBDependentID =
+    // NVRM_FB_CONTROLLER_ID_INTEL, local index 0) rather than sharing NVRMFB's controller, and handles power attributes directly.
     IOReturn setPowerState(unsigned long ordinal, IOService *) override {
         handleEvent(ordinal ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
         if (fResumeOn) {
@@ -535,10 +544,13 @@ bool NMIntelFB::start(IOService *provider)
     bzero(fVBuf->getBytesNoCopy(), fVBuf->getLength());
     fApertureBase = fVBuf->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone); fApertureLen = fVBuf->getLength();
     fSurfMap = fVBuf->map();
-    // Before IOFramebuffer::start, so start() attaches the shared controller (see the panel path below).
-    setProperty("IOFBDependentID", 0x4E56524D00000001ull, 64);
-    setProperty("IOFBDependentIndex", 4ull, 32);
-    if (!IOFramebuffer::start(provider)) { OSSafeReleaseNULL(fSurfMap); fVBuf->complete(); OSSafeReleaseNULL(fVBuf); return false; }
+    if (!fSurfMap) { IFBLOG("virtual: surface map failed"); fVBuf->complete(); OSSafeReleaseNULL(fVBuf); return false; }
+    // Before IOFramebuffer::start, so start() attaches an independent Intel controller at local index 0 (see the panel path below).
+    if (!publishDependentIdentity()) { OSSafeReleaseNULL(fSurfMap); fVBuf->complete(); OSSafeReleaseNULL(fVBuf); return false; }
+    if (!IOFramebuffer::start(provider)) {
+        removeProperty("IOFBDependentID"); removeProperty("IOFBDependentIndex");
+        OSSafeReleaseNULL(fSurfMap); fVBuf->complete(); OSSafeReleaseNULL(fVBuf); return false;
+    }
     if (IOWorkLoop *wl = getWorkLoop()) {
         fTimer = IOTimerEventSource::timerEventSource(this, [](OSObject *o, IOTimerEventSource *t) {
             ((NMIntelFB *)o)->sample(); t->setTimeoutMS(2000); });
@@ -572,27 +584,25 @@ bool NMIntelFB::start(IOService *provider)
     ifbStep(NMH_STEP_MMIO);
     if (!adoptFirmwareMode()) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
     ifbStep(NMH_STEP_ADOPT);
-    // Head 4 of the NVIDIA accelerator (NVAccel): WindowServer composites this panel on the NVIDIA card and the
-    // display pipe copies each frame into fSurfMap.
-    // The dependent ID and index must exist before IOFramebuffer::start. start() attaches the framebuffer to its
-    // shared controller only when it finds a dependent ID; set later, the controller stays unset until open(), and the
-    // power change queued by registerPowerDriver() below takes the controller's lock through a null pointer (page fault
-    // in IOFramebuffer::powerStateWillChangeTo at boot). NVRMFB sets them before start for the same reason.
+    // Independent Intel controller (NVRM_FB_CONTROLLER_ID_INTEL, local index 0) mapped to logical hybrid head 4 of
+    // NVAccel: WindowServer composites this panel on the NVIDIA card and the display pipe copies each frame into fSurfMap.
+    // The dependent ID and index must exist before IOFramebuffer::start so IOGraphicsFamily attaches this panel to its
+    // own Intel controller with local slot 0 populated (never sharing NVRMFB's controller ID or leaving slot 0 empty).
     // The mapping is made here, before resumeCapture, tcStart and the DMC target publish anything another thread can
-    // reach, so a failure to map needs nothing undone but the register mapping.
+    // reach, so a failure to map or publish identity unwinds cleanly before any service state is exposed.
     const IOPhysicalAddress surfPhys = fConsoleScanout ? fConsPhys : (fApertureBase + fSurf);
     const IOPhysicalLength surfLen = fConsoleScanout ? fConsBytes : ((IOPhysicalLength)fRowBytes * fHeight);
     if (IODeviceMemory *sm = IODeviceMemory::withRange(surfPhys, surfLen)) {
         fSurfMap = sm->map(kIOMapWriteCombineCache); sm->release();
     }
     if (!fSurfMap) {
-        // Without the mapping there is no head 4 and no dependent ID, so no controller either: starting would hit the
-        // same null controller on the first power change. Leave the panel to the firmware framebuffer.
         IFBLOG("the surface would not map write-combined: leaving the panel to the firmware framebuffer");
         OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false;
     }
-    setProperty("IOFBDependentID", 0x4E56524D00000001ull, 64);
-    setProperty("IOFBDependentIndex", 4ull, 32);
+    if (!publishDependentIdentity()) {
+        startUnwind();
+        return false;
+    }
     resumeCapture();
     tcStart();
     { int a = 0; fDmcOn = PE_parse_boot_argn("nmhybriddmc", &a, sizeof a) && a == 1;
@@ -643,6 +653,8 @@ void NMIntelFB::startUnwind()
     if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
     if (fBacklight) { fBacklight->terminate(kIOServiceSynchronous); fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); }
     fPwmPeriod = 0;
+    removeProperty("IOFBDependentID");
+    removeProperty("IOFBDependentIndex");
     OSSafeReleaseNULL(fSurfMap); OSSafeReleaseNULL(fMMIO); fRegs = nullptr;
 }
 

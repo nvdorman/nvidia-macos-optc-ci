@@ -84,6 +84,7 @@ static bool nvaccel_verbose() { static int v = -1; if (v < 0) { int x = 0; v = P
 #include "nm_hybrid.h"
 #include "nm_hybrid_abi.h"
 #include "nm_hybrid_p2p.h"
+#include "../nvrm_fb_topology.h"
 #include "nvaccel_optc_policy.h"
 
 // ---- GPU core temperature, published into PerformanceStatistics -------------
@@ -134,9 +135,11 @@ SYSCTL_INT(_debug, OID_AUTO, nmxaccel_headless, CTLFLAG_RD | CTLFLAG_LOCKED | CT
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_headless, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &gNvHeadless, 0,
            "1 = no NVIDIA display: Metal device for apps only, WindowServer on the GPU that owns the display");
 #endif
-// 4 NVIDIA heads (nvfbheads=4) + 1 for an Intel built-in panel (NMIntelFB, IOFBDependentIndex 4): WindowServer composites
-// that panel on the NVIDIA card and the display-pipe copy path below writes each frame into the Intel scan-out surface.
-static const unsigned kNvMaxFB = 5;
+// 4 NVIDIA heads (nvfbheads=4) + 1 for a foreign hybrid built-in panel (NMIntelFB with independent Intel controller
+// local index 0, or legacy NMGopFB, routed to logical slot 4): WindowServer composites that panel on the NVIDIA card
+// and the display-pipe copy path below writes each frame into the panel's scan-out surface.
+static const unsigned kNvMaxFB = NVRM_FB_MAX_HEADS;
+static_assert(NVRM_FB_MAX_HEADS == 5, "NVRM_FB_MAX_HEADS changed: keep kNvMaxFB in sync");
 static unsigned gNvHeadsPublished = 0, gNvHeadsRegistered = 0;
 static unsigned gNvHeadsPiped = 0;
 // The Intel built-in panel (head 4) joins only when this is 1. Off by default while the path is proven: a write at run
@@ -396,6 +399,111 @@ public:
     unsigned fDirectAllocLogged = 0;
     SInt64 fDirectRefused = 0;
     OSObject *fMetalPlugin = nullptr;
+    unsigned fHead4AssocLogs = 0;
+    bool fHead4AssocActive = false;
+    uint64_t fHead4AssocRegId = 0;
+    uint32_t fHead4AssocDense = 0;
+    static enum nvrm_fb_kind classifyFramebuffer(IOService *fb) {
+        if (!fb) return NVRM_FB_UNKNOWN;
+        if (fb->metaCast("NVRMNVDAFramebuffer")) return NVRM_FB_NVIDIA;
+        if (fb->metaCast("NMIntelFB"))           return NVRM_FB_INTEL;
+        if (fb->metaCast("NMGopFB"))             return NVRM_FB_GOP;
+        return NVRM_FB_UNKNOWN;
+    }
+    static void readFbTopologyProps(IOService *fb, int *hasId, uint64_t *depId, int *hasIdx, uint32_t *localIdx) {
+        *hasId = 0; *depId = 0; *hasIdx = 0; *localIdx = 0;
+        if (!fb) return;
+        OSObject *idObj = fb->copyProperty("IOFBDependentID");
+        OSObject *idxObj = fb->copyProperty("IOFBDependentIndex");
+        OSNumber *idNum = OSDynamicCast(OSNumber, idObj);
+        OSNumber *idxNum = OSDynamicCast(OSNumber, idxObj);
+        if (idNum) { *hasId = 1; *depId = (uint64_t)idNum->unsigned64BitValue(); }
+        if (idxNum) { *hasIdx = 1; *localIdx = (uint32_t)idxNum->unsigned32BitValue(); }
+        OSSafeReleaseNULL(idObj);
+        OSSafeReleaseNULL(idxObj);
+    }
+    void clearHead4AssociationLocked() {
+        if (fHead4AssocActive || getProperty("NVAccelHead4RegistryID") || getProperty("NVAccelHead4DensePipeIndex")) {
+            removeProperty("NVAccelHead4RegistryID");
+            removeProperty("NVAccelHead4DensePipeIndex");
+            fHead4AssocActive = false;
+            fHead4AssocRegId = 0;
+            fHead4AssocDense = 0;
+        }
+    }
+    void logHead4AssociationBounded(IOService *fb, unsigned denseIdx, bool matched) {
+        if (fHead4AssocLogs >= 8) return;
+        fHead4AssocLogs++;
+        int hasId = 0, hasIdx = 0;
+        uint64_t depId = 0; uint32_t localIdx = 0;
+        readFbTopologyProps(fb, &hasId, &depId, &hasIdx, &localIdx);
+        ALOG("hybrid: head4 association class=%s depID=0x%llx (has=%d) localIdx=%u (has=%d) logical=%d dense=%u match=%d",
+             fb ? fb->getMetaClass()->getClassName() : "(null)",
+             (unsigned long long)depId, hasId, localIdx, hasIdx,
+             NVRM_FB_LOGICAL_HYBRID_HEAD, denseIdx, matched ? 1 : 0);
+    }
+    bool findVerifiedHead4PipeLocked(IOService *fb, unsigned *outDense) {
+        if (!fb || !fDM || fb != fFBs[NVRM_FB_LOGICAL_HYBRID_HEAD] || fb->isInactive()) return false;
+        if (!(gNvHeadsPiped & NVRM_FB_HYBRID_PUBLISHED_BIT)) return false;
+        uint8_t *dm = (uint8_t *)fDM;
+        const unsigned count = fDM->getFramebufferCount();
+        if (!count || count > 16) return false;
+        unsigned matches = 0, foundIdx = 0;
+        for (unsigned d = 0; d < count; d++) {
+            void *pipe = *(void *const volatile *)(dm + 0x88 + 8 * d);
+            if (!pipe) continue;
+            IOService *pfb = *(IOService *const volatile *)((const uint8_t *)pipe + 0x98);
+            if (pfb == fb) { foundIdx = d; matches++; }
+        }
+        if (matches != 1) return false;
+        if (!nm_optc_head4_assoc_valid(fFBs[NVRM_FB_LOGICAL_HYBRID_HEAD], fb, foundIdx, count, fb->isInactive() ? 1 : 0))
+            return false;
+        if (outDense) *outDense = foundIdx;
+        return true;
+    }
+    void publishHead4AssociationLocked(IOService *fb, unsigned denseIdx) {
+        if (!fb || !fDM || fb != fFBs[NVRM_FB_LOGICAL_HYBRID_HEAD]) {
+            clearHead4AssociationLocked();
+            return;
+        }
+        const unsigned count = fDM->getFramebufferCount();
+        void *pipe = (denseIdx < count && denseIdx < 16) ? *(void *const volatile *)((const uint8_t *)fDM + 0x88 + 8 * denseIdx) : nullptr;
+        IOService *pfb = pipe ? *(IOService *const volatile *)((const uint8_t *)pipe + 0x98) : nullptr;
+        if (!nm_optc_head4_assoc_valid(fFBs[NVRM_FB_LOGICAL_HYBRID_HEAD], pfb, denseIdx, count, fb->isInactive() ? 1 : 0)) {
+            clearHead4AssociationLocked();
+            logHead4AssociationBounded(fb, denseIdx, false);
+            return;
+        }
+        int hasId = 0, hasIdx = 0; uint64_t depId = 0; uint32_t localIdx = 0;
+        readFbTopologyProps(fb, &hasId, &depId, &hasIdx, &localIdx);
+        if (nvrm_fb_logical_head(classifyFramebuffer(fb), hasId, depId, hasIdx, localIdx) != NVRM_FB_LOGICAL_HYBRID_HEAD) {
+            clearHead4AssociationLocked();
+            logHead4AssociationBounded(fb, denseIdx, false);
+            return;
+        }
+        const uint64_t regId = fb->getRegistryEntryID();
+        if (!regId ||
+            !setProperty("NVAccelHead4RegistryID", (unsigned long long)regId, 64) ||
+            !setProperty("NVAccelHead4DensePipeIndex", (unsigned long long)denseIdx, 32)) {
+            clearHead4AssociationLocked();
+            ALOG("hybrid: head4 association property publish failed (dense=%u)", denseIdx);
+            return;
+        }
+        const bool changed = !fHead4AssocActive || fHead4AssocRegId != regId || fHead4AssocDense != denseIdx;
+        fHead4AssocActive = true;
+        fHead4AssocRegId = regId;
+        fHead4AssocDense = denseIdx;
+        if (changed) logHead4AssociationBounded(fb, denseIdx, true);
+    }
+    void syncHead4AssociationLocked() {
+        IOService *fb4 = fFBs[NVRM_FB_LOGICAL_HYBRID_HEAD];
+        unsigned denseIdx = 0;
+        if (findVerifiedHead4PipeLocked(fb4, &denseIdx)) {
+            publishHead4AssociationLocked(fb4, denseIdx);
+        } else {
+            clearHead4AssociationLocked();
+        }
+    }
     bool hasActiveHead() const {
         return nm_optc_has_active_head(fFB != nullptr ? 1 : 0, gNmHybrid, gNvIgpu, fFBs[4] != nullptr ? 1 : 0) != 0;
     }
@@ -579,36 +687,64 @@ public:
         (void)ref; (void)note;
         NVAccel *me = (NVAccel *)target;
         if (!me || !newService) return true;
-        unsigned idx = 0;
-        OSNumber *num = OSDynamicCast(OSNumber, newService->getProperty("IOFBDependentIndex"));
-        if (num) idx = num->unsigned32BitValue();
-        const char *what = "kept";
-        if (idx >= kNvMaxFB) what = "OUT OF RANGE -- this head will get no pipe";
-        else {
-            newService->retain();
-            if (OSCompareAndSwapPtr(nullptr, newService, (void *volatile *)&me->fFBs[idx])) OSBitOrAtomic(1u << idx, &gNvHeadsPublished);
-            else { newService->release(); what = "DUPLICATE -- the first one keeps the slot"; }
+        const enum nvrm_fb_kind kind = classifyFramebuffer(newService);
+        int hasId = 0, hasIdx = 0;
+        uint64_t depId = 0; uint32_t localIdx = 0;
+        readFbTopologyProps(newService, &hasId, &depId, &hasIdx, &localIdx);
+        const int logical = nvrm_fb_logical_head(kind, hasId, depId, hasIdx, localIdx);
+        if (logical < 0 || (unsigned)logical >= kNvMaxFB) {
+            ALOG("%s rejected -- class %s depID=0x%llx (has=%d) localIdx=%u (has=%d) invalid for logical topology",
+                 newService->getName(), newService->getMetaClass()->getClassName(),
+                 (unsigned long long)depId, hasId, localIdx, hasIdx);
+            return true;
         }
-        newService->retain();
-        if (idx == 0 && me->fFBs[0] == newService) {
-            IOService *old;
-            do { old = me->fFB; } while (!OSCompareAndSwapPtr(old, newService, (void *volatile *)&me->fFB));
-            if (old == newService) newService->release();
-            else if (old) {
-                bool slotted = false;
-                for (unsigned j = 0; j < kNvMaxFB; j++) if (me->fFBs[j] == old) slotted = true;
-                ALOG("fFB: head 0 (%s) displaced %s, which published first (%s)", newService->getName(), old->getName(),
-                     slotted ? "its extra reference returned" : "NOT slotted: keeping its reference rather than risk a reader");
-                if (slotted) old->release();
+        const unsigned slot = (unsigned)logical;
+        const char *what = "kept";
+        bool validOwner = false;
+        enum nm_optc_claim_outcome outcome = nm_optc_decide_claim(me->fFBs[slot], newService);
+        if (outcome == NM_OPTC_CLAIM_IDEMPOTENT) {
+            OSBitOrAtomic(1u << slot, &gNvHeadsPublished);
+            what = "idempotent";
+            validOwner = true;
+        } else if (outcome == NM_OPTC_CLAIM_ACQUIRED) {
+            newService->retain();
+            if (OSCompareAndSwapPtr(nullptr, newService, (void *volatile *)&me->fFBs[slot])) {
+                OSBitOrAtomic(1u << slot, &gNvHeadsPublished);
+                validOwner = true;
+            } else {
+                newService->release();
+                outcome = nm_optc_decide_claim(me->fFBs[slot], newService);
+                if (outcome == NM_OPTC_CLAIM_IDEMPOTENT) {
+                    OSBitOrAtomic(1u << slot, &gNvHeadsPublished);
+                    what = "idempotent";
+                    validOwner = true;
+                } else {
+                    what = "CONFLICT -- slot already claimed, rejecting";
+                }
             }
-        // only head 0 may become the primary framebuffer: an Intel panel (index 4) publishing first became fFB (10-10 log:
-        // "head 0 displaced NMIntelFB, which published first"), and on a laptop with nothing on the NVIDIA ports it stays
-        } else if (idx != 0 || !OSCompareAndSwapPtr(nullptr, newService, (void *volatile *)&me->fFB)) newService->release();
+        } else {
+            what = "CONFLICT -- slot already claimed, rejecting";
+        }
+        if (!validOwner) {
+            ALOG("%s (%s) local %u -> logical %u %s (depID 0x%llx)",
+                 newService->getName(), newService->getMetaClass()->getClassName(),
+                 localIdx, slot, what, (unsigned long long)depId);
+            return true;
+        }
+        // Only NVRMNVDAFramebuffer at logical slot 0 may become the primary NVIDIA framebuffer (fFB).
+        if (nm_optc_should_set_primary_fb(kind, logical) && me->fFBs[0] == newService && me->fFB != newService) {
+            newService->retain();
+            if (!OSCompareAndSwapPtr(nullptr, newService, (void *volatile *)&me->fFB)) {
+                newService->release();
+            }
+        }
         unsigned before = me->fDM ? me->fDM->getFramebufferCount() : 0xFFFFFFFFu;
-        ALOG("%s published -- display machine framebuffer count = %u (index %u %s)", newService->getName(), before, idx, what);
+        ALOG("%s (%s) published -- display machine framebuffer count = %u (depID 0x%llx local %u -> logical %u %s)",
+             newService->getName(), newService->getMetaClass()->getClassName(), before,
+             (unsigned long long)depId, localIdx, slot, what);
         if (gNvAccelArmed)
-            ALOG("  index %u published AFTER the arm: it gets a pipe only when debug.nvaccelfb=3 is written again, "
-                 "and WindowServer composites it only after a WindowServer restart", idx);
+            ALOG("  logical %u published AFTER the arm: it gets a pipe only when debug.nvaccelfb=3 is written again, "
+                 "and WindowServer composites it only after a WindowServer restart", slot);
         else
             ALOG("  to register it:  sudo sysctl -w debug.nvaccelfb=1   (2 = re-run the family's own sweep)");
         return true;
@@ -812,9 +948,10 @@ public:
         for (unsigned i = 0; i < kNvMaxFB; i++) {
             IOService *fb = fFBs[i];
             if (!fb) {
-                // The Intel panel (index 4, NMIntelFB) does not wait for NVIDIA heads that never publish: a machine with one
-                // monitor publishes only head 0, and the walk stopped there, so the Intel head got no pipe (measured 10-10,
-                // published 0x11 registered 0x1). Pipes are found by their framebuffer pointer, not their number.
+                // The Intel panel (logical slot 4, NMIntelFB at local index 0 on its Intel controller) does not wait for
+                // NVIDIA heads that never publish: a machine with one monitor publishes only head 0, and the walk stopped
+                // there, so the Intel head got no pipe (measured 10-10, published 0x11 registered 0x1). Pipes are found by
+                // their framebuffer pointer, not their number; dense pipe index is distinct from logical slot 4.
                 if (gNvIgpu && i < 4 && ((gNvHeadsPublished >> 4) & 1)) { i = 3; continue; }
                 if (gNvHeadsPublished >> i)
                     ALOG("  %s: index %u has not published (published 0x%x): stopping, so no head above it gets a pipe "
@@ -833,6 +970,7 @@ public:
                 ALOG("  %s: index %u -- count went %u -> %u; the family did not add it (already known, or the cap "
                      "accel+0xcb0 = %u refused it). Stopping here so no later head takes this one's pipe number.",
                      why, i, b, c, *(const volatile uint32_t *)((const uint8_t *)this + 0xcb0));
+                if (i == (unsigned)NVRM_FB_LOGICAL_HYBRID_HEAD) clearHead4AssociationLocked();
                 break;
             }
             uint8_t *dm = (uint8_t *)fDM;
@@ -842,16 +980,24 @@ public:
                 ALOG("  %s: index %u -- the family stored a NULL pipe in slot %u (0xe3b5, unchecked) and counted it; "
                      "count put back %u -> %u so no broadcast dereferences it (0xe320). This head gets no pipe this boot.",
                      why, i, b, c, fDM->getFramebufferCount());
+                if (i == (unsigned)NVRM_FB_LOGICAL_HYBRID_HEAD) clearHead4AssociationLocked();
                 break;
             }
             IOService *pfb = *(IOService *const volatile *)((const uint8_t *)pipe + 0x98);
             if (pfb != fb) {
                 ALOG("  %s: index %u -- pipe %u (%p) drives %p, not %s %p; keeping the pipe (it is real), stopping "
                      "the walk so no later head's pipe number is off by this one", why, i, b, pipe, pfb, fb->getName(), fb);
+                if (i == (unsigned)NVRM_FB_LOGICAL_HYBRID_HEAD) {
+                    clearHead4AssociationLocked();
+                    logHead4AssociationBounded(fb, b, false);
+                }
                 break;
             }
-            ALOG("  %s: index %u -> pipe %u (%p), count %u", why, i, b, pipe, c);
+            ALOG("  %s: logical %u -> dense pipe %u (%p), count %u", why, i, b, pipe, c);
             gNvHeadsPiped |= 1u << i;
+            if (i == (unsigned)NVRM_FB_LOGICAL_HYBRID_HEAD) {
+                publishHead4AssociationLocked(fb, b);
+            }
             added++;
         }
         return added;
@@ -889,6 +1035,7 @@ public:
         }
         unsigned after = fDM->getFramebufferCount();
         ALOG("  framebuffer count after = %u", after);
+        syncHead4AssociationLocked();
         if (after > before) { onCountGrewLocked(); return true; }
         return false;
     }
@@ -1110,7 +1257,7 @@ public:
                 fFBNote = addMatchingNotification(gIOFirstPublishNotification, fbm, &NVAccel::fbPublished, this, nullptr, 0);
                 fbm->release();
                 ALOG("watching for NVRMFramebuffer to publish -> notifier %p", fFBNote);
-                // a laptop whose built-in panel is on the Intel GPU: NMIntelFB publishes as head 4 of this accelerator
+                // a laptop whose built-in panel is on the Intel GPU: NMIntelFB publishes its own Intel controller local index 0 and maps to logical head 4 of this accelerator
                 if (OSDictionary *im = serviceMatching("NMIntelFB")) {
                     fIntelNote = addMatchingNotification(gIOFirstPublishNotification, im, &NVAccel::fbPublished, this, nullptr, 0);
                     im->release();
@@ -1327,6 +1474,16 @@ public:
 
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE {
         ALOG("stop");
+        if (fRegLock) {
+            IOLockLock(fRegLock);
+            clearHead4AssociationLocked();
+            IOLockUnlock(fRegLock);
+        } else {
+            clearHead4AssociationLocked();
+        }
+        if (fFBNote) { fFBNote->remove(); fFBNote = nullptr; }
+        if (fIntelNote) { fIntelNote->remove(); fIntelNote = nullptr; }
+        if (fGopNote) { fGopNote->remove(); fGopNote = nullptr; }
         stopTemperature();
         stopUtilization();
         gAccelTab.remove(this, nvaccelMultiGpu());   // a no-op without nvmultigpu=1

@@ -5,6 +5,14 @@ on:
   push:
     branches: [ main ]
 
+env:
+  NV_VERSION: "620.70.06"
+  NV_OGKM_COMMIT: "e6a2e01579fbbd1ca2ed43fef2ee2589e9bd8bd9"
+  NV_OGKM_TARBALL_SHA256: "b10b72830aa2c1367f0013d3d31fad3d0865330f37da2ed893f0a726125d4175"
+  EXPECTED_XCODE_VERSION: "16.4"
+  EXPECTED_XCODE_BUILD: "16F6"
+  EXPECTED_DEVELOPER_DIR: "/Applications/Xcode_16.4.app/Contents/Developer"
+
 jobs:
   build-optc:
     runs-on: macos-15
@@ -12,63 +20,86 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Inspect Xcode and Kernel SDK
-        run: |
-          xcodebuild -version
-          xcrun --show-sdk-path
-          xcrun clang++ --version
-
-      - name: Download NVIDIA open-gpu-kernel-modules 620.70.06 & prepare headers
-        env:
-          NV_VERSION: "620.70.06"
+      - name: Verify pinned source commit, Xcode 16.4, and SDK
         run: |
           set -euo pipefail
-          WORK="$RUNNER_TEMP/ogkm_work"
+          test -d "$EXPECTED_DEVELOPER_DIR"
+          echo "DEVELOPER_DIR=$EXPECTED_DEVELOPER_DIR" >> "$GITHUB_ENV"
+          export DEVELOPER_DIR="$EXPECTED_DEVELOPER_DIR"
+
+          SOURCE_COMMIT=$(git rev-parse HEAD)
+          test "$SOURCE_COMMIT" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          echo "SOURCE_COMMIT=$SOURCE_COMMIT" >> "$GITHUB_ENV"
+
+          XVER=$(xcodebuild -version)
+          echo "$XVER"
+          echo "$XVER" | grep -q "Xcode $EXPECTED_XCODE_VERSION"
+          echo "$XVER" | grep -q "Build version $EXPECTED_XCODE_BUILD"
+
+          SDK_PATH=$(xcrun --show-sdk-path)
+          SDK_VER=$(xcrun --show-sdk-version)
+          CLANG_VER=$(xcrun clang++ --version)
+          echo "SDK: $SDK_PATH ($SDK_VER)"
+          echo "$CLANG_VER"
+
+          {
+            echo "source_commit=$SOURCE_COMMIT"
+            echo "xcode_developer_dir=$DEVELOPER_DIR"
+            echo "$XVER"
+            echo "sdk_path=$SDK_PATH"
+            echo "sdk_version=$SDK_VER"
+            echo "$CLANG_VER"
+          } > "$RUNNER_TEMP/toolchain.txt"
+
+      - name: Verify OGKM 620.70.06, patch-chain digests, and build RM + NVKMS archives
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' > "$RUNNER_TEMP/patch_chain.txt"
+          import hashlib, pathlib
+          expected = [
+              ("610-backlight-register-log.patch", "97b7028ed45789895906615f1417103e728d8e5b86cde6fef3137c28d5a6a64d"),
+              ("610-display-completion.patch", "cc44986089be61c940bd9be5f11685b4064d1b8dde1e386e3d574b1a6dcaca7e"),
+              ("610-fsp-timer-double-destroy.patch", "da4e425a6ab8aeb8b62a1fb9e680316b1e129f9d97fa72cb5bdb3ae8926d3a93"),
+              ("610-setmode-reason.patch", "4a95bb2ed76b0fd7eae2acb7655d6d13e8d309b1603631507ff5fba85b568757"),
+              ("615-viewport-scaling.patch", "c0c30b4085a43d60c0ff0427c12e3c44dd490d6cf6a501edb446b5d9cf6b501f"),
+              ("620-color-range.patch", "a7282fac3689a004a10f4a841e908756a9aec5805f8995cd7236a5612aa0e097"),
+              ("620-yuv420-hw.patch", "05573b92f0ce17f57473e23d1d20d256e0f687cc0bf2541175df55813c1ba9d8"),
+          ]
+          pdir = pathlib.Path("kexts/NVRM/patches")
+          actual = sorted(p.name for p in pdir.glob("*.patch"))
+          assert actual == [x[0] for x in expected], f"patch list mismatch: {actual}"
+          for name, want in expected:
+              got = hashlib.sha256((pdir / name).read_bytes()).hexdigest()
+              assert got == want, f"{name}: sha256 {got} != {want}"
+              print(f"{got}  {name}")
+          PY
+          cat "$RUNNER_TEMP/patch_chain.txt"
+
+          WORK="$RUNNER_TEMP/rm_work_fresh"
+          rm -rf "$WORK"
           mkdir -p "$WORK"
-          curl -fsSL "https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/${NV_VERSION}.tar.gz" -o "$WORK/ogkm.tar.gz"
+          curl -fsSL "https://github.com/NVIDIA/open-gpu-kernel-modules/archive/${NV_OGKM_COMMIT}.tar.gz" -o "$WORK/ogkm.tar.gz"
+          GOT_SHA=$(shasum -a 256 "$WORK/ogkm.tar.gz" | awk '{print $1}')
+          echo "OGKM tarball sha256: $GOT_SHA"
+          test "$GOT_SHA" = "$NV_OGKM_TARBALL_SHA256"
+
           tar -xzf "$WORK/ogkm.tar.gz" -C "$WORK"
           PRISTINE="$WORK/open-gpu-kernel-modules-${NV_VERSION}"
+          mv "$WORK/open-gpu-kernel-modules-${NV_OGKM_COMMIT}" "$PRISTINE"
           test -d "$PRISTINE/src/nvidia"
-          bash tools/test_patch_chain.sh "$PRISTINE"
+          test -d "$PRISTINE/src/nvidia-modeset"
+
+          bash tools/test_patch_chain.sh "$PRISTINE" | tee -a "$RUNNER_TEMP/patch_chain.txt"
+          bash build/build_rm620.sh "$WORK" "$PRISTINE" 2>&1 | tee "$RUNNER_TEMP/nvrm_rm620.log"
+          grep -q "failed: 0 of " "$RUNNER_TEMP/nvrm_rm620.log"
+          bash build/build_kms620.sh "$WORK" 2>&1 | tee "$RUNNER_TEMP/nvrm_kms620.log"
+          grep -q "failed: 0 of " "$RUNNER_TEMP/nvrm_kms620.log"
+
           T="$WORK/ogkm-${NV_VERSION}"
-          cp -R "$PRISTINE" "$T"
-          : > "$T/.nm-patches"
-          for f in kexts/NVRM/patches/*.patch; do
-            ok=0
-            for root in "" "src/nvidia-modeset"; do
-              ( cd "$T/$root" && patch -p1 --fuzz=0 --dry-run < "$GITHUB_WORKSPACE/$f" >/dev/null 2>&1 && patch -p1 --fuzz=0 --no-backup-if-mismatch < "$GITHUB_WORKSPACE/$f" >/dev/null ) && { ok=1; break; }
-            done
-            [ "$ok" = 1 ] || { echo "Patch failed: $f"; exit 2; }
-            basename "$f" >> "$T/.nm-patches"
-          done
-          python3 - "$T" <<'PY'
-          import os, sys
-          t = sys.argv[1]
-          def edit(rel, old, new):
-              p = os.path.join(t, rel); s = open(p).read()
-              if new in s: return
-              assert s.count(old) == 1, f"{rel}: anchor found {s.count(old)} times"
-              s = s.replace(old, new); open(p + ".tmp", "w").write(s); os.replace(p + ".tmp", p)
-          edit("src/common/sdk/nvidia/inc/cpuopsys.h", "defined(__INTEGRITY) ) && !defined(nvmacosx)", "defined(__INTEGRITY) || defined(NV_DARWIN) ) && !defined(nvmacosx)")
-          for rel in ("src/common/inc/nvVer.h", "src/common/inc/nvUnixVersion.h"):
-              edit(rel, "defined(NV_QNX) || defined(NV_INTEGRITY) || \\", "defined(NV_QNX) || defined(NV_INTEGRITY) || defined(NV_DARWIN) || \\")
-          edit("src/common/inc/nvBldVer.h", "#if defined(NV_LINUX) || defined(NV_BSD) || defined(NV_SUNOS)\n", "#if defined(NV_LINUX) || defined(NV_BSD) || defined(NV_SUNOS) || defined(NV_DARWIN)\n")
-          PY
-          cd "$T/src/nvidia"
-          mkdir -p _out/Darwin_x86_64
-          make -n TARGET_OS=Darwin TARGET_ARCH=x86_64 NV_VERBOSE=1 2>/dev/null > "$WORK/make-n.txt"
-          grep -E "^echo .*version\.h" "$WORK/make-n.txt" > "$WORK/pre.sh"
-          bash "$WORK/pre.sh"
-          grep " -c " "$WORK/make-n.txt" | python3 -c '
-          import sys
-          for l in sys.stdin:
-              l = l.rstrip("\n")
-              assert l.startswith("cc "), l[:40]
-              l = "clang -arch x86_64 -mmacosx-version-min=15.0 -mkernel -DNV_DARWIN -fcf-protection=branch " + l[3:]
-              l = l.replace(" -mcmodel=kernel", "").replace(" -fno-pic", "")
-              print(l)' > _out/Darwin_x86_64/compile_cmds.sh
-          test -s _out/Darwin_x86_64/compile_cmds.sh
-          head -n 1 _out/Darwin_x86_64/compile_cmds.sh
+          test -f "$T/src/nvidia/_out/Darwin_x86_64/libnvkernel.a"
+          test -f "$T/src/nvidia-modeset/_out/Darwin_x86_64/libnvkms.a"
+          echo "OGKM_PRISTINE=$PRISTINE" >> "$GITHUB_ENV"
           echo "OGKM_DIR=$T" >> "$GITHUB_ENV"
 
       - name: Build NMIntelFB.kext
@@ -78,8 +109,10 @@ jobs:
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/out/intelfb"
-          bash kexts/NMIntelFB/build.sh "$OUT"
+          rm -rf "$OUT"
+          bash kexts/NMIntelFB/build.sh "$OUT" 2>&1 | tee "$RUNNER_TEMP/nmintelfb_build.log"
           test -f "$OUT/NMIntelFB.kext/Contents/MacOS/NMIntelFB"
+          test -f "$OUT/NMIntelFBVirtual.kext/Contents/MacOS/NMIntelFBVirtual"
 
       - name: Build NVAccel.kext (macOS 15 + macOS 26 Tahoe)
         env:
@@ -87,57 +120,292 @@ jobs:
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/out/accel"
-          OGKM="$OGKM_DIR" bash build/accel_build_all.sh kexts/NVRM "$OUT"
+          rm -rf "$OUT"
+          OGKM="$OGKM_DIR" bash build/accel_build_all.sh kexts/NVRM "$OUT" 2>&1 | tee "$RUNNER_TEMP/nvaccel_build.log"
+          test -f "$OUT/15/NVAccel.kext/Contents/MacOS/NVAccel"
+          test -f "$OUT/26/NVAccel.kext/Contents/MacOS/NVAccel"
 
-      - name: Verify kext libraries, Mach-O exports, and Info.plist
+      - name: Build NVRM.kext (fresh output dir)
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/out/nvrm"
+          rm -rf "$OUT"
+          NVRM_PRISTINE_OGKM="$OGKM_PRISTINE" bash build/build_nvrm.sh kexts/NVRM "$OGKM_DIR" "$OUT" 2>&1 | tee "$RUNNER_TEMP/nvrm_build.log"
+          test -f "$OUT/NVRM.kext/Contents/MacOS/NVRM"
+          test -f "$OUT/imports.txt"
+          test -f "$OUT/symbols.txt"
+
+      - name: Verify libraries, Info.plists, Mach-O UUIDs, ABI & instruction contracts
         run: |
           set -euo pipefail
           INT="$RUNNER_TEMP/out/intelfb/NMIntelFB.kext"
+          INTV="$RUNNER_TEMP/out/intelfb/NMIntelFBVirtual.kext"
           ACC15="$RUNNER_TEMP/out/accel/15/NVAccel.kext"
           ACC26="$RUNNER_TEMP/out/accel/26/NVAccel.kext"
-          bash build/check_kext_libraries.sh "$INT" "$ACC15" "$ACC26"
-          for K in "$INT" "$ACC15" "$ACC26"; do
+          NVRM="$RUNNER_TEMP/out/nvrm/NVRM.kext"
+
+          bash build/check_kext_libraries.sh "$INT" "$ACC15" "$ACC26" "$NVRM" | tee "$RUNNER_TEMP/check_kext_libraries.txt"
+
+          for PAIR in "NMIntelFB:$INT" "NVAccel15:$ACC15" "NVAccel26:$ACC26" "NVRM:$NVRM"; do
+            label="${PAIR%%:*}"
+            K="${PAIR#*:}"
             n=$(basename "$K" .kext)
             b="$K/Contents/MacOS/$n"
             plutil -lint "$K/Contents/Info.plist"
-            xcrun otool -hv "$b"
-            xcrun otool -l "$b" | grep -A 3 LC_UUID || true
-            xcrun nm -g "$b" | grep -E "kmod_info|MetaClass" | head -n 10
-            xcrun nm -u "$b" > "$RUNNER_TEMP/${n}_imports.txt"
-            test -s "$RUNNER_TEMP/${n}_imports.txt"
+            lipo -archs "$b" | grep -qx "x86_64"
+            xcrun otool -hv "$b" | grep -q "KEXT_BUNDLE"
+            xcrun otool -l "$b" | grep -A 3 LC_UUID | tee "$RUNNER_TEMP/${label}_uuid.txt"
+            xcrun nm -g "$b" | grep -q "_kmod_info"
+            xcrun nm "$b" | grep -q "gMetaClass"
+            xcrun nm -u "$b" > "$RUNNER_TEMP/${label}_imports.txt"
+            xcrun nm "$b" > "$RUNNER_TEMP/${label}_symbols.txt"
+            test -s "$RUNNER_TEMP/${label}_imports.txt"
+            test -s "$RUNNER_TEMP/${label}_symbols.txt"
           done
-          xcrun nm -g "$INT/Contents/MacOS/NMIntelFB" > "$RUNNER_TEMP/NMIntelFB_symbols.txt"
-          xcrun nm -g "$ACC26/Contents/MacOS/NVAccel" > "$RUNNER_TEMP/NVAccel26_symbols.txt"
 
-      - name: Run Option C unit tests and upstream safety gates
+          {
+            echo "=== ABI header lock checks ==="
+            diff -u kexts/NVRM/nvrm_vram_abi.h kexts/NVRMFB/nvrm_vram_abi.h
+            diff -u kexts/NVRM/nvrm_vram_abi.h kexts/NMIntelFB/nvrm_vram_abi.h
+            diff -u kexts/NVRM/nvrm_gpuva_abi.h kexts/NVRMFB/nvrm_gpuva_abi.h
+            grep -q "^#define NVRM_VRAM_ABI_VERSION 2u" kexts/NVRM/nvrm_vram_abi.h
+            grep -q "^#define NVRM_GPUVA_ABI_VERSION 1u" kexts/NVRM/nvrm_gpuva_abi.h
+            grep -q "^#define NVRM_DISPLAY_PTRS_ABI_VERSION 1u" kexts/NVRM/nvrm_gpuva_abi.h
+            grep -q "^#define NVRM_FLIP_ABI_VERSION 2u" kexts/NVRM/nvrm_gpuva_abi.h
+            grep -q "^#define NVRM_SURFSHARE_VERSION 2u" kexts/NVRM/nvrm_surfshare_abi.h
+            grep -q "^#define NVRM_SS_RM_VERSION 2u" kexts/NVRM/nvrm_surfshare_abi.h
+            echo "OK: ABI headers and version pins match stock v3.0 NVRMFB/NVRMAGDC"
+
+            echo "=== NMIntelFB instruction contract ==="
+            python3 - \
+              "$INT/Contents/MacOS/NMIntelFB" "$RUNNER_TEMP/out/intelfb/NMIntelFB.o" \
+              "$INTV/Contents/MacOS/NMIntelFBVirtual" "$RUNNER_TEMP/out/intelfb/NMIntelFBVirtual.o" <<'PY'
+          import pathlib, subprocess, sys
+
+          INTEL_BYTES = b"\x01\x00\x00\x00NMIN"
+          NVIDIA_BYTES = b"\x01\x00\x00\x00MRVN"
+
+          for label, bin_p, obj_p in [
+              ("NMIntelFB", sys.argv[1], sys.argv[2]),
+              ("NMIntelFBVirtual", sys.argv[3], sys.argv[4]),
+          ]:
+              raw = pathlib.Path(bin_p).read_bytes()
+              assert INTEL_BYTES in raw, f"{label}: missing Intel controller ID bytes"
+              assert NVIDIA_BYTES not in raw, f"{label}: stale NVIDIA shared ID bytes present"
+              strs = subprocess.check_output(["strings", "-a", bin_p], text=True, errors="replace")
+              assert "IOFBDependentID" in strs and "IOFBDependentIndex" in strs
+              # Check relocation/instruction order on the object file before final link
+              dis_o = subprocess.check_output(["xcrun", "otool", "-tV", obj_p], text=True)
+              s_idx = dis_o.index("__ZN9NMIntelFB5startEP9IOService:")
+              nxt = dis_o.find("\n__", s_idx + 10)
+              start_dis = dis_o[s_idx:nxt if nxt != -1 else len(dis_o)]
+              fb_start_pos = start_dis.index("__ZN13IOFramebuffer5startEP9IOService")
+              if "4e4d494e00000001" in start_dis.lower():
+                  id_pos = start_dis.lower().index("4e4d494e00000001")
+              else:
+                  id_pos = start_dis.index("publishDependentIdentity")
+                  assert "4e4d494e00000001" in dis_o.lower(), f"{label}: missing Intel ID in object"
+              assert id_pos < fb_start_pos, f"{label}: identity set after IOFramebuffer::start"
+              print(f"OK {label}: Intel ID 0x4e4d494e00000001 + local 0 before IOFramebuffer::start, no stale NVIDIA ID")
+          PY
+
+            echo "=== NVAccel 15 & 26 contract ==="
+            for PAIR in "NVAccel15:$ACC15/Contents/MacOS/NVAccel:$RUNNER_TEMP/out/accel/15/nvrm-accel.o" "NVAccel26:$ACC26/Contents/MacOS/NVAccel:$RUNNER_TEMP/out/accel/26/nvrm-accel.o"; do
+              acc_label="${PAIR%%:*}"
+              rest="${PAIR#*:}"
+              acc_bin="${rest%%:*}"
+              acc_obj="${rest#*:}"
+              python3 - "$acc_label" "$acc_bin" "$acc_obj" <<'PY'
+          import pathlib, subprocess, sys
+          label, bin_p, obj_p = sys.argv[1], sys.argv[2], sys.argv[3]
+          raw = pathlib.Path(bin_p).read_bytes()
+          assert b"\x01\x00\x00\x00NMIN" in raw, f"{label}: missing Intel controller ID bytes"
+          assert b"\x01\x00\x00\x00MRVN" in raw, f"{label}: missing NVIDIA/GOP controller ID bytes"
+          strs = subprocess.check_output(["strings", "-a", bin_p], text=True, errors="replace")
+          for need in ("NVAccelHead4RegistryID", "NVAccelHead4DensePipeIndex", "NMIntelFB", "NMGopFB", "NVRMNVDAFramebuffer"):
+              assert need in strs, f"{label}: missing string {need}"
+          dis_o = subprocess.check_output(["xcrun", "otool", "-tV", obj_p], text=True)
+          assert "__ZN7NVAccel11fbPublishedEPvS0_P9IOServiceP10IONotifier:" in dis_o
+          print(f"OK {label}: topology IDs, metaCast classes, and head4 association properties verified")
+          PY
+            done
+
+            echo "=== NVRM rtd3 & ABI export contract ==="
+            python3 - "$NVRM/Contents/MacOS/NVRM" "$RUNNER_TEMP/out/nvrm/NVRM.o" <<'PY'
+          import pathlib, subprocess, sys
+          nvrm_bin, nvrm_o = sys.argv[1], sys.argv[2]
+          raw = pathlib.Path(nvrm_bin).read_bytes()
+          assert b"\x01\x00\x00\x00NMIN" in raw, "NVRM missing Intel controller ID bytes"
+          assert b"\x01\x00\x00\x00MRVN" in raw, "NVRM missing NVIDIA/GOP controller ID bytes"
+          strs = subprocess.check_output(["strings", "-a", nvrm_bin], text=True, errors="replace")
+          for need in (
+              "NMIntelFB", "NMGopFB", "NVRMNVDAFramebuffer", "IOFBDependentID", "IOFBDependentIndex",
+              "nvDisplayPointers", "nvGpuVaAlloc", "nvGpuVaMap", "nvGpuVaFree",
+              "nvSurfShareRm", "nvSurfPageoff", "nvNewAccelClient", "NVRMGpuUtilization",
+              "NVRMBootRaster", "NVRMBootScreen", "NVRMBootScreenDone", "NVRMBacklight",
+              "NVRMDdcTransfer", "NVRMDpAux", "NVRMGpuReady", "NVRMGpuPower",
+          ):
+              assert need in strs, f"NVRM missing string {need}"
+          dis_o = subprocess.check_output(["xcrun", "otool", "-tV", nvrm_o], text=True)
+          rtd_idx = dis_o.index("__ZL9rtd3HeadsPv:")
+          nxt = dis_o.find("\n__", rtd_idx + 10)
+          rtd_dis = dis_o[rtd_idx:nxt if nxt != -1 else len(dis_o)].lower()
+          assert "4e4d494e00000001" in rtd_dis, "NVRM rtd3Heads missing Intel controller ID"
+          assert "4e56524d00000001" in rtd_dis, "NVRM rtd3Heads missing NVIDIA/GOP controller ID"
+          print("OK NVRM: rtd3Heads carries Intel + NVIDIA/GOP topology checks and all platform-function ABI strings intact")
+          PY
+          } | tee "$RUNNER_TEMP/contract_checks.txt"
+
+      - name: Run Option C focused C tests and static upstream safety gates
         run: |
           set -euo pipefail
-          cc -O1 -Wall -Werror -I./kexts/NMIntelFB -I./kexts/NVRM/accel -I./kexts/NVRM \
-            tools/test_optc_policy.c -o "$RUNNER_TEMP/test_optc_policy"
-          "$RUNNER_TEMP/test_optc_policy"
-          cc -O1 -Wall -Werror -I./kexts/NVRM/accel \
-            tools/test_hybrid_present.c -o "$RUNNER_TEMP/test_hybrid_present"
-          "$RUNNER_TEMP/test_hybrid_present"
-          bash tools/hybrid_verify.sh
-          python3 tools/test_hybrid_wiring.py
-          python3 tools/test_sysctl_allowlist.py
+          {
+            echo "=== [static-host] tools/test_optc_policy.c ==="
+            cc -O1 -Wall -Werror -I./kexts/NMIntelFB -I./kexts/NVRM/accel -I./kexts/NVRM \
+              tools/test_optc_policy.c -o "$RUNNER_TEMP/test_optc_policy"
+            "$RUNNER_TEMP/test_optc_policy"
 
-      - name: Stage and verify Option C artifacts
+            echo "=== [static-host] tools/test_hybrid_present.c ==="
+            cc -O1 -Wall -Werror -I./kexts/NVRM/accel \
+              tools/test_hybrid_present.c -o "$RUNNER_TEMP/test_hybrid_present"
+            "$RUNNER_TEMP/test_hybrid_present"
+
+            echo "=== [static-host] tools/test_hybrid_rtd3.c ==="
+            cc -Wall -Werror -I./kexts/NVRM \
+              tools/test_hybrid_rtd3.c -o "$RUNNER_TEMP/test_hybrid_rtd3"
+            "$RUNNER_TEMP/test_hybrid_rtd3"
+
+            echo "=== [static-host] tools/test_hybrid_fb_dependent_id.py ==="
+            python3 tools/test_hybrid_fb_dependent_id.py
+
+            echo "=== [static-host] tools/test_hybrid_wiring.py ==="
+            python3 tools/test_hybrid_wiring.py
+
+            echo "=== [static-host] tools/test_sysctl_allowlist.py ==="
+            python3 tools/test_sysctl_allowlist.py
+
+            echo "=== [static-host] tools/test_nv_rtd3_policy.py ==="
+            python3 tools/test_nv_rtd3_policy.py
+
+            echo "=== [static-host] tools/test_fb_hdr.py ==="
+            python3 tools/test_fb_hdr.py
+
+            echo "=== [static-host] tools/test_gopfb_wiring.py ==="
+            python3 tools/test_gopfb_wiring.py
+
+            echo "=== [static-fixture] tools/test_hybrid_scripts.sh ==="
+            bash tools/test_hybrid_scripts.sh
+
+            echo "=== [static-host] tools/hybrid_verify.sh (no runtime log on CI runner) ==="
+            bash tools/hybrid_verify.sh
+          } 2>&1 | tee "$RUNNER_TEMP/tests.txt"
+
+      - name: Stage and verify Option C triple artifacts and complete manifest
         run: |
           set -euo pipefail
           STAGE="$RUNNER_TEMP/optc-artifact"
+          rm -rf "$STAGE"
           mkdir -p "$STAGE/26" "$STAGE/15" "$STAGE/logs"
+
           cp -R "$RUNNER_TEMP/out/intelfb/NMIntelFB.kext" "$STAGE/NMIntelFB.kext"
           cp -R "$RUNNER_TEMP/out/accel/26/NVAccel.kext" "$STAGE/26/NVAccel.kext"
           cp -R "$RUNNER_TEMP/out/accel/15/NVAccel.kext" "$STAGE/15/NVAccel.kext"
-          cp "$RUNNER_TEMP/out/intelfb/NMIntelFB.err" "$STAGE/logs/" 2>/dev/null || true
+          cp -R "$RUNNER_TEMP/out/nvrm/NVRM.kext" "$STAGE/NVRM.kext"
+
+          cp "$RUNNER_TEMP/out/intelfb/NMIntelFB.err" "$STAGE/logs/NMIntelFB.err" 2>/dev/null || true
+          cp "$RUNNER_TEMP/out/intelfb/NMIntelFB.link.err" "$STAGE/logs/NMIntelFB.link.err" 2>/dev/null || true
+          cp "$RUNNER_TEMP/out/accel/15/accel.err" "$STAGE/logs/accel15.err"
+          cp "$RUNNER_TEMP/out/accel/15/accelld.err" "$STAGE/logs/accel15ld.err"
           cp "$RUNNER_TEMP/out/accel/26/accel.err" "$STAGE/logs/accel26.err"
           cp "$RUNNER_TEMP/out/accel/26/accelld.err" "$STAGE/logs/accel26ld.err"
-          cp "$RUNNER_TEMP/NMIntelFB_imports.txt" "$RUNNER_TEMP/NMIntelFB_symbols.txt" \
-             "$RUNNER_TEMP/NVAccel_imports.txt" "$RUNNER_TEMP/NVAccel26_symbols.txt" "$STAGE/logs/"
-          ( cd "$STAGE" && shasum -a 256 NMIntelFB.kext/Contents/MacOS/NMIntelFB \
+          cp "$RUNNER_TEMP/out/nvrm/link.err" "$STAGE/logs/nvrm_link.err"
+          cp "$RUNNER_TEMP/out/nvrm/symbols.txt" "$STAGE/logs/NVRM_unstripped_symbols.txt"
+          cp "$RUNNER_TEMP/out/nvrm/patch-chain.txt" "$STAGE/logs/nvrm_patch_chain.txt"
+
+          cp "$RUNNER_TEMP"/toolchain.txt "$RUNNER_TEMP"/patch_chain.txt \
+             "$RUNNER_TEMP"/nmintelfb_build.log "$RUNNER_TEMP"/nvaccel_build.log \
+             "$RUNNER_TEMP"/nvrm_rm620.log "$RUNNER_TEMP"/nvrm_kms620.log "$RUNNER_TEMP"/nvrm_build.log \
+             "$RUNNER_TEMP"/check_kext_libraries.txt "$RUNNER_TEMP"/contract_checks.txt "$RUNNER_TEMP"/tests.txt \
+             "$RUNNER_TEMP"/*_imports.txt "$RUNNER_TEMP"/*_symbols.txt "$RUNNER_TEMP"/*_uuid.txt \
+             "$STAGE/logs/"
+
+          ( cd "$STAGE" && shasum -a 256 \
+            NMIntelFB.kext/Contents/MacOS/NMIntelFB \
+            NMIntelFB.kext/Contents/Info.plist \
             26/NVAccel.kext/Contents/MacOS/NVAccel \
-            15/NVAccel.kext/Contents/MacOS/NVAccel > SHA256SUMS.txt && cat SHA256SUMS.txt )
+            26/NVAccel.kext/Contents/Info.plist \
+            15/NVAccel.kext/Contents/MacOS/NVAccel \
+            15/NVAccel.kext/Contents/Info.plist \
+            NVRM.kext/Contents/MacOS/NVRM \
+            NVRM.kext/Contents/Info.plist \
+            > SHA256SUMS.txt && cat SHA256SUMS.txt )
+
+          python3 - "$STAGE" <<'PY'
+          import hashlib, json, os, pathlib, plistlib, re, subprocess, sys
+
+          stage = pathlib.Path(sys.argv[1])
+          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+          def uuid_of(b):
+              out = subprocess.check_output(["xcrun", "otool", "-l", str(b)], text=True)
+              m = re.search(r"cmd LC_UUID.*?uuid\s+([0-9A-Fa-f-]+)", out, re.S)
+              return m.group(1).upper() if m else ""
+
+          patches = []
+          for line in (stage / "logs/patch_chain.txt").read_text().splitlines():
+              m = re.match(r"^([0-9a-f]{64})\s+(\S+\.patch)$", line.strip())
+              if m:
+                  patches.append({"file": m.group(2), "sha256": m.group(1)})
+
+          kexts = {}
+          for key, rel in [
+              ("NMIntelFB", "NMIntelFB.kext"),
+              ("NVAccel26", "26/NVAccel.kext"),
+              ("NVAccel15", "15/NVAccel.kext"),
+              ("NVRM", "NVRM.kext"),
+          ]:
+              kdir = stage / rel
+              name = kdir.stem
+              exe = kdir / "Contents/MacOS" / name
+              plist = kdir / "Contents/Info.plist"
+              pl = plistlib.loads(plist.read_bytes())
+              kexts[key] = {
+                  "bundle_id": pl.get("CFBundleIdentifier"),
+                  "bundle_version": pl.get("CFBundleVersion"),
+                  "kext_relpath": rel,
+                  "executable_relpath": f"{rel}/Contents/MacOS/{name}",
+                  "executable_sha256": sha(exe),
+                  "executable_bytes": exe.stat().st_size,
+                  "info_plist_relpath": f"{rel}/Contents/Info.plist",
+                  "info_plist_sha256": sha(plist),
+                  "macho_uuid": uuid_of(exe),
+                  "arch": subprocess.check_output(["lipo", "-archs", str(exe)], text=True).strip(),
+              }
+
+          manifest = {
+              "ci_run_id": os.environ.get("GITHUB_RUN_ID"),
+              "ci_run_number": os.environ.get("GITHUB_RUN_NUMBER"),
+              "source_commit": os.environ.get("SOURCE_COMMIT"),
+              "ogkm_version": os.environ.get("NV_VERSION"),
+              "ogkm_commit": os.environ.get("NV_OGKM_COMMIT"),
+              "ogkm_tarball_sha256": os.environ.get("NV_OGKM_TARBALL_SHA256"),
+              "xcode_version": os.environ.get("EXPECTED_XCODE_VERSION"),
+              "xcode_build": os.environ.get("EXPECTED_XCODE_BUILD"),
+              "ordered_patch_chain": patches,
+              "abi_versions": {
+                  "NVRM_VRAM_ABI_VERSION": 2,
+                  "NVRM_GPUVA_ABI_VERSION": 1,
+                  "NVRM_DISPLAY_PTRS_ABI_VERSION": 1,
+                  "NVRM_FLIP_ABI_VERSION": 2,
+                  "NVRM_SURFSHARE_VERSION": 2,
+                  "NVRM_SS_RM_VERSION": 2,
+                  "NVRM_UTILIZATION_ABI_VERSION": 1,
+              },
+              "static_verification_only": True,
+              "kexts": kexts,
+          }
+          (stage / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          print((stage / "manifest.json").read_text())
+          PY
 
       - name: Upload Option C kexts artifact
         uses: actions/upload-artifact@v4

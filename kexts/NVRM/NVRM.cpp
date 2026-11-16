@@ -86,6 +86,7 @@ static bool nvrmMultiGpu(void)
     return on == 1;
 }
 #include "nv_rtd3_policy.h"
+#include "nvrm_fb_topology.h"
 extern "C" void nv_rtd3_arm(const struct nv_rtd3_ops *ops);
 extern "C" void nvrm_power_start(nv_state_t *nv);   // nvrm_power.cpp
 extern "C" void nvrm_power_stop(void);
@@ -2225,19 +2226,43 @@ static IOACPIPlatformDevice *rtd3Acpi(NVRM *n)
     return a;
 }
 static int rtd3Heads(void *) {
-    // Every framebuffer: this GPU's own heads, and (hybrid switch on) another GPU's panel published as a head of ours.
+    // Every framebuffer: this GPU's own heads, and (hybrid switch on) another GPU's panel mapped to this accelerator.
+    // Fail-closed: if enumeration fails/invalidates or an expected hybrid panel fails topology verification, treat as lit.
     int hy = 0; { int lv = 0; const int present = PE_parse_boot_argn("nmhybrid", &lv, sizeof(lv)); hy = present && lv >= 1 && lv <= 4; }
-    OSDictionary *m = IOService::serviceMatching("IOFramebuffer"); if (!m) return 1;   // cannot look: treat as lit
+    OSDictionary *m = IOService::serviceMatching("IOFramebuffer"); if (!m) return 1;
     OSIterator *it = IOService::getMatchingServices(m); m->release();
-    int own = 0, foreign = 0;
-    if (it) {
-        while (OSObject *o = it->getNextObject()) {
-            IOService *s = OSDynamicCast(IOService, o); if (!s) continue;
-            if (s->metaCast("NVRMNVDAFramebuffer")) own++;
-            else if (OSNumber *id = OSDynamicCast(OSNumber, s->getProperty("IOFBDependentID"))) { if (id->unsigned64BitValue() == 0x4E56524D00000001ull) foreign++; }
-        }
-        it->release();
+    if (!it) return 1;
+    int own = 0, foreign = 0, unverified = 0;
+    while (OSObject *o = it->getNextObject()) {
+        IOService *s = OSDynamicCast(IOService, o);
+        if (!s) { unverified++; continue; }
+        enum nvrm_fb_kind kind = NVRM_FB_UNKNOWN;
+        if (s->metaCast("NVRMNVDAFramebuffer")) kind = NVRM_FB_NVIDIA;
+        else if (s->metaCast("NMIntelFB"))      kind = NVRM_FB_INTEL;
+        else if (s->metaCast("NMGopFB"))        kind = NVRM_FB_GOP;
+
+        OSObject *idObj = s->copyProperty("IOFBDependentID");
+        OSObject *idxObj = s->copyProperty("IOFBDependentIndex");
+        OSNumber *idNum = OSDynamicCast(OSNumber, idObj);
+        OSNumber *idxNum = OSDynamicCast(OSNumber, idxObj);
+        const int hasId = idObj ? 1 : 0;
+        const int idTypeOk = idNum ? 1 : 0;
+        const uint64_t depId = idNum ? (uint64_t)idNum->unsigned64BitValue() : 0ULL;
+        const int hasIdx = idxObj ? 1 : 0;
+        const int idxTypeOk = idxNum ? 1 : 0;
+        const uint32_t localIdx = idxNum ? (uint32_t)idxNum->unsigned32BitValue() : 0U;
+        OSSafeReleaseNULL(idObj);
+        OSSafeReleaseNULL(idxObj);
+
+        const enum nvrm_fb_rtd3_role role = nvrm_fb_classify_for_rtd3(
+            kind, hasId, depId, idTypeOk, hasIdx, localIdx, idxTypeOk);
+        if (role == NVRM_RTD3_FB_OWN) own++;
+        else if (role == NVRM_RTD3_FB_FOREIGN) foreign++;
+        else if (role == NVRM_RTD3_FB_UNVERIFIED) unverified++;
     }
+    const bool enumOk = it->isValid();
+    it->release();
+    if (!enumOk || unverified > 0) return nvrm_rtd3_evaluate_heads(enumOk ? 1 : 0, own, foreign, unverified, hy);
     return nv_rtd3_heads_lit(own, foreign, hy);
 }
 static int rtd3Clients(void *ctx) {

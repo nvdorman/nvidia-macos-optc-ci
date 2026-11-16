@@ -7,10 +7,40 @@
 #include <stdint.h>
 #include "nm_hybrid.h"
 #include "../nvrm_vram_abi.h"
+#include "../nvrm_fb_topology.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+enum nm_optc_claim_outcome {
+    NM_OPTC_CLAIM_INVALID = -1,
+    NM_OPTC_CLAIM_CONFLICT = 0,
+    NM_OPTC_CLAIM_ACQUIRED = 1,
+    NM_OPTC_CLAIM_IDEMPOTENT = 2
+};
+
+static inline enum nm_optc_claim_outcome nm_optc_decide_claim(
+    const void *current_owner, const void *candidate)
+{
+    if (!candidate) return NM_OPTC_CLAIM_INVALID;
+    if (current_owner == candidate) return NM_OPTC_CLAIM_IDEMPOTENT;
+    if (current_owner != 0) return NM_OPTC_CLAIM_CONFLICT;
+    return NM_OPTC_CLAIM_ACQUIRED;
+}
+
+static inline int nm_optc_should_set_primary_fb(enum nvrm_fb_kind kind, int logical_slot)
+{
+    return (kind == NVRM_FB_NVIDIA && logical_slot == 0) ? 1 : 0;
+}
+
+static inline int nm_optc_head4_assoc_valid(
+    const void *slot4_fb, const void *pipe_fb,
+    uint32_t dense_pipe_idx, uint32_t pipe_count, int is_inactive)
+{
+    return (slot4_fb != 0 && !is_inactive && pipe_fb == slot4_fb &&
+            dense_pipe_idx < pipe_count && dense_pipe_idx < 16u) ? 1 : 0;
+}
 
 static inline int nm_optc_should_enable_igpu(int hybrid_level, int no_igpu_boot_arg)
 {
