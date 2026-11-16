@@ -155,15 +155,20 @@ jobs:
             n=$(basename "$K" .kext)
             b="$K/Contents/MacOS/$n"
             plutil -lint "$K/Contents/Info.plist"
-            lipo -archs "$b" | grep -qx "x86_64"
-            xcrun otool -hv "$b" | grep -q "KEXT_BUNDLE"
-            xcrun otool -l "$b" | grep -A 3 LC_UUID | tee "$RUNNER_TEMP/${label}_uuid.txt"
-            xcrun nm -g "$b" | grep -q "_kmod_info"
-            xcrun nm "$b" | grep -q "gMetaClass"
+            ARCHS=$(lipo -archs "$b")
+            test "$ARCHS" = "x86_64"
+            OTOOL_HV=$(xcrun otool -hv "$b")
+            grep -Eq 'KEXT_?BUNDLE' <<<"$OTOOL_HV"
+            xcrun otool -l "$b" > "$RUNNER_TEMP/${label}_otool_l.txt"
+            grep -A 3 LC_UUID "$RUNNER_TEMP/${label}_otool_l.txt" | tee "$RUNNER_TEMP/${label}_uuid.txt"
+            test -s "$RUNNER_TEMP/${label}_uuid.txt"
             xcrun nm -u "$b" > "$RUNNER_TEMP/${label}_imports.txt"
             xcrun nm "$b" > "$RUNNER_TEMP/${label}_symbols.txt"
+            xcrun nm -g "$b" > "$RUNNER_TEMP/${label}_extsymbols.txt"
             test -s "$RUNNER_TEMP/${label}_imports.txt"
             test -s "$RUNNER_TEMP/${label}_symbols.txt"
+            grep -q "_kmod_info" "$RUNNER_TEMP/${label}_extsymbols.txt"
+            grep -q "gMetaClass" "$RUNNER_TEMP/${label}_symbols.txt"
           done
 
           {
