@@ -54,6 +54,7 @@ def execute(name, command, compile_command=None):
                 raise ValueError('invalid production case record')
             cases.append(row)
     report = {
+        'schema_version': 1,
         'source_commit': source_commit, 'ci_run_id': run_id, 'target_os_build': '25G342',
         'command': command, 'exit_code': result.returncode,
         'log_path': log.name, 'log_sha256': hashlib.sha256(log.read_bytes()).hexdigest(),

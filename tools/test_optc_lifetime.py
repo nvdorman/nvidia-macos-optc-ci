@@ -48,6 +48,7 @@ PRELUDE = r'''
 #include <condition_variable>
 #include <thread>
 #include <cstring>
+#include <vector>
 #include "nvaccel_owner_policy.h"
 #include "nvrm_gpuva_abi.h"
 #include "nvrm_vram_abi.h"
@@ -67,8 +68,11 @@ constexpr unsigned THREAD_UNINT=0, kMillisecondScale=1;
 #define NVRM_GPUVA_DRAIN_FN "nvGpuVaDrain"
 #define NVRM_OWNER_GENERATION_PROPERTY "NVVramOwnerGeneration"
 struct IOLock { std::mutex m; std::condition_variable cv; };
-void IOLockLock(IOLock *l) { l->m.lock(); }
-void IOLockUnlock(IOLock *l) { l->m.unlock(); }
+static thread_local unsigned metadataDepth;
+static void checkBackendCall();
+static void drainFromBackend();
+void IOLockLock(IOLock *l) { l->m.lock(); ++metadataDepth; }
+void IOLockUnlock(IOLock *l) { assert(metadataDepth); --metadataDepth; l->m.unlock(); }
 void IOLockWakeup(IOLock *l, void *, bool) { l->cv.notify_all(); }
 void IOLockSleep(IOLock *l, void *, unsigned) {
  std::unique_lock<std::mutex> lock(l->m, std::adopt_lock); l->cv.wait(lock); lock.release();
@@ -106,7 +110,7 @@ struct IOService : IORegistryEntry {
  static OSDictionary *serviceMatching(const char *){++matchingCalls;static OSDictionary d;d.retain();return &d;}
  static OSIterator *getMatchingServices(OSDictionary *){static OSIterator it;it.used=false;it.retain();return &it;}
  bool didTerminate(IOService *, IOOptionBits, bool *) { return true; }
- IOReturn callPlatformFunction(const OSSymbol *, bool, void *, void *, void *, void *) { return callResult; }
+ IOReturn callPlatformFunction(const OSSymbol *, bool, void *, void *, void *, void *) { checkBackendCall(); return callResult; }
 };
 unsigned IOService::matchingCalls=0;
 #define OSTypeAlloc(T) new T
@@ -116,11 +120,12 @@ struct NvKmsKapiAllocateDeviceParams { unsigned gpuId; };
 struct Kms {
  static Kms *instance;
  unsigned unmapped=0, freed=0, devices=0, allocated=0; NvKmsKapiDevice *device=nullptr;
+ bool drainDuringAllocate=false;
  Kms(){instance=this;}
- NvKmsKapiDevice *(*allocateDevice)(NvKmsKapiAllocateDeviceParams *) = [](NvKmsKapiAllocateDeviceParams *){++instance->allocated;return instance->device;};
- void (*unmapMemory)(NvKmsKapiDevice *,NvKmsKapiMemory *,int,void *) = [](NvKmsKapiDevice *,NvKmsKapiMemory *,int,void *){++instance->unmapped;};
- void (*freeMemory)(NvKmsKapiDevice *,NvKmsKapiMemory *) = [](NvKmsKapiDevice *,NvKmsKapiMemory *){++instance->freed;};
- void (*freeDevice)(NvKmsKapiDevice *) = [](NvKmsKapiDevice *){++instance->devices;};
+ NvKmsKapiDevice *(*allocateDevice)(NvKmsKapiAllocateDeviceParams *) = [](NvKmsKapiAllocateDeviceParams *){checkBackendCall();if(instance->drainDuringAllocate)drainFromBackend();++instance->allocated;return instance->device;};
+ void (*unmapMemory)(NvKmsKapiDevice *,NvKmsKapiMemory *,int,void *) = [](NvKmsKapiDevice *,NvKmsKapiMemory *,int,void *){checkBackendCall();++instance->unmapped;};
+ void (*freeMemory)(NvKmsKapiDevice *,NvKmsKapiMemory *) = [](NvKmsKapiDevice *,NvKmsKapiMemory *){checkBackendCall();++instance->freed;};
+ void (*freeDevice)(NvKmsKapiDevice *) = [](NvKmsKapiDevice *){checkBackendCall();++instance->devices;};
  void *(*allocateMemory)() = []()->void *{return nullptr;};
  bool (*mapMemory)() = [](){return false;};
 };
@@ -128,9 +133,16 @@ Kms *Kms::instance=nullptr;
 using NvKmsKapiFunctionsTable=Kms;
 using NvU32=unsigned;
 constexpr int NVKMS_KAPI_MAPPING_TYPE_KERNEL=0;
-struct thread_call {};
-void clock_interval_to_deadline(unsigned n, unsigned, uint64_t *out) { *out=n; }
-void thread_call_enter_delayed(thread_call *, uint64_t) {}
+struct thread_call { unsigned queued=0; };
+static std::mutex deadlineLock;
+static std::condition_variable deadlineCv;
+static bool blockDeadline=false,deadlineEntered=false,releaseDeadline=false;
+void clock_interval_to_deadline(unsigned n, unsigned, uint64_t *out) {
+ std::unique_lock<std::mutex> lock(deadlineLock);
+ if(blockDeadline){deadlineEntered=true;deadlineCv.notify_all();deadlineCv.wait(lock,[]{return releaseDeadline;});}
+ *out=n;
+}
+void thread_call_enter_delayed(thread_call *call, uint64_t) { assert(metadataDepth==1);++call->queued; }
 struct NVVramOwner;
 struct NVVramAllocation;
 struct NVGpuVaRecord;
@@ -149,20 +161,22 @@ struct NVVramLease {
 struct NVVramOwner : IOService {
  IOLock storage, *fLock=&storage; NVOwnerState fState;
  IOService *fNvrm=nullptr,*fStock=nullptr; bool fDirect=true,fDeferred=false,fAttached=false,fLifetimeHeld=false,fRetirementPending=false;
+ bool fInitializing=false,fReaping=false;
  unsigned fTerminateOptions=0; Kms *fKms=nullptr; NvKmsKapiDevice *fDevice=nullptr;
  NVStockLifetime *fStockLifetime=nullptr,*fDisplayLifetime[5]={};
  NVRetiredScanout fRetiredScanout[5];
  bool retireScanout(unsigned,IOService *,OSObject *,OSObject *,NVVramAllocation *,NVVramAllocation *);
  bool reapScanouts();
  NVRMRmHandles fHandles={}; NVVramAllocation *fAllocations=nullptr; NVGpuVaRecord *fReservations=nullptr;
- thread_call *fReaper=nullptr; uint64_t fMappedBytes=0; unsigned scheduled=0;
+ thread_call *fReaper=nullptr; uint64_t fMappedBytes=0;
  int failure=0; bool powered=true;
  bool active(); bool enter(); void leave(); void waitOperations(); bool borrow(); void unborrow();
- void beginDrain(); void reap(); void scheduleReap() { ++scheduled; }
+ void beginDrain(); void reap(); void scheduleReap(unsigned delayMs=1);
  bool handles(NVRMRmHandles *); bool ensureDeviceLocked();
  IORegistryEntry *fPci=nullptr;
  IOReturn cpuAccess(IOReturn (*)(void *),void *);
  IOReturn call(const char *name,void *raw) {
+  checkBackendCall();
   if (!std::strcmp(name,NVRM_OWNER_CPU_ACCESS_FN)) {
    auto *q=(NVRMOwnerCpuAccess *)raw;
    return powered && q->ownerGeneration==fState.generation ? q->body(q->context) : kIOReturnNotReady;
@@ -177,15 +191,19 @@ struct NVVramOwner : IOService {
   q->status=0; return 0;
  }
 };
+static NVVramOwner *reentrantOwner;
+static void checkBackendCall(){assert(metadataDepth==0);if(reentrantOwner)(void)reentrantOwner->active();}
+static void drainFromBackend(){assert(reentrantOwner);reentrantOwner->beginDrain();}
 struct NVVramAllocation : Object {
  NVVramOwner *fOwner=nullptr; NVVramAllocation *fNext=nullptr;
  NVBackingState fState; NVRMVramRequest fReceipt={}; unsigned fCache=kIOMapWriteCombineCache;
+ uint64_t fChargedBytes=0;
  bool acquire(NVLeaseUse,NVVramLease *); void releaseLease(NVLeaseUse); void retire(); bool park(); bool unpark();
  NVBackingKey key() const { return fState.key; }
 };
 struct NVGpuVaRecord : Object {
  NVVramOwner *fOwner; NVGpuVaRecord *fNext=nullptr;
- NVRMGpuVaRequest fRequest={}; NVVramLease fLease; NVBackingKey fKey={}; bool fMapped=false,fRetiring=false;
+ NVRMGpuVaRequest fRequest={}; NVVramLease fLease; NVBackingKey fKey={}; bool fMapped=false,fRetiring=false,fBusy=false;
  bool unmap(bool);
 };
 struct IOAddressRange { uint64_t address,length; };
@@ -223,7 +241,7 @@ struct IOAccelDisplayPipeTransaction2 {
 constexpr IOReturn kIOReturnBadArgument=3,kIOReturnUnsupported=4;
 #include "nv_iop_pixel.h"
 static uint64_t nvResPitch(const unsigned char *) { return 16; }
-static bool thread_call_cancel(thread_call *) { return true; }
+static bool thread_call_cancel(thread_call *call) { if(call)call->queued=0;return true; }
 struct NVVidMemory : Object {
  bool pin=true; unsigned prepares=0,completes=0; NVVramAllocation *fBacking=nullptr;
  bool prepare() { if(pin) ++prepares; return pin; }
@@ -277,6 +295,7 @@ METHODS = [
     "void NVVramOwner::waitOperations()", "bool NVVramOwner::borrow()", "void NVVramOwner::unborrow()",
     "bool NVVramOwner::handles(", "bool NVVramOwner::ensureDeviceLocked()", "IOReturn NVVramOwner::cpuAccess(",
     "void NVVramOwner::beginDrain()", "void NVVramOwner::reap()",
+    "void NVVramOwner::scheduleReap(",
     "bool NVVramOwner::retireScanout(", "bool NVVramOwner::reapScanouts()",
     "NVVramLease::~NVVramLease()", "void NVVramLease::reset()",
     "bool NVVramAllocation::acquire(", "void NVVramAllocation::releaseLease(",
@@ -297,9 +316,12 @@ int main() {
  NVVramOwner owner; Kms kms; NvKmsKapiDevice device; kms.device=&device;
  IOService nvrm,nub,pci; OSNumber gpuId; nub.property=&gpuId; nvrm.clients.child=&nub; owner.fNvrm=&nvrm; owner.fPci=&pci;
  assert(owner.fState.activate(first)); NVRMRmHandles initial={};
+ reentrantOwner=&owner;
  assert(owner.handles(&initial) && initial.kapiDevice==&device && kms.allocated==1 && IOService::matchingCalls==0);
  NVVramAllocation allocation; allocation.fOwner=&owner; allocation.fState.key={first,1};
  allocation.fReceipt.actualSize=16384000; allocation.fReceipt.phys=0x10000000;
+ std::vector<unsigned char> pixels(16384000);NvKmsKapiMemory memoryHandle;
+ allocation.fReceipt.kva=pixels.data();allocation.fReceipt.handle=&memoryHandle;allocation.fChargedBytes=16384000;
  allocation.retain(); owner.fAllocations=&allocation; owner.fState.allocations=1; owner.fMappedBytes=16384000;
  NVVramLease lease; assert(allocation.acquire(NVLeaseUse::Present,&lease));
  assert(allocation.park() && allocation.unpark()); assert(nvBackingKeyEqual(allocation.key(),{first,1}));
@@ -323,6 +345,23 @@ int main() {
  lease.reset(); owner.reap(); assert(!kms.freed); descriptor.free(); owner.reap();
  assert(kms.freed==1 && kms.devices==1 && owner.fState.phase==NVOwnerPhase::Dead);
  pass("client_map_lifetime");
+ assert(owner.fMappedBytes==0);
+ NVVramOwner initializing;initializing.fState.activate(first+20);initializing.fNvrm=&nvrm;initializing.fPci=&pci;
+ reentrantOwner=&initializing;kms.drainDuringAllocate=true;const unsigned freedDevices=kms.devices;
+ NVRMRmHandles refused={};assert(!initializing.handles(&refused)&&!refused.kapiDevice);
+ assert(!initializing.fInitializing&&!initializing.fState.operations&&kms.devices==freedDevices+1);
+ initializing.reap();assert(initializing.fState.phase==NVOwnerPhase::Dead);kms.drainDuringAllocate=false;
+ reentrantOwner=&owner;
+ pass("reentrant_callouts");
+ NVVramOwner scheduled;scheduled.fState.activate(first+30);scheduled.fState.drain();thread_call work;scheduled.fReaper=&work;
+ {std::lock_guard<std::mutex> lock(deadlineLock);blockDeadline=true;}
+ std::thread enqueue([&]{scheduled.scheduleReap();});
+ {std::unique_lock<std::mutex> lock(deadlineLock);deadlineCv.wait(lock,[]{return deadlineEntered;});}
+ scheduled.reap();assert(scheduled.fState.phase==NVOwnerPhase::Dead);
+ {std::lock_guard<std::mutex> lock(deadlineLock);releaseDeadline=true;deadlineCv.notify_all();}
+ enqueue.join();assert(work.queued==0);
+ {std::lock_guard<std::mutex> lock(deadlineLock);blockDeadline=false;}
+ pass("reaper_shutdown");
  NVVramOwner concurrent; concurrent.fState.activate(first+1); concurrent.fKms=&kms; concurrent.fDevice=&device;
  std::mutex barrier; std::condition_variable cv; bool entered=false,release=false;
  std::thread user([&] { assert(concurrent.enter()); { std::unique_lock<std::mutex> l(barrier); entered=true; cv.notify_all(); cv.wait(l,[&]{return release;}); } concurrent.leave(); });
@@ -333,6 +372,7 @@ int main() {
  pass("borrower_drain");
  NVVramOwner vaOwner; vaOwner.fState.activate(first+2);
  NVGpuVaRecord va; va.fOwner=&vaOwner; va.fMapped=true; va.fRequest.hVirt=1; va.fRequest.hMemory=2; va.fRequest.gpuva=0x1000;
+ va.fBusy=true;assert(!va.unmap(true)&&va.fRequest.hVirt==1);va.fBusy=false;
  vaOwner.failure=1; assert(!va.unmap(true) && va.fMapped && va.fRequest.hMemory==2 && va.fRequest.hVirt==1);
  vaOwner.failure=2; assert(!va.unmap(true) && !va.fMapped && !va.fRequest.hMemory && va.fRequest.hVirt==1);
  vaOwner.failure=0; assert(va.unmap(true) && !va.fRequest.hVirt);

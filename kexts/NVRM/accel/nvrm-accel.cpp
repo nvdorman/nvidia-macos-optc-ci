@@ -24,6 +24,7 @@
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <kern/thread_call.h>
 #include "IOAccelerator.h"
 #include "IOGraphicsAccelerator2.h"
 #include "IOAccelEventMachineFast2.h"
@@ -126,9 +127,6 @@ static constexpr uint64_t kNvUtilMaxAgeNs    = 5000000000ULL;
 extern "C" {   // kern/thread_call.h and kern/clock.h clash with the family headers here, so the KPIs are declared by hand
 struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
 int thread_call_enter_delayed(struct thread_call *call, uint64_t deadline);
-bool thread_call_cancel_wait(struct thread_call *);
-bool thread_call_cancel(struct thread_call *);
-bool thread_call_free(struct thread_call *);
 void clock_interval_to_deadline(uint32_t interval, uint32_t scale_factor, uint64_t *result);
 uint64_t mach_absolute_time(void);
 uint64_t mach_continuous_time(void);
@@ -1423,7 +1421,8 @@ NVVramOwner *NVVramOwner::create(IOService *provider, IOPCIDevice *pci, bool dir
     NVVramOwner *o = OSTypeAlloc(NVVramOwner);
     if (!o || !o->init()) { if (o) o->release(); return nullptr; }
     o->fLock = IOLockAlloc();
-    o->fReaper = thread_call_allocate(&NVVramOwner::reapCall, o);
+    o->fReaper = thread_call_allocate_with_options(&NVVramOwner::reapCall, o,
+        THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
     if (!o->fLock || !o->fReaper) { o->release(); return nullptr; }
     uint64_t previous = __atomic_load_n(&gOwnerGeneration, __ATOMIC_ACQUIRE), generation;
     do {
@@ -1452,34 +1451,50 @@ IOReturn NVVramOwner::call(const char *name, void *request)
 }
 bool NVVramOwner::bindDisplay(IOService *fb, unsigned head)
 {
-    if (!fb || head >= 5) return false;
+    if (!fb || head >= 5 || !enter()) return false;
     IORegistryEntry *parent = fb;
     for (unsigned depth = 0; parent && parent != fPci && depth < 8; ++depth) parent = parent->getParentEntry(gIOServicePlane);
-    if (parent != fPci) return false;
+    if (parent != fPci) { leave(); return false; }
     IOLockLock(fLock);
-    if (fDisplayLifetime[head]) {
-        bool same = fState.phase == NVOwnerPhase::Active && fDisplayLifetime[head]->fFramebuffer == fb;
-        IOLockUnlock(fLock); return same;
+    if (fDisplayLifetime[head] || fDisplayBinding[head] || fState.phase != NVOwnerPhase::Active) {
+        const bool same = fState.phase == NVOwnerPhase::Active && fDisplayLifetime[head] &&
+                          fDisplayLifetime[head]->fFramebuffer == fb;
+        IOLockUnlock(fLock); leave(); return same;
     }
-    if (fState.phase != NVOwnerPhase::Active) { IOLockUnlock(fLock); return false; }
-    NVStockLifetime *guard = OSTypeAlloc(NVStockLifetime);
-    bool initialized = guard && guard->init();
-    bool attached = initialized && guard->attach(fb);
-    bool started = attached && guard->start(fb);
-    if (started) {
-        guard->fOwner = this; guard->fFramebuffer = fb; fb->retain(); fDisplayLifetime[head] = guard;
-    } else {
-        if (attached) guard->detach(fb);
-        if (guard) guard->release();
-    }
+    fDisplayBinding[head] = true;
     IOLockUnlock(fLock);
-    return started;
+    NVStockLifetime *guard = OSTypeAlloc(NVStockLifetime);
+    const bool initialized = guard && guard->init();
+    if (initialized) { guard->fOwner = this; guard->fFramebuffer = fb; fb->retain(); }
+    const bool attached = initialized && guard->attach(fb);
+    const bool started = attached && guard->start(fb);
+    IOLockLock(fLock);
+    const bool published = started && !fb->isInactive() && fState.phase == NVOwnerPhase::Active;
+    if (published) fDisplayLifetime[head] = guard;
+    fDisplayBinding[head] = false;
+    IOLockUnlock(fLock);
+    if (!published && guard) {
+        guard->fOwner = nullptr;
+        if (guard->fDeferred) { bool defer = false; guard->IOService::didTerminate(fb, guard->fOptions, &defer); }
+        else { if (started) guard->stop(fb); if (attached) guard->detach(fb); }
+        guard->release();
+    }
+    leave();
+    return published;
 }
 bool NVVramOwner::ensureDeviceLocked()
 {
-    if (fDevice) return true;
-    if (fState.phase != NVOwnerPhase::Active || fNvrm->isInactive()) return false;
-    if (!fDirect) {
+    if (fDevice) return fState.phase == NVOwnerPhase::Active;
+    if (fInitializing || !fState.enter()) return false;
+    fInitializing = true;
+    IOLockUnlock(fLock);
+    IOService *stock = nullptr;
+    NVStockLifetime *guard = nullptr;
+    bool attached = false, started = false;
+    NvKmsKapiFunctionsTable *kms = nullptr;
+    NvKmsKapiDevice *device = nullptr;
+    NVRMRmHandles handles = {}; handles.version = NVRM_GPUVA_ABI_VERSION;
+    if (!fNvrm->isInactive() && !fDirect) {
         OSDictionary *matching = IOService::serviceMatching("NVRMNVDAFramebuffer");
         OSIterator *it = matching ? IOService::getMatchingServices(matching) : nullptr;
         if (matching) matching->release();
@@ -1488,48 +1503,68 @@ bool NVVramOwner::ensureDeviceLocked()
                 IOService *fb = OSDynamicCast(IOService, object);
                 IORegistryEntry *p = fb;
                 for (unsigned depth = 0; p && p != fPci && depth != 8; ++depth) p = p->getParentEntry(gIOServicePlane);
-                if (fb && p == fPci && !fb->isInactive()) { fStock = fb; fStock->retain(); break; }
+                if (fb && p == fPci && !fb->isInactive()) { stock = fb; stock->retain(); break; }
             }
             it->release();
         }
-        if (!fStock) return false;
-        NVStockLifetime *guard = OSTypeAlloc(NVStockLifetime);
-        if (!guard || !guard->init()) { if (guard) guard->release(); fStock->release(); fStock = nullptr; return false; }
-        guard->fOwner = this;
-        if (!guard->attach(fStock)) { guard->release(); fStock->release(); fStock = nullptr; return false; }
-        if (!guard->start(fStock)) { guard->detach(fStock); guard->release(); fStock->release(); fStock = nullptr; return false; }
-        guard->fFramebuffer = fStock; fStock->retain();
-        fStockLifetime = guard;
-        const OSSymbol *symbol = OSSymbol::withCStringNoCopy(NVRM_GPUVA_FN_HANDLES);
-        fHandles = {}; fHandles.version = NVRM_GPUVA_ABI_VERSION;
-        IOReturn r = symbol ? fStock->callPlatformFunction(symbol, false, &fHandles, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
-        if (symbol) symbol->release();
-        if (r != kIOReturnSuccess || !fHandles.kapiDevice) {
-            fStockLifetime->stop(fStock); fStockLifetime->detach(fStock); fStockLifetime->release(); fStockLifetime = nullptr;
-            fStock->release(); fStock = nullptr; fHandles = {}; return false;
+        if (stock) {
+            guard = OSTypeAlloc(NVStockLifetime);
+            if (guard && guard->init()) {
+                guard->fOwner = this; guard->fFramebuffer = stock; stock->retain();
+                attached = guard->attach(stock);
+                started = attached && guard->start(stock);
+                if (started) {
+                    const OSSymbol *symbol = OSSymbol::withCStringNoCopy(NVRM_GPUVA_FN_HANDLES);
+                    const IOReturn result = symbol ? stock->callPlatformFunction(symbol, false, &handles, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
+                    if (symbol) symbol->release();
+                    if (result == kIOReturnSuccess) device = (NvKmsKapiDevice *)handles.kapiDevice;
+                }
+            }
         }
-        fDevice = (NvKmsKapiDevice *)fHandles.kapiDevice; return true;
-    }
-    NVRMDisplayPointers dp = {}; dp.version = NVRM_DISPLAY_PTRS_ABI_VERSION;
-    if (call(NVRM_DISPLAY_PTRS_FN, &dp) != kIOReturnSuccess) return false;
-    NvKmsKapiFunctionsTable *k = (NvKmsKapiFunctionsTable *)dp.kapi;
-    if (!k || !k->allocateDevice || !k->freeDevice || !k->allocateMemory || !k->freeMemory || !k->mapMemory || !k->unmapMemory) return false;
-    NvU32 gpuId = 0; bool found = false;
-    OSIterator *clients = fNvrm->getClientIterator();
-    if (clients) {
-        while (OSObject *object = clients->getNextObject()) {
-            IOService *s = OSDynamicCast(IOService, object);
-            OSNumber *n = s ? OSDynamicCast(OSNumber, s->getProperty("gpu-id")) : nullptr;
-            if (n) { gpuId = n->unsigned32BitValue(); found = true; break; }
+    } else if (!fNvrm->isInactive()) {
+        NVRMDisplayPointers dp = {}; dp.version = NVRM_DISPLAY_PTRS_ABI_VERSION;
+        if (call(NVRM_DISPLAY_PTRS_FN, &dp) == kIOReturnSuccess) kms = (NvKmsKapiFunctionsTable *)dp.kapi;
+        if (kms && kms->allocateDevice && kms->freeDevice && kms->allocateMemory &&
+            kms->freeMemory && kms->mapMemory && kms->unmapMemory) {
+            NvU32 gpuId = 0; bool found = false;
+            OSIterator *clients = fNvrm->getClientIterator();
+            if (clients) {
+                while (OSObject *object = clients->getNextObject()) {
+                    IOService *s = OSDynamicCast(IOService, object);
+                    OSNumber *n = s ? OSDynamicCast(OSNumber, s->getProperty("gpu-id")) : nullptr;
+                    if (n) { gpuId = n->unsigned32BitValue(); found = true; break; }
+                }
+                clients->release();
+            }
+            if (found) {
+                NvKmsKapiAllocateDeviceParams ap = {}; ap.gpuId = gpuId;
+                device = kms->allocateDevice(&ap);
+                handles.kapiDevice = device;
+            }
         }
-        clients->release();
     }
-    if (!found) return false;
-    NvKmsKapiAllocateDeviceParams ap = {}; ap.gpuId = gpuId;
-    fDevice = k->allocateDevice(&ap);
-    if (!fDevice) return false;
-    fKms = k; fHandles = {}; fHandles.version = NVRM_GPUVA_ABI_VERSION; fHandles.kapiDevice = fDevice;
-    return true;
+    IOLockLock(fLock);
+    const bool published = device && fState.phase == NVOwnerPhase::Active;
+    if (published) {
+        fDevice = device; fKms = kms; fHandles = handles;
+        fStock = stock; fStockLifetime = guard;
+    }
+    IOLockUnlock(fLock);
+    if (!published) {
+        if (fDirect && device) kms->freeDevice(device);
+        if (guard) {
+            guard->fOwner = nullptr;
+            if (guard->fDeferred) { bool defer = false; guard->IOService::didTerminate(stock, guard->fOptions, &defer); }
+            else { if (started) guard->stop(stock); if (attached) guard->detach(stock); }
+            guard->release();
+        }
+        if (stock) stock->release();
+    }
+    IOLockLock(fLock);
+    fInitializing = false;
+    fState.leave();
+    IOLockWakeup(fLock, &fState.operations, false);
+    return published && fState.phase == NVOwnerPhase::Active;
 }
 bool NVVramOwner::active()
 { IOLockLock(fLock); bool ok = fState.phase == NVOwnerPhase::Active; IOLockUnlock(fLock); return ok; }
@@ -1553,10 +1588,13 @@ void NVVramOwner::unborrow()
 }
 bool NVVramOwner::handles(NVRMRmHandles *out)
 {
+    if (!out || !enter()) return false;
     IOLockLock(fLock);
     bool ok = fState.phase == NVOwnerPhase::Active && ensureDeviceLocked();
     if (ok) *out = fHandles;
-    IOLockUnlock(fLock); return ok;
+    IOLockUnlock(fLock);
+    leave();
+    return ok;
 }
 IOReturn NVVramOwner::cpuAccess(IOReturn (*body)(void *), void *context)
 {
@@ -1573,27 +1611,29 @@ NVVramAllocation *NVVramOwner::allocate(uint64_t bytes)
     if (!a || !a->init()) { if (a) a->release(); leave(); return nullptr; }
     IOLockLock(fLock);
     uint64_t generation = 0;
-    bool ok = fState.phase == NVOwnerPhase::Active && ensureDeviceLocked() && fState.allocations != UINT32_MAX &&
-              nvNextGeneration(&fState.nextAllocation, &generation);
+    const uint64_t budget = fDirect ? nm_optc_vram_budget(fBarBytes) : UINT64_MAX;
+    bool ok = fState.phase == NVOwnerPhase::Active && ensureDeviceLocked() &&
+        fState.allocations != UINT32_MAX && fMappedBytes <= budget && want <= budget - fMappedBytes &&
+        nvNextGeneration(&fState.nextAllocation, &generation);
+    if (ok) { ++fState.allocations; fMappedBytes += want; }
+    IOLockUnlock(fLock);
+    if (!ok) { a->release(); leave(); return nullptr; }
+
     NVRMVramRequest r = {}; r.version = NVRM_VRAM_ABI_VERSION; r.size = want;
-    if (ok && fDirect) {
-        const uint64_t budget = nm_optc_vram_budget(fBarBytes);
-        ok = fMappedBytes <= budget && want <= budget - fMappedBytes;
-        if (ok) {
-            NvKmsKapiAllocateMemoryParams mp = {}; NvU8 compressible = 0;
-            mp.layout = NvKmsSurfaceMemoryLayoutPitch; mp.type = NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT;
-            mp.size = want; mp.useVideoMemory = NV_TRUE; mp.compressible = &compressible;
-            r.handle = fKms->allocateMemory(fDevice, &mp);
-            ok = r.handle && fKms->mapMemory(fDevice, (NvKmsKapiMemory *)r.handle, NVKMS_KAPI_MAPPING_TYPE_KERNEL, &r.kva) && r.kva;
-            r.actualSize = want; r.allocationCookie = generation;
-        }
-    } else if (ok) {
+    if (fDirect) {
+        NvKmsKapiAllocateMemoryParams mp = {}; NvU8 compressible = 0;
+        mp.layout = NvKmsSurfaceMemoryLayoutPitch; mp.type = NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT;
+        mp.size = want; mp.useVideoMemory = NV_TRUE; mp.compressible = &compressible;
+        r.handle = fKms->allocateMemory(fDevice, &mp);
+        ok = r.handle && fKms->mapMemory(fDevice, (NvKmsKapiMemory *)r.handle, NVKMS_KAPI_MAPPING_TYPE_KERNEL, &r.kva) && r.kva;
+        r.actualSize = want; r.allocationCookie = generation;
+    } else {
         const OSSymbol *s = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_ALLOC);
         ok = s && !fStock->isInactive() && fStock->callPlatformFunction(s, false, &r, nullptr, nullptr, nullptr) == kIOReturnSuccess;
         if (s) s->release();
     }
     NVRMKernelMapInfo mi = { NVRM_OWNER_ABI_VERSION, sizeof(mi), r.kva, want, 0, 0, 0, 0 };
-    ok = ok && r.handle && r.kva && r.actualSize >= want && r.actualSize <= UINT64_MAX - fMappedBytes &&
+    ok = ok && r.handle && r.kva && r.actualSize >= want &&
          call(NVRM_KERNEL_MAP_INFO_FN, &mi) == kIOReturnSuccess && mi.physical && mi.availableBytes >= r.actualSize &&
          (mi.cacheOptions == kIOMapInhibitCache || mi.cacheOptions == kIOMapWriteCombineCache);
     if (ok) {
@@ -1602,27 +1642,25 @@ NVVramAllocation *NVVramOwner::allocate(uint64_t bytes)
             [](void *p) -> IOReturn { Clear *c = (Clear *)p; bzero(c->kva, c->size); nv_frame_store_drain(); return kIOReturnSuccess; }, &clear };
         ok = call(NVRM_OWNER_CPU_ACCESS_FN, &access) == kIOReturnSuccess;
     }
-    if (ok) {
+    IOLockLock(fLock);
+    uint64_t charged = want;
+    if (r.actualSize > want) {
+        const uint64_t extra = r.actualSize - want;
+        if (fMappedBytes <= budget && extra <= budget - fMappedBytes) {
+            fMappedBytes += extra; charged += extra;
+        } else {
+            ok = false; fState.drain(); fHandles = {};
+        }
+    }
+    ok = ok && fState.phase == NVOwnerPhase::Active;
+    if (r.handle) {
         r.phys = mi.physical;
         a->fOwner = this; retain(); a->fState.key = { fState.generation, generation };
-        a->fReceipt = r; a->fCache = mi.cacheOptions;
+        a->fReceipt = r; a->fCache = mi.cacheOptions; a->fChargedBytes = charged;
+        if (!ok) { a->fState.retire(); fRetirementPending = true; }
         a->fNext = fAllocations; fAllocations = a; a->retain();
-        ++fState.allocations; fMappedBytes += r.actualSize;
-    } else if (r.handle) {
-        if (fDirect) {
-            if (r.kva) fKms->unmapMemory(fDevice, (NvKmsKapiMemory *)r.handle, NVKMS_KAPI_MAPPING_TYPE_KERNEL, r.kva);
-            fKms->freeMemory(fDevice, (NvKmsKapiMemory *)r.handle);
-        } else {
-            const OSSymbol *s = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_FREE);
-            const bool released = s && fStock->callPlatformFunction(s, false, &r, nullptr, nullptr, nullptr) == kIOReturnSuccess;
-            if (s) s->release();
-            if (!released) {
-                a->fOwner = this; retain(); a->fState.key = { fState.generation, generation };
-                a->fState.retire(); a->fReceipt = r;
-                a->fNext = fAllocations; fAllocations = a; a->retain();
-                ++fState.allocations; fMappedBytes += r.actualSize; fRetirementPending = true;
-            }
-        }
+    } else {
+        --fState.allocations; fMappedBytes -= charged;
     }
     IOLockUnlock(fLock); leave();
     if (!ok) { a->release(); return nullptr; }
@@ -1640,13 +1678,15 @@ void NVVramOwner::beginDrain()
 }
 bool NVVramOwner::isDrained()
 { IOLockLock(fLock); bool done = fState.phase == NVOwnerPhase::Dead; IOLockUnlock(fLock); return done; }
-void NVVramOwner::scheduleReap()
+void NVVramOwner::scheduleReap(unsigned delayMs)
 {
     if (!fReaper || !fLock) return;
-    IOLockLock(fLock); bool needed = fRetirementPending || fState.phase == NVOwnerPhase::Draining; IOLockUnlock(fLock);
-    if (!needed) return;
-    uint64_t deadline = 0; clock_interval_to_deadline(1, kMillisecondScale, &deadline);
-    thread_call_enter_delayed(fReaper, deadline);
+    uint64_t deadline = 0; clock_interval_to_deadline(delayMs, kMillisecondScale, &deadline);
+    IOLockLock(fLock);
+    if (fState.phase != NVOwnerPhase::Dead &&
+        (fRetirementPending || fState.phase == NVOwnerPhase::Draining))
+        thread_call_enter_delayed(fReaper, deadline);
+    IOLockUnlock(fLock);
 }
 void NVVramOwner::reapCall(void *p, void *) { ((NVVramOwner *)p)->reap(); }
 bool NVVramOwner::retireScanout(unsigned head, IOService *fb, OSObject *frontSurface, OSObject *previousSurface,
@@ -1688,6 +1728,10 @@ bool NVVramOwner::reapScanouts()
 }
 void NVVramOwner::reap()
 {
+    IOLockLock(fLock);
+    if (fReaping) { IOLockUnlock(fLock); return; }
+    fReaping = true;
+    IOLockUnlock(fLock);
     bool retry = reapScanouts(), finished = false, deferred = false;
     IOLockLock(fLock);
     NVGpuVaRecord **v = &fReservations;
@@ -1708,9 +1752,11 @@ void NVVramOwner::reap()
         if (fState.operations) break;
         NVVramAllocation *a = *link;
         if (!a->fState.releasable()) { link = &a->fNext; continue; }
+        IOLockUnlock(fLock);
         bool ok = true;
         if (fDirect) {
-            fKms->unmapMemory(fDevice, (NvKmsKapiMemory *)a->fReceipt.handle, NVKMS_KAPI_MAPPING_TYPE_KERNEL, a->fReceipt.kva);
+            if (a->fReceipt.kva)
+                fKms->unmapMemory(fDevice, (NvKmsKapiMemory *)a->fReceipt.handle, NVKMS_KAPI_MAPPING_TYPE_KERNEL, a->fReceipt.kva);
             fKms->freeMemory(fDevice, (NvKmsKapiMemory *)a->fReceipt.handle);
         } else {
             NVRMVramRequest receipt = a->fReceipt;
@@ -1718,8 +1764,10 @@ void NVVramOwner::reap()
             ok = s && fStock->callPlatformFunction(s, false, &receipt, nullptr, nullptr, nullptr) == kIOReturnSuccess;
             if (s) s->release();
         }
+        IOLockLock(fLock);
+        link = &fAllocations; while (*link && *link != a) link = &(*link)->fNext;
         if (!ok) { retry = true; link = &a->fNext; continue; }
-        *link = a->fNext; --fState.allocations; fMappedBytes -= a->fReceipt.actualSize;
+        *link = a->fNext; --fState.allocations; fMappedBytes -= a->fChargedBytes;
         a->fState.phase = NVBackingPhase::Released;
         IOLockUnlock(fLock); a->release(); IOLockLock(fLock);
     }
@@ -1728,14 +1776,21 @@ void NVVramOwner::reap()
         if (a->fState.phase == NVBackingPhase::Retiring) fRetirementPending = true;
     if (fState.drained()) {
         NVRMGpuVaRequest q = {}; q.version = NVRM_GPUVA_ABI_VERSION; q.kapiDevice = fDevice;
-        if (!fDevice || call(NVRM_GPUVA_DRAIN_FN, &q) == kIOReturnSuccess) {
-            if (fDirect && fDevice) fKms->freeDevice(fDevice);
+        IOLockUnlock(fLock);
+        const bool drained = !fDevice || call(NVRM_GPUVA_DRAIN_FN, &q) == kIOReturnSuccess;
+        if (drained && fDirect && fDevice) fKms->freeDevice(fDevice);
+        IOLockLock(fLock);
+        if (drained) {
             fDevice = nullptr; fKms = nullptr; fState.phase = NVOwnerPhase::Dead;
             finished = true; deferred = fDeferred; fDeferred = false;
         } else retry = true;
     }
     IOLockUnlock(fLock);
-    if (retry) { uint64_t when = 0; clock_interval_to_deadline(100, kMillisecondScale, &when); thread_call_enter_delayed(fReaper, when); }
+    if (!finished) {
+        if (retry) scheduleReap(100);
+        IOLockLock(fLock); fReaping = false; IOLockUnlock(fLock);
+        return;
+    }
     if (finished) {
         thread_call_cancel(fReaper); // discard a retirement wake queued before the final Dead transition
         for (unsigned head = 0; head < 5; ++head) if (fDisplayLifetime[head]) {
@@ -3824,16 +3879,21 @@ bool NVMemoryMap::init(IOGraphicsAccelerator2 *a, IOAccelTask *t, IOAccelMemory 
 bool NVGpuVaRecord::unmap(bool releaseVa)
 {
     IOLockLock(fOwner->fLock);
+    if (fBusy) { IOLockUnlock(fOwner->fLock); return false; }
     if (!fRequest.hVirt) { IOLockUnlock(fOwner->fLock); return true; }
+    fBusy = true;
     NVRMGpuVaRequest q = fRequest;
     q.hMemory = fMapped ? fRequest.hMemory : 0;
     q.flags = releaseVa ? 0 : NVRM_GPUVA_FLAG_UNMAP_ONLY;
-    bool ok = fOwner->call(NVRM_GPUVA_FN_FREE, &q) == kIOReturnSuccess && q.status == 0;
+    IOLockUnlock(fOwner->fLock);
+    const bool ok = fOwner->call(NVRM_GPUVA_FN_FREE, &q) == kIOReturnSuccess && q.status == 0;
     const bool unmapped = !q.hMemory;
+    IOLockLock(fOwner->fLock);
     if (unmapped) { fMapped = false; fRequest.hMemory = 0; }
     if (ok && releaseVa) { fRequest.hVirt = 0; fRequest.gpuva = 0; }
     IOLockUnlock(fOwner->fLock);
     if (unmapped) { fLease.reset(); fKey = {}; }
+    IOLockLock(fOwner->fLock); fBusy = false; IOLockUnlock(fOwner->fLock);
     return ok;
 }
 void NVGpuVaRecord::free() { fLease.reset(); if (fOwner) fOwner->release(); OSObject::free(); }
@@ -3852,16 +3912,24 @@ static unsigned long long nvAccelGpuVaAlloc(IOAccelMemoryMap *map, unsigned long
     if (ok) {
         r->fRequest.version = NVRM_GPUVA_ABI_VERSION; r->fRequest.kapiDevice = owner->fDevice;
         r->fRequest.size = len; r->fRequest.align = align;
-        ok = owner->call(NVRM_GPUVA_FN_ALLOC, &r->fRequest) == kIOReturnSuccess &&
-             r->fRequest.status == 0 && r->fRequest.hVirt && r->fRequest.gpuva;
+        ++owner->fState.reservations;
     }
-    if (ok) {
+    IOLockUnlock(owner->fLock);
+    if (!ok) { if (r) r->release(); owner->leave(); return 0; }
+    ok = owner->call(NVRM_GPUVA_FN_ALLOC, &r->fRequest) == kIOReturnSuccess &&
+         r->fRequest.status == 0 && r->fRequest.hVirt && r->fRequest.gpuva;
+    IOLockLock(owner->fLock);
+    ok = ok && owner->fState.phase == NVOwnerPhase::Active;
+    if (r->fRequest.hVirt) {
         r->fOwner = owner; owner->retain();
         r->fNext = owner->fReservations; owner->fReservations = r; r->retain();
-        ++owner->fState.reservations; mm->fRecord = r;
+        if (ok) mm->fRecord = r;
+        else { r->fRetiring = true; owner->fRetirementPending = true; }
+    } else {
+        --owner->fState.reservations;
     }
     IOLockUnlock(owner->fLock); owner->leave();
-    if (!ok) { if (r) r->release(); return 0; }
+    if (!ok) { r->release(); return 0; }
     return r->fRequest.gpuva;
 }
 static void nvAccelGpuVaFree(IOAccelMemoryMap *map)
@@ -3881,17 +3949,28 @@ bool NVMemoryMap::commitIntoGPUPageTable()
     NVVidMemory *vm = OSDynamicCast(NVVidMemory, fMem);
     if (!vm || vm->fOwner != fOwner || !vm->fBacking || !fRecord || fRecord->fOwner != fOwner) return false;
     NVGpuVaRecord *r = fRecord;
-    if (r->fMapped) return nvBackingKeyEqual(r->fKey, vm->fBacking->key());
-    if (!r->fRequest.hVirt || r->fRequest.size > vm->capacity() ||
-        !vm->fBacking->acquire(NVLeaseUse::GpuMapping, &r->fLease)) return false;
+    if (!fOwner->enter()) return false;
     IOLockLock(fOwner->fLock);
+    if (r->fBusy || r->fRetiring || r->fMapped || !r->fRequest.hVirt || r->fRequest.size > vm->capacity()) {
+        const bool mapped = !r->fBusy && !r->fRetiring && r->fMapped && nvBackingKeyEqual(r->fKey, vm->fBacking->key());
+        IOLockUnlock(fOwner->fLock); fOwner->leave(); return mapped;
+    }
+    r->fBusy = true;
     NVRMGpuVaRequest q = r->fRequest; q.kapiMemory = vm->handle(); q.isVidmem = 1;
-    bool ok = fOwner->fState.phase == NVOwnerPhase::Active &&
-        fOwner->call(NVRM_GPUVA_FN_MAP, &q) == kIOReturnSuccess && q.status == 0;
-    if (ok) { r->fRequest = q; r->fMapped = true; r->fKey = vm->fBacking->key(); }
     IOLockUnlock(fOwner->fLock);
-    if (!ok) r->fLease.reset(); else OSAddAtomic64(1, &gCntMapCommit);
-    return ok;
+    bool ok = vm->fBacking->acquire(NVLeaseUse::GpuMapping, &r->fLease);
+    if (ok) ok = fOwner->call(NVRM_GPUVA_FN_MAP, &q) == kIOReturnSuccess && q.status == 0;
+    IOLockLock(fOwner->fLock);
+    const bool admitted = ok && !r->fRetiring && fOwner->fState.phase == NVOwnerPhase::Active;
+    if (ok) {
+        r->fRequest = q; r->fMapped = true; r->fKey = vm->fBacking->key();
+        if (!admitted) { r->fRetiring = true; fOwner->fRetirementPending = true; }
+    }
+    IOLockUnlock(fOwner->fLock);
+    if (!ok) r->fLease.reset(); else if (admitted) OSAddAtomic64(1, &gCntMapCommit);
+    IOLockLock(fOwner->fLock); r->fBusy = false; IOLockUnlock(fOwner->fLock);
+    fOwner->leave();
+    return admitted;
 }
 void NVMemoryMap::releaseFromGPUPageTable()
 {

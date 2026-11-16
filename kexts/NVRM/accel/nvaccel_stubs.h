@@ -52,6 +52,8 @@ public:
     IOPCIDevice *fPci = nullptr;
     bool fDirect = false, fAttached = false, fDeferred = false, fLifetimeHeld = false;
     bool fRetirementPending = false;
+    bool fInitializing = false, fReaping = false;
+    bool fDisplayBinding[5] = {};
     IOOptionBits fTerminateOptions = 0;
     NVStockLifetime *fStockLifetime = nullptr;
     NVStockLifetime *fDisplayLifetime[5] = {};
@@ -68,7 +70,7 @@ public:
     bool reapScanouts();
     bool scanoutRetiring(unsigned);
     static NVVramOwner *create(IOService *, IOPCIDevice *, bool);
-    bool ensureDeviceLocked();
+    bool ensureDeviceLocked(); // drops the metadata lock for initialization; returns with it held
     bool handles(NVRMRmHandles *);
     bool active();
     bool borrow();
@@ -79,7 +81,7 @@ public:
     void beginDrain();
     bool isDrained();
     void reap();
-    void scheduleReap();
+    void scheduleReap(unsigned delayMs = 1);
     static void reapCall(void *, void *);
     IOReturn call(const char *, void *);
     IOReturn cpuAccess(IOReturn (*)(void *), void *);
@@ -102,10 +104,12 @@ public:
 class NVVramAllocation : public OSObject {
     OSDeclareDefaultStructors(NVVramAllocation)
 public:
+    bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
     NVVramOwner *fOwner = nullptr;
     NVVramAllocation *fNext = nullptr;
     NVBackingState fState;
     NVRMVramRequest fReceipt = {};
+    uint64_t fChargedBytes = 0;
     uint32_t fCache = 0;
     bool acquire(NVLeaseUse, NVVramLease *);
     void releaseLease(NVLeaseUse);
@@ -127,12 +131,13 @@ public:
 class NVGpuVaRecord : public OSObject {
     OSDeclareDefaultStructors(NVGpuVaRecord)
 public:
+    bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
     NVVramOwner *fOwner = nullptr;
     NVGpuVaRecord *fNext = nullptr;
     NVRMGpuVaRequest fRequest = {};
     NVVramLease fLease;
     NVBackingKey fKey = {};
-    bool fMapped = false, fRetiring = false;
+    bool fMapped = false, fRetiring = false, fBusy = false;
     bool unmap(bool releaseVa);
     void free() APPLE_KEXT_OVERRIDE;
 };
