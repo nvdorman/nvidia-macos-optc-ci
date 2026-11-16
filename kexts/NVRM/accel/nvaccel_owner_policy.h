@@ -1,7 +1,6 @@
 /* EXP-013: lock-external ownership transitions, shared by the driver and host tests. */
 #pragma once
 #include <stdint.h>
-#include <limits.h>
 
 struct NVBackingKey { uint64_t ownerGeneration, allocationGeneration; };
 enum class NVOwnerPhase { Uninitialized, Active, Draining, Dead };
