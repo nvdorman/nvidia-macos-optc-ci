@@ -3,6 +3,18 @@
 // and an exact read-only GGTT walk. IOGraphics and clients see owned WC shadow pages.
 // nmIntelPresent synchronously publishes a completed NVAccel final image to both.
 
+// Apple's macOS SDK Kernel.framework omits MACH_KERNEL_PRIVATE so vm_map_t defaults to ipc_port_t,
+// whereas com.apple.kpi.iokit exports IOMemoryDescriptor::doMap/doUnmap taking struct _vm_map *.
+// Match the kernel KPI ABI before any IOKit header pulls in IOMemoryDescriptor.h.
+#include <IOKit/IOTypes.h>
+struct _vm_map;
+#pragma push_macro("vm_map_t")
+#define vm_map_t struct _vm_map *
+#include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOSubMemoryDescriptor.h>
+#pragma pop_macro("vm_map_t")
+
 #include <IOKit/IOLib.h>
 // IOPCIDevice (with its setBusMasterEnable) is marked deprecated in favour of PCIDriverKit, which runs in user space and
 // cannot replace a kernel extension's PCI access; that deprecation is ignored from here on in this kext's sources.

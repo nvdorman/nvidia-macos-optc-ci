@@ -25,6 +25,16 @@ for K in "$@"; do
     ok=0; for id in $(printf '%s' "$ids" | tr '|' ' '); do case "$libs" in *" $id "*) ok=1;; esac; done
     [ "$ok" = 1 ] || { echo "STOP: $n imports ${pat%%|*} symbols but its Info.plist does not list ${ids%%|*} in OSBundleLibraries"; fail=1; }
   done <<< "$TABLE"
+
+  # Reject non-exported SDK vm_map_t mangling (ipc_port instead of _vm_map) and Private.kext-only symbols
+  if printf '%s\n' "$und" | grep -Eq '(doMap|doUnmap).*EP8ipc_port'; then
+    echo "STOP: $n imports IOMemoryDescriptor::doMap/doUnmap with ipc_port* instead of _vm_map*"
+    fail=1
+  fi
+  if printf '%s\n' "$und" | grep -Eq '(^|[[:space:]])_thread_call_cancel_wait$'; then
+    echo "STOP: $n imports private kernel symbol _thread_call_cancel_wait"
+    fail=1
+  fi
 done
-[ "$fail" = 0 ] && echo "every imported IOKit family is declared ($# kext(s))"
+[ "$fail" = 0 ] && echo "every imported IOKit family and kernel KPI contract is valid ($# kext(s))"
 exit $fail

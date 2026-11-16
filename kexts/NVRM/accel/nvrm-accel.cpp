@@ -4,6 +4,18 @@
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 
+// Apple's macOS SDK Kernel.framework omits MACH_KERNEL_PRIVATE so vm_map_t defaults to ipc_port_t,
+// whereas com.apple.kpi.iokit exports IOGeneralMemoryDescriptor::doMap/doUnmap taking struct _vm_map *.
+// Match the kernel KPI ABI before nvrm_off.h pulls in IOKit headers.
+#include <IOKit/IOTypes.h>
+struct _vm_map;
+#pragma push_macro("vm_map_t")
+#define vm_map_t struct _vm_map *
+#include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOSubMemoryDescriptor.h>
+#pragma pop_macro("vm_map_t")
+
 #include "../nvrm_off.h"
 #include "../nvrm_startup_policy.h"
 #ifdef NMX_ACCEL
@@ -613,6 +625,7 @@ public:
     uint32_t fHeadlessDeadlineSec = kHeadlessDeadlineSec;
     static constexpr uint32_t kHeadlessPollSec = 2;        // chosen: a small fraction of the ~7 s NVKMS takes to enumerate
     struct thread_call *fHeadlessCall = nullptr;
+    volatile UInt32 fHeadlessArmed = 0;
     uint32_t fHeadlessWaited = 0;
     // true when NVKMS enumerated this card's connectors (NVRMFB writes connected-displays on each display nub it
     // enumerates) and found a display on none of them
@@ -699,12 +712,20 @@ public:
         }
         uint64_t when = 0;
         clock_interval_to_deadline(kHeadlessPollSec, kSecondScale, &when);
+        __atomic_store_n(&fHeadlessArmed, 1, __ATOMIC_RELEASE);
         thread_call_enter_delayed(fHeadlessCall, when);
         ALOG("headless check: armed, every %u s for up to %u s", kHeadlessPollSec, fHeadlessDeadlineSec);
     }
     static void headlessCheck(void *p0, void *) {
         NVAccel *me = (NVAccel *)p0;
-        if (!me || __atomic_load_n(&me->fStopping, __ATOMIC_ACQUIRE)) return;
+        if (!me) return;
+        bool rearmed = false;
+        struct ScopedArmClear {
+            volatile UInt32 *armed;
+            bool *keep;
+            ~ScopedArmClear() { if (!*keep) __atomic_store_n(armed, 0, __ATOMIC_RELEASE); }
+        } armClear { &me->fHeadlessArmed, &rearmed };
+        if (__atomic_load_n(&me->fStopping, __ATOMIC_ACQUIRE)) return;
         if (me->fRegLock) IOLockLock(me->fRegLock);
         const char *why = me->hasActiveHead() ? "a display head published" : !me->fMetalPlugin ? "no plugin name to restore"
                         : me->getProperty("MetalPluginName") ? "the plugin name is already back" : nullptr;
@@ -718,9 +739,12 @@ public:
             headlessDisplayOwner(owner, sizeof owner, &other);
             const bool early = other && headlessNoDisplayHere();
             if (!early && me->fHeadlessWaited < me->fHeadlessDeadlineSec) {
-                uint64_t when = 0;
-                clock_interval_to_deadline(kHeadlessPollSec, kSecondScale, &when);
-                thread_call_enter_delayed(me->fHeadlessCall, when);
+                if (!__atomic_load_n(&me->fStopping, __ATOMIC_ACQUIRE)) {
+                    uint64_t when = 0;
+                    clock_interval_to_deadline(kHeadlessPollSec, kSecondScale, &when);
+                    thread_call_enter_delayed(me->fHeadlessCall, when);
+                    rearmed = true;
+                }
                 if (me->fRegLock) IOLockUnlock(me->fRegLock);
                 return;
             }
@@ -1369,7 +1393,19 @@ public:
         if (fFBNote) { fFBNote->remove(); fFBNote = nullptr; }
         if (fIntelNote) { fIntelNote->remove(); fIntelNote = nullptr; }
         if (fGopNote) { fGopNote->remove(); fGopNote = nullptr; }
-        if (fHeadlessCall) { thread_call_cancel_wait(fHeadlessCall); thread_call_free(fHeadlessCall); fHeadlessCall = nullptr; }
+        if (fHeadlessCall) {
+            if (fRegLock) IOLockLock(fRegLock);
+            if (thread_call_cancel(fHeadlessCall)) __atomic_store_n(&fHeadlessArmed, 0, __ATOMIC_RELEASE);
+            if (fRegLock) IOLockUnlock(fRegLock);
+            while (__atomic_load_n(&fHeadlessArmed, __ATOMIC_ACQUIRE)) {
+                if (fRegLock) IOLockLock(fRegLock);
+                if (thread_call_cancel(fHeadlessCall)) __atomic_store_n(&fHeadlessArmed, 0, __ATOMIC_RELEASE);
+                if (fRegLock) IOLockUnlock(fRegLock);
+                IOSleep(1);
+            }
+            while (!thread_call_free(fHeadlessCall)) { thread_call_cancel(fHeadlessCall); IOSleep(1); }
+            fHeadlessCall = nullptr;
+        }
         stopTemperature();
         stopUtilization();
         if (fOwner) fOwner->waitOperations();
@@ -3799,19 +3835,26 @@ static void nvAccelDrainPipe(NVDisplayPipe *pipe)
         IOLockLock(gIopAsLock);
         bool ours = e->pipe == pipe;
         if (ours) e->stopping = true;
-        struct thread_call *call = ours ? e->call : nullptr;
-        IOLockUnlock(gIopAsLock);
-        if (!ours) continue;
-        if (call) thread_call_cancel_wait(call);
-        NVIopAsyncFrame current, next;
-        IOLockLock(gIopAsLock);
-        current = e->current; next = e->next; e->current = {}; e->next = {}; e->busy = 0;
+        while (ours && e->busy) {
+            if (e->call && thread_call_cancel(e->call)) {
+                e->busy = 0;
+                break;
+            }
+            IOLockSleep(gIopAsLock, (event_t)&e->busy, THREAD_UNINT);
+        }
+        if (!ours) { IOLockUnlock(gIopAsLock); continue; }
+        NVIopAsyncFrame current = e->current, next = e->next;
+        e->current = {}; e->next = {}; e->busy = 0;
         IOService *fb = e->fb; NVVramOwner *owner = e->owner;
+        struct thread_call *call = e->call;
         e->fb = nullptr; e->pipe = nullptr; e->owner = nullptr; e->call = nullptr;
         e->stopping = false;
         IOLockUnlock(gIopAsLock);
         nvIopDropFrame(&current); nvIopDropFrame(&next);
-        if (call) thread_call_free(call);
+        if (call) {
+            thread_call_cancel(call);
+            while (!thread_call_free(call)) { thread_call_cancel(call); IOSleep(1); }
+        }
         if (fb && owner) {
             IOLockLock(gIopAsLock);
             if (owner->retireScanout(head, fb, (OSObject *)gIopFlipFront[head], (OSObject *)gIopFlipPrev[head],
