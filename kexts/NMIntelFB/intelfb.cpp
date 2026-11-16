@@ -17,6 +17,7 @@
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/graphics/IODisplay.h>
+#include <IOKit/IOPlatformExpert.h>
 #include <IOKit/ndrvsupport/IOMacOSVideo.h>
 #include "intelfb_console.h"
 #include <libkern/OSAtomic.h>

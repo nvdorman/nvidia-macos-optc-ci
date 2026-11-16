@@ -12,7 +12,7 @@ SDK=$(xcrun --show-sdk-path)
 KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
 CFLAGS=( -arch x86_64 -fapple-kext -mkernel -nostdinc -I"$KHDR" -I"$SRC" -I"$SRC/../NVRM/accel" -I"$SRC/../NVRM"
   -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT
-  -mmacosx-version-min=15.0 -g0
+  -mmacosx-version-min=${MINVER:-15.0} -g0
   -ffile-prefix-map="$SRC"=driver -ffile-prefix-map="$HOME"=/build
   -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fno-common
   -Wall -Wno-unused-parameter -Wno-inconsistent-missing-override -Wno-unused-function -O2 )
@@ -37,7 +37,7 @@ for VARIANT in real virtual; do
     bash "$SRC/../../build/warn_ceiling.sh" nmintelfb "$(grep -c ": warning:" "$E")" "$E" || exit 4
     K="$OUT/$NAME.kext"
     mkdir -p "$K/Contents/MacOS"
-    xcrun clang++ -arch x86_64 -mmacosx-version-min=15.0 -fapple-kext -nostdlib \
+    xcrun clang++ -arch x86_64 -mmacosx-version-min=${MINVER:-15.0} -fapple-kext -nostdlib \
         -Xlinker -kext -lkmodc++ -lkmod -lcc_kext "$OUT/$NAME.o" -o "$K/Contents/MacOS/$NAME" 2> "$OUT/$NAME.link.err"
     lrc=$?
     if [ $lrc -ne 0 ]; then

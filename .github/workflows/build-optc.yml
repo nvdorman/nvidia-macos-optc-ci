@@ -72,12 +72,18 @@ jobs:
           echo "OGKM_DIR=$T" >> "$GITHUB_ENV"
 
       - name: Build NMIntelFB.kext
+        env:
+          MINVER: "15.5"
+          MACOSX_DEPLOYMENT_TARGET: "15.5"
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/out/intelfb"
           bash kexts/NMIntelFB/build.sh "$OUT"
+          test -f "$OUT/NMIntelFB.kext/Contents/MacOS/NMIntelFB"
 
       - name: Build NVAccel.kext (macOS 15 + macOS 26 Tahoe)
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "15.5"
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/out/accel"
