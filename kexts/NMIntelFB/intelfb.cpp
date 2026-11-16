@@ -833,10 +833,10 @@ bool NMIntelFB::revalidateAuthorityLocked(bool walk)
     if (pe.v_offset || (pe.v_length && pe.v_length != fFrameBytes) ||
         !nm_intelfb_console_matches(&fBootVideo, &current, fConsoleKva)) return false;
     NMIntelPlane plane;
-    if (!fMMIO || !nm_intelfb_plane_snapshot(readRegister, this, fMMIO->getLength(), fPipe, &plane) ||
+    if (!fMMIO || fPipe < 0 || !nm_intelfb_plane_snapshot(readRegister, this, fMMIO->getLength(), (unsigned)fPipe, &plane) ||
         !nm_intelfb_plane_equal(&plane, &fFirmwarePlane)) return false;
     return !walk || (nm_intelfb_reserved(&fEfiMap, fEfiBytes, fBootVideo.base, fRoundedBytes) &&
-        nm_intelfb_translation(readRegister, this, fMMIO->getLength(), fVer, fPipe, &fBootVideo, nullptr));
+        nm_intelfb_translation(readRegister, this, fMMIO->getLength(), fVer, (unsigned)fPipe, &fBootVideo, nullptr));
 #endif
 }
 

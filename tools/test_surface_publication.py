@@ -176,7 +176,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     unlockStatus=0;
     assert([f nvmtlSurfaceOut] && f->_surfSynced && f->_surfSeed==failed.seed);
     assert(!memcmp(failed.cpu,f->_i.gpu,sizeof failed.cpu));
-    puts("OPTC_CASE {\"id\":\"publication_failure\",\"result\":\"PASS\"}");
+    if (argc == 1) puts("OPTC_CASE {\"id\":\"publication_failure\",\"result\":\"PASS\"}");
     puts("PASS: overlapping publication preserves GPU pixels; later CPU edits import; a publication after the commit's "
          "VRAM mark never waits for the accelerator lock and retries a busy re-mark off its thread; another process's "
          "write is waited for before import");
