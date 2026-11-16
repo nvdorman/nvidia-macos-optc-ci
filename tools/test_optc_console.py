@@ -34,10 +34,15 @@ METHODS = "\n".join(definition(name) for name in (
     "static NMIntelVideo nmIntelConsoleVideo(",
     "bool NMIntelFB::recordConsoleMappingLocked(",
     "void NMIntelFB::revokePresentation(",
+    "IOReturn NMIntelFB::reacquirePresentation(",
     "bool NMIntelFB::copyShadowLocked(",
     "void NMIntelFB::refreshFire(",
     "bool NMIntelFB::restoreConsole(",
+    "IOReturn NMIntelFB::gatedCloseAction(",
+    "IOReturn NMIntelFB::open(",
     "void NMIntelFB::close(",
+    "IOReturn NMIntelFB::setupForCurrentConfig(",
+    "IOReturn NMIntelFB::setDisplayMode(",
     "IODeviceMemory *NMIntelFB::getApertureRange(",
     "IOReturn NMIntelFB::framebufferInfo(",
 ))
@@ -61,9 +66,25 @@ using IOVirtualAddress = uintptr_t;
 using IOReturn = int;
 using IOPixelAperture = int;
 using IOPhysicalLength = uint64_t;
+using IODisplayModeID = uint32_t;
+using IOIndex = int32_t;
 using UInt32 = uint32_t;
 using thread_call_param_t = void *;
 using task_t = void *;
+struct OSObject { virtual ~OSObject() = default; };
+struct IOWorkLoop {
+    using Action = IOReturn (*)(OSObject *, void *, void *, void *, void *);
+    bool gateHeld = false;
+    unsigned gatedActions = 0;
+    IOReturn runAction(Action action, OSObject *target, void *p0 = nullptr, void *p1 = nullptr, void *p2 = nullptr, void *p3 = nullptr) {
+        assert(!gateHeld);
+        gateHeld = true;
+        ++gatedActions;
+        const IOReturn r = action(target, p0, p1, p2, p3);
+        gateHeld = false;
+        return r;
+    }
+};
 constexpr unsigned kIOMapCacheMask = 0xf00, kIOMapDefaultCache = 0;
 constexpr unsigned kIOMapWriteCombineCache = 0x400, kIOMapInhibitCache = 0x100;
 constexpr unsigned kIODirectionInOut = 3;
@@ -160,17 +181,24 @@ struct IOPlatformExpert {
         return kIOReturnSuccess;
     }
 };
-struct IOFramebuffer {
+struct IOFramebuffer : OSObject {
     IOLock *fixtureLock = nullptr;
-    unsigned baseCloses = 0;
-    virtual ~IOFramebuffer() = default;
-    void close() { assert(!fixtureLock->held); ++baseCloses; }
+    IOWorkLoop *fixtureWorkLoop = nullptr;
+    unsigned baseOpens = 0, baseCloses = 0, baseSetups = 0;
+    IOReturn openStatus = kIOReturnSuccess, setupStatus = kIOReturnSuccess;
+    void (*onOpen)() = nullptr;
+    void (*onSetup)() = nullptr;
+    IOWorkLoop *getWorkLoop() const { return fixtureWorkLoop; }
+    IOReturn open() { ++baseOpens; if (onOpen) onOpen(); return openStatus; }
+    void close() { assert(!fixtureLock->held); assert(!fixtureWorkLoop || fixtureWorkLoop->gateHeld); ++baseCloses; }
+    IOReturn setupForCurrentConfig() { ++baseSetups; if (onSetup) onSetup(); return setupStatus; }
 };
 struct NMIntelFB : IOFramebuffer {
     IOLock lock;
+    IOWorkLoop workLoop;
     IOLock *fPresentLock = &lock;
     IOPlatformExpert platform;
-    bool fConsoleScanout = true, fOpened = true, fPowered = true, fStopping = false;
+    bool fConsoleScanout = true, fOpened = true, fPowered = true, fStopping = false, fSetupInFlight = false;
     bool authority = true;
     int fHyLevel = NMH_COPY;
     uint32_t fWidth = 320, fHeight = 200, fRowBytes = 1280;
@@ -186,16 +214,21 @@ struct NMIntelFB : IOFramebuffer {
     uint64_t fVramMapOffset = 0;
     volatile UInt32 fRefreshPending = 1;
     unsigned copies = 0;
-    NMIntelFB() { fixtureLock = &lock; platform.lock = &lock; }
+    NMIntelFB() { fixtureLock = &lock; fixtureWorkLoop = &workLoop; platform.lock = &lock; }
     IOPlatformExpert *getPlatform() { return &platform; }
     uint64_t getRegistryEntryID() { return 17; }
     bool revalidateAuthorityLocked(bool) { assert(lock.held); return authority && fPowered; }
     bool recordConsoleMappingLocked();
     void revokePresentation(NMIntelPhase);
+    IOReturn reacquirePresentation();
     bool copyShadowLocked();
     static void refreshFire(thread_call_param_t, thread_call_param_t);
     bool restoreConsole();
+    static IOReturn gatedCloseAction(OSObject *, void *, void *, void *, void *);
+    IOReturn open();
     void close();
+    IOReturn setupForCurrentConfig();
+    IOReturn setDisplayMode(IODisplayModeID, IOIndex);
     IODeviceMemory *getApertureRange(IOPixelAperture);
     IOReturn framebufferInfo(NMIntelFramebufferInfo *);
 };
@@ -437,7 +470,7 @@ static void lifecycle() {
     IOLockLock(&fb.lock);
     std::thread missed([&] { NMIntelFB::refreshFire(&fb, nullptr); }); missed.join();
     IOLockUnlock(&fb.lock); assert(fb.fRefreshPending == 0); // try-lock skips instead of waiting
-    fb.close();
+    fb.workLoop.runAction(NMIntelFB::gatedCloseAction, &fb);
     assert(fb.baseCloses == 1 && fb.fPresentState.phase == NMIntelRecovery && fb.fPresentState.epoch == 2);
     assert(PE_state.video.v_baseAddr == (fb.fBootVideo.base | 1) && fb.platform.changed == 1 && fb.platform.acquired == 1);
     assert(fb.framebufferInfo(&info) == kIOReturnNotReady && info.actualSize == 0);
@@ -468,8 +501,85 @@ static void lifecycle() {
     fb.fVramMap->release(); fb.fSurfMap->release();
     casePass("console_epoch");
 }
+static NMIntelFB *gHookFb = nullptr;
+static void openRevokesAuthority() { gHookFb->authority = false; }
+static void setupMapsAndNotifies() {
+    NMIntelFB &fb = *gHookFb;
+    if (fb.fVramMap) fb.fVramMap->release();
+    fb.fVramMap = mapShadow(fb.fShadowMemory, 0x401, fb.fFrameBytes);
+    fb.fFrameBuffer = reinterpret_cast<volatile unsigned char *>(fb.fVramMap->address);
+    PE_state.video = {fb.fBootVideo.base, fb.fRowBytes, fb.fWidth, fb.fHeight, 32, 1, 0};
+    // Simulate IOFramebuffer::doSetup(true) firing deliverDisplayModeDidChangeNotification before setup returns:
+    // group 5 (IOAccelDisplayPipe) queries framebufferInfo() prior to Legacy group 0.
+    NMIntelFramebufferInfo info{1, sizeof(info), 0, 0, 0, 0, 0, 0, 0};
+    assert(fb.framebufferInfo(&info) == kIOReturnSuccess);
+    assert(info.epoch == fb.fPresentState.epoch && fb.fPresentState.phase == NMIntelApertureActive);
+}
+static void openAndModeset() {
+    NMIntelFB fb;
+    gHookFb = &fb;
+    fb.fOpened = false;
+    fb.fPresentState = {NMIntelPrepared, 1, 0, 0};
+    fb.fShadowBuffer = new Backing(fb.fFrameBytes);
+    fb.fShadowMemory = new NMIntelShadowMemory;
+    assert(fb.fShadowMemory->initSubRange(fb.fShadowBuffer, 0, fb.fFrameBytes, kIODirectionInOut));
+    Backing *physical = new Backing(fb.fFrameBytes);
+    fb.fSurfMap = new IOMemoryMap; fb.fSurfMap->descriptor = physical;
+    fb.fSurfMap->address = reinterpret_cast<uintptr_t>(physical->getBytesNoCopy());
+    fb.fSurfMap->length = fb.fFrameBytes; fb.fSurfMap->options = kIOMapInhibitCache;
+    fb.fSavedConsole = {fb.fBootVideo.base | 1, fb.fRowBytes, fb.fWidth, fb.fHeight, 32, 1, 0};
+    PE_state.video = {fb.fBootVideo.base, fb.fRowBytes, fb.fWidth, fb.fHeight, 32, 1, 0};
+
+    // Negative control: half-mapped fVramMap / fFrameBuffer is strictly rejected.
+    fb.fFrameBuffer = reinterpret_cast<volatile unsigned char *>(0x1000);
+    IOLockLock(&fb.lock); assert(!fb.recordConsoleMappingLocked()); IOLockUnlock(&fb.lock);
+    fb.fFrameBuffer = nullptr;
+
+    // Open succeeds when IOFramebuffer::open() leaves fVramMap & fFrameBuffer null (doSetup runs later).
+    assert(fb.open() == kIOReturnSuccess && fb.baseOpens == 1 && fb.baseCloses == 0);
+    assert(fb.fOpened && fb.fPresentState.phase == NMIntelApertureActive && fb.fConsoleKva == 0);
+
+    // First setDisplayMode(1, 0) also runs before doSetup(1) maps fVramMap.
+    assert(fb.setDisplayMode(1, 0) == kIOReturnSuccess);
+    assert(fb.setDisplayMode(2, 0) == kIOReturnUnsupported);
+
+    // setupForCurrentConfig activates synchronously once doSetup(1) remaps fVramMap so
+    // IOAccelDisplayPipe::init_framebuffer_resource receives an active epoch during DidChange.
+    const uint64_t preSetupEpoch = fb.fPresentState.epoch;
+    fb.onSetup = setupMapsAndNotifies;
+    assert(fb.setupForCurrentConfig() == kIOReturnSuccess && fb.baseSetups == 1);
+    assert(fb.fPresentState.phase == NMIntelApertureActive);
+    assert(fb.fPresentState.epoch == preSetupEpoch + 1);
+    assert(!fb.fSetupInFlight && fb.fConsoleKva == reinterpret_cast<uintptr_t>(fb.fFrameBuffer));
+    fb.onSetup = nullptr;
+
+    // Outside setupForCurrentConfig(), revoked presentation stays NotReady even when fOpened & mapped.
+    fb.revokePresentation(NMIntelRecovery);
+    NMIntelFramebufferInfo info{1, sizeof(info), 0, 0, 0, 0, 0, 0, 0};
+    assert(fb.framebufferInfo(&info) == kIOReturnNotReady && info.actualSize == 0);
+    assert(fb.reacquirePresentation() == kIOReturnSuccess);
+
+    // Open failure unwind after IOFramebuffer::open(): close() MUST run under controller workLoop gate.
+    fb.fOpened = false;
+    fb.fVramMap->release(); fb.fVramMap = nullptr; fb.fFrameBuffer = nullptr;
+    fb.onOpen = openRevokesAuthority;
+    assert(fb.open() == kIOReturnNotReady);
+    assert(fb.workLoop.gatedActions == 1 && fb.baseCloses == 1 && !fb.fOpened && !fb.workLoop.gateHeld);
+    fb.onOpen = nullptr;
+
+    // Fallback unwind when controller workLoop is unavailable: no panic, state cleanly revoked.
+    fb.authority = true;
+    fb.fixtureWorkLoop = nullptr;
+    fb.onOpen = openRevokesAuthority;
+    assert(fb.open() == kIOReturnNotReady);
+    assert(fb.baseCloses == 1 && !fb.fOpened && fb.fPresentState.phase == NMIntelRecovery);
+    fb.fixtureWorkLoop = &fb.workLoop;
+
+    fb.fShadowMemory->release(); fb.fShadowBuffer->release(); fb.fSurfMap->release();
+    casePass("open_unwind_and_setup_sync");
+}
 int main() {
-    reservation(); translation(); mapping(); transfer(); lifecycle();
+    reservation(); translation(); mapping(); transfer(); lifecycle(); openAndModeset();
     puts("PASS: production console authority/mapping/transfer/lifecycle; host fixtures only");
 }
 '''

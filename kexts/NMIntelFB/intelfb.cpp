@@ -221,7 +221,7 @@ class NMIntelFB : public IOFramebuffer {
     uint64_t fFrameBytes = 0, fRoundedBytes = 0, fConsoleKva = 0;
     PE_Video fSavedConsole = {};
     IONotifier *fFramebufferEvents = nullptr;
-    bool fPowered = true, fOpened = false, fBaseStarted = false;
+    bool fPowered = true, fOpened = false, fBaseStarted = false, fSetupInFlight = false;
     thread_call_t fRefreshCall = nullptr;
     volatile UInt32 fRefreshPending = 0;
     bool captureBootAuthority();
@@ -237,6 +237,7 @@ class NMIntelFB : public IOFramebuffer {
     IOReturn present(NMIntelPresentRequest *q);
     static int readRegister(void *context, uint64_t offset, uint32_t *value);
     static void refreshFire(thread_call_param_t context, thread_call_param_t);
+    static IOReturn gatedCloseAction(OSObject *owner, void *, void *, void *, void *);
     static IOReturn framebufferEvent(OSObject *, void *, IOFramebuffer *, IOIndex, void *);
     // WindowServer paces an accelerated display on its VBL interrupt: the NVIDIA display pipe completes each frame on it.
     // Without one the first frame never completed and WindowServer stalled every display (in testing, the
@@ -871,7 +872,13 @@ bool NMIntelFB::start(IOService *provider)
 // calls, notifier removal, thread-call drain, or platform console callbacks.
 bool NMIntelFB::recordConsoleMappingLocked()
 {
-    if (!fVramMap || !fFrameBuffer) return !fOpened;
+    // IOFramebuffer::open() never invokes doSetup(); fVramMap and fFrameBuffer stay null
+    // until doSetup(true) runs in setupForCurrentConfig() or transiently null while it remaps.
+    if (!fVramMap && !fFrameBuffer) {
+        fConsoleKva = 0;
+        return true;
+    }
+    if (!fVramMap || !fFrameBuffer) return false;
     IOMemoryDescriptor *descriptor = fVramMap->getMemoryDescriptor();
     if ((descriptor != fShadowBuffer && descriptor != fShadowMemory) ||
         fVramMapOffset || fVramMap->getLength() < fFrameBytes ||
@@ -1000,6 +1007,13 @@ bool NMIntelFB::restoreConsole()
 #endif
 }
 
+IOReturn NMIntelFB::gatedCloseAction(OSObject *owner, void *, void *, void *, void *)
+{
+    NMIntelFB *me = static_cast<NMIntelFB *>(owner);
+    if (me) me->close();
+    return kIOReturnSuccess;
+}
+
 IOReturn NMIntelFB::open()
 {
     if (!fConsoleScanout) return IOFramebuffer::open();
@@ -1014,7 +1028,17 @@ IOReturn NMIntelFB::open()
     fOpened = true;
     IOLockUnlock(fPresentLock);
     if (reacquirePresentation() == kIOReturnSuccess) return kIOReturnSuccess;
-    close();
+    // IOFramebuffer::newUserClient() holds only gIOFBSystemWorkLoop; take the controller
+    // workLoop gate around close() because IOFramebuffer::open() already released it.
+    if (IOWorkLoop *wl = getWorkLoop()) {
+        (void)wl->runAction(&NMIntelFB::gatedCloseAction, this);
+    } else {
+        IOLockLock(fPresentLock);
+        fOpened = false;
+        nm_intelfb_revoke(&fPresentState, NMIntelRecovery);
+        IOLockUnlock(fPresentLock);
+        (void)restoreConsole();
+    }
     return kIOReturnNotReady;
 }
 
@@ -1035,8 +1059,14 @@ IOReturn NMIntelFB::setupForCurrentConfig()
 {
     if (!fConsoleScanout) return IOFramebuffer::setupForCurrentConfig();
     if (reacquirePresentation() != kIOReturnSuccess) return kIOReturnNotReady;
-    revokePresentation(NMIntelRecovery);
+    IOLockLock(fPresentLock);
+    nm_intelfb_revoke(&fPresentState, NMIntelRecovery);
+    fSetupInFlight = true;
+    IOLockUnlock(fPresentLock);
     const IOReturn result = IOFramebuffer::setupForCurrentConfig();
+    IOLockLock(fPresentLock);
+    fSetupInFlight = false;
+    IOLockUnlock(fPresentLock);
     if (result != kIOReturnSuccess) return result;
     return reacquirePresentation();
 }
@@ -1134,6 +1164,14 @@ IOReturn NMIntelFB::framebufferInfo(NMIntelFramebufferInfo *q)
     if (!fConsoleScanout) return kIOReturnUnsupported;
     if (!fPresentLock) return kIOReturnNotReady;
     IOLockLock(fPresentLock);
+    // IOFramebuffer::doSetup(true) delivers DisplayModeDidChange after remapping fVramMap
+    // and before setupForCurrentConfig() returns. Activate synchronously once mapped so
+    // IOAccelDisplayPipe (group 5 before Legacy group 0) receives an active epoch.
+    if (fSetupInFlight && !fStopping && fHyLevel == NMH_COPY &&
+        fPresentState.phase == NMIntelRecovery && fOpened &&
+        fShadowMemory && fShadowBuffer && fVramMap && fFrameBuffer &&
+        recordConsoleMappingLocked() && revalidateAuthorityLocked(true))
+        (void)nm_intelfb_activate(&fPresentState);
     const bool ok = !fStopping && fHyLevel == NMH_COPY && fShadowMemory &&
         fPresentState.phase == NMIntelApertureActive && revalidateAuthorityLocked(false);
     if (ok) *q = { NM_INTEL_FB_ABI_VERSION, sizeof(*q), getRegistryEntryID(),
