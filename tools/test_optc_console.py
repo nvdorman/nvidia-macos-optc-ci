@@ -475,6 +475,7 @@ with tempfile.TemporaryDirectory(prefix="optc-console-") as directory:
         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
         "-I", str(ROOT / "kexts/NMIntelFB"), str(source), "-o", str(executable),
     ], check=True)
+    # Apple ASan rejects detect_leaks=1; retain each toolchain's default leak support.
     subprocess.run([str(executable)], check=True,
-                   env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:halt_on_error=1",
+                   env={**os.environ, "ASAN_OPTIONS": "halt_on_error=1",
                         "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1"})

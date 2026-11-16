@@ -37,6 +37,9 @@
 #include <sys/sysctl.h>
 #include <libkern/version.h>
 
+// The 25G342 kernel's IOSubMemoryDescriptor metaclass advertises 0x70 bytes.
+static_assert(sizeof(IOSubMemoryDescriptor) == 0x70, "25G342 IOSubMemoryDescriptor ABI mismatch");
+
 #define IFBLOG(fmt, ...) IOLog("NMIntelFB: " fmt "\n", ##__VA_ARGS__)
 
 // kmutil places a kext in a kernel collection only with a _kmod_info symbol (Xcode generates it; this build does not)
