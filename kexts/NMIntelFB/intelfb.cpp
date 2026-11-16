@@ -568,12 +568,45 @@ bool NMIntelFB::captureBootAuthority()
 {
     NMIntelVideo afterVideo;
     NMIntelEfiMap afterMap;
-    if (!nmIntelReadBoot(&fBootVideo, &fEfiMap) ||
-        !nm_intelfb_video_ok(&fBootVideo, &fFrameBytes, &fRoundedBytes)) return false;
+    if (!nmIntelReadBoot(&fBootVideo, &fEfiMap)) {
+        const uintptr_t p = reinterpret_cast<uintptr_t>(PE_state.bootArgs);
+        const volatile boot_args *a =
+            (PE_state.initialized && !(p & 3) && nm_intelfb_kernel_span(p, sizeof(boot_args)))
+                ? reinterpret_cast<const volatile boot_args *>(p)
+                : nullptr;
+        IFBLOG("authority reject: bootArgs init=%d kspan=%d ver=%u rev=%u efi=%u mbytes=%u mstride=%u mver=%u disp=%llu",
+               PE_state.initialized ? 1 : 0, a ? 1 : 0,
+               a ? static_cast<unsigned>(a->Version) : 0u,
+               a ? static_cast<unsigned>(a->Revision) : 0u,
+               a ? static_cast<unsigned>(a->efiMode) : 0u,
+               static_cast<unsigned>(fEfiMap.bytes),
+               static_cast<unsigned>(fEfiMap.stride),
+               static_cast<unsigned>(fEfiMap.version),
+               static_cast<unsigned long long>(fBootVideo.display));
+        return false;
+    }
+    if (!nm_intelfb_video_ok(&fBootVideo, &fFrameBytes, &fRoundedBytes)) {
+        IFBLOG("authority reject: boot video invalid (%llux%llu p=%llu depth=%llu disp=%llu rot=%llu)",
+               static_cast<unsigned long long>(fBootVideo.width),
+               static_cast<unsigned long long>(fBootVideo.height),
+               static_cast<unsigned long long>(fBootVideo.pitch),
+               static_cast<unsigned long long>(fBootVideo.depth),
+               static_cast<unsigned long long>(fBootVideo.display),
+               static_cast<unsigned long long>(fBootVideo.rotate));
+        return false;
+    }
     const PE_Video console = PE_state.video;
     const NMIntelVideo current = nmIntelConsoleVideo(console);
     if (console.v_offset || (console.v_length && console.v_length != fFrameBytes) ||
-        !nm_intelfb_console_matches(&fBootVideo, &current, 0)) return false;
+        !nm_intelfb_console_matches(&fBootVideo, &current, 0)) {
+        IFBLOG("authority reject: console mismatch off=%llu len=%llu baseEq=%d disp=%llu->%llu",
+               static_cast<unsigned long long>(console.v_offset),
+               static_cast<unsigned long long>(console.v_length),
+               (current.base == fBootVideo.base || current.base == (fBootVideo.base | 1ull)) ? 1 : 0,
+               static_cast<unsigned long long>(fBootVideo.display),
+               static_cast<unsigned long long>(current.display));
+        return false;
+    }
     fEfiBytes = static_cast<uint8_t *>(IOMallocData(fEfiMap.bytes));
     if (!fEfiBytes) return false;
     IOMemoryDescriptor *map = IOMemoryDescriptor::withPhysicalAddress(
@@ -589,7 +622,15 @@ bool NMIntelFB::captureBootAuthority()
     if (!ok || !nmIntelReadBoot(&afterVideo, &afterMap) ||
         !nm_intelfb_video_equal(&fBootVideo, &afterVideo) ||
         !nm_intelfb_efi_metadata_equal(&fEfiMap, &afterMap) ||
-        !nm_intelfb_reserved(&fEfiMap, fEfiBytes, fBootVideo.base, fRoundedBytes)) return false;
+        !nm_intelfb_reserved(&fEfiMap, fEfiBytes, fBootVideo.base, fRoundedBytes)) {
+        IFBLOG("authority reject: efi read/reservation ok=%d stable=%d res=%d bytes=%u stride=%u",
+               ok ? 1 : 0,
+               (ok && nm_intelfb_video_equal(&fBootVideo, &afterVideo) &&
+                nm_intelfb_efi_metadata_equal(&fEfiMap, &afterMap)) ? 1 : 0,
+               (ok && nm_intelfb_reserved(&fEfiMap, fEfiBytes, fBootVideo.base, fRoundedBytes)) ? 1 : 0,
+               fEfiMap.bytes, fEfiMap.stride);
+        return false;
+    }
     fWidth = static_cast<uint32_t>(fBootVideo.width);
     fHeight = static_cast<uint32_t>(fBootVideo.height);
     fRowBytes = static_cast<uint32_t>(fBootVideo.pitch);
@@ -632,6 +673,15 @@ bool NMIntelFB::adoptFirmwareMode()
         accepted = plane;
     }
     if (matched < 0) {
+        for (unsigned p = 0; p < 4; ++p) {
+            NMIntelPlane snap = {};
+            if (nm_intelfb_plane_snapshot(readRegister, this, fMMIO->getLength(), p, &snap) &&
+                (snap.conf & (1u << 31))) {
+                IFBLOG("pipe %u mismatch: conf=0x%x ctl=0x%x stride=0x%x size=0x%x src=0x%x ggc=0x%x planeOk=%d",
+                       p, snap.conf, snap.control, snap.stride, snap.size, snap.pipeSource, snap.ggc,
+                       nm_intelfb_plane_ok(&snap, &fBootVideo));
+            }
+        }
         IFBLOG("no stable linear plane has the firmware framebuffer's complete GGTT translation");
         return false;
     }

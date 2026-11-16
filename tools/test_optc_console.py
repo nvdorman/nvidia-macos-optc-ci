@@ -218,15 +218,25 @@ static void reservation() {
     assert(!nm_intelfb_boot_header_ok(2, 1, 32));
     assert(nm_intelfb_kernel_span(0xffffff8000100000ull, 4096));
     assert(!nm_intelfb_kernel_span(0x100000, 4096) && !nm_intelfb_kernel_span(UINT64_MAX - 7, 8));
-    for (unsigned field = 0; field < 5; ++field) {
+    for (unsigned field = 0; field < 7; ++field) {
         NMIntelVideo bad = video;
         if (field == 0) bad.base |= 1;
         if (field == 1) bad.base = 0xffffff8000000000ull;
         if (field == 2) bad.pitch = UINT64_MAX - 3;
         if (field == 3) bad.rotate = 1;
         if (field == 4) bad.depth = 30;
+        if (field == 5) bad.display = 0;
+        if (field == 6) bad.display = 3;
         assert(!nm_intelfb_video_ok(&bad, nullptr, nullptr));
     }
+    // Verbose (-v) boots leave bootArgs->Video.v_display == 2 (FB_TEXT_MODE) while XNU normalizes console to 1.
+    NMIntelVideo verboseBoot = video;
+    verboseBoot.display = 2;
+    assert(nm_intelfb_video_ok(&verboseBoot, &bytes, &rounded));
+    NMIntelVideo activeConsole = video;
+    assert(nm_intelfb_console_matches(&verboseBoot, &activeConsole, 0));
+    activeConsole.display = 2;
+    assert(!nm_intelfb_console_matches(&verboseBoot, &activeConsole, 0));
     uint8_t map[96] = {};
     NMIntelEfiMap metadata{0x400000, sizeof map, 48, 1};
     efi(map, 0, video.base, 2000); efi(map + 48, 0, video.base + 2000 * 4096ull, 2000);
@@ -308,6 +318,8 @@ static void translation() {
     r.mutateOffset = 0x70180; r.mutateOccurrence = 2; r.seen = 0; assert(!valid());
     r.mutateOffset = table + first * 8; r.mutateOccurrence = 2; r.seen = 0; assert(!valid());
     r.mutateOffset = UINT64_MAX; assert(valid());
+    video.display = 2; assert(valid()); // verbose (-v) bootArgs FB_TEXT_MODE GGTT walk
+    video.display = 1;
     casePass("translation");
 }
 

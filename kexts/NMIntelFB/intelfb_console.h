@@ -50,13 +50,16 @@ static inline int nm_intelfb_boot_header_ok(uint32_t version, uint32_t revision,
     /* The pinned x86 boot_args ABI is version 2, revisions 0 and 1. */
     return version == 2 && revision <= 1 && efiMode == 64;
 }
+/* boot_args->Video.v_display is 1 (GRAPHICS_MODE) on normal boot and 2 (FB_TEXT_MODE) under -v;
+ * XNU PE_create_console() sets PE_state.video.v_display = 1 without mutating PE_state.bootArgs,
+ * so boot metadata permits {1, 2} while active console matching below keeps current->display == 1. */
 static inline int nm_intelfb_video_ok(const struct NMIntelVideo *v, uint64_t *bytes,
                                     uint64_t *rounded)
 {
     uint64_t size, end, pages;
     if (!v || !v->base || (v->base & (NM_INTEL_PAGE - 1)) ||
         v->base >= (1ull << 52) || v->width < 320 || v->height < 200 ||
-        v->depth != 32 || v->display != 1 || v->rotate ||
+        v->depth != 32 || (v->display != 1 && v->display != 2) || v->rotate ||
         !nm_intelfb_span(v->width, v->height, v->pitch, UINT64_MAX, &size, 0) ||
         !nm_intelfb_add(size, NM_INTEL_PAGE - 1, &pages)) return 0;
     pages &= ~(NM_INTEL_PAGE - 1);

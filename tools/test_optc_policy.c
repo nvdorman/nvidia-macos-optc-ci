@@ -129,6 +129,19 @@ int main(void)
     CHK("valid original firmware geometry has an exact span",
         nm_intelfb_video_ok(&original, &bytes, &rounded) &&
         bytes == 16384000ULL && rounded == bytes);
+    struct NMIntelVideo verboseBoot = original;
+    verboseBoot.display = 2;
+    CHK("verbose -v FB_TEXT_MODE bootArgs admitted when active console is normalized",
+        nm_intelfb_video_ok(&verboseBoot, &bytes, &rounded) &&
+        nm_intelfb_console_matches(&verboseBoot, &current, 0));
+    current.display = 2;
+    CHK("unnormalized active console display mode rejected",
+        !nm_intelfb_console_matches(&verboseBoot, &current, 0));
+    current.display = 0;
+    CHK("zero TEXT_MODE display rejected", !nm_intelfb_video_ok(&current, &bytes, &rounded));
+    current.display = 3;
+    CHK("out-of-range display mode rejected", !nm_intelfb_video_ok(&current, &bytes, &rounded));
+    current = original;
     current.base |= 1;
     CHK("explicit physical console flag preserves known provenance",
         nm_intelfb_console_matches(&original, &current, 0));
