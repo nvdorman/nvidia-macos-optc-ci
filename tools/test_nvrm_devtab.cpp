@@ -1,6 +1,5 @@
 /* Host test for kexts/NVRM/nvrm_devtab.h. c++ -std=c++11 -I kexts/NVRM tools/test_nvrm_devtab.cpp -o /tmp/t && /tmp/t
-   Every arm is a sentence. The legacy arms compare against a model of the old code (one global, set by each start, never
-   cleared), so they fail if the table changes what a single card, or an un-opted several, does. */
+   Stopped devices must not remain discoverable, with or without multi-GPU opt-in. */
 #include <cstdio>
 #include "nvrm_devtab.h"
 static int fails;
@@ -17,7 +16,13 @@ int main() {
     arm("one card: the table's primary is the object that started, as the old global was", (tab.add(&a, false, false), old = &a, tab.primary() == old));
     arm("one card: the table holds exactly one entry and at(0) is it", tab.count() == 1 && tab.at(0) == &a && tab.at(1) == 0);
     tab.remove(&a, false);
-    arm("one card: stop does not clear it (the old global never was)", tab.primary() == &a);
+    arm("one card: stop clears primary and all discovery entries",
+        tab.primary() == 0 && tab.count() == 0 && tab.at(0) == 0);
+    tab.remove(&a, false);
+    arm("one card: repeated stop stays empty", tab.primary() == 0 && tab.count() == 0);
+    tab.add(&b, false, false);
+    tab.remove(&a, false);
+    arm("a stale stop cannot remove the new primary", tab.primary() == &b && tab.count() == 1);
     reset(); Dev *oldg = 0;
     Dev *seq[] = { &a, &b, &c, &d };
     bool same = true;

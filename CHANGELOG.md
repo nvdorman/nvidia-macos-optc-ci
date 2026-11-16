@@ -1,5 +1,14 @@
 # Changelog
 
+## EXP-013 — experimental Hybrid copy contract
+
+- Preserve the independent Intel local-0/controller identity and logical Head 4.
+- Pin each NVIDIA allocation and GPU mapping to an immutable device generation; drain borrowed mappings and CPU access before retirement.
+- Populate the admitted framebuffer resource with the completed final image before synchronous, epoch-checked Intel publication. Failed preparation uses the family's real unwind without an unmatched completion.
+- Keep firmware scanout private: validate boot-video provenance, EFI reservation and live linear GGTT translation; expose owned shadow pages to framebuffer clients instead.
+- Use the stock Metal producer's private-image/readback and checked completion path in copy mode. Do not accept the legacy shared-memory/GPU-mark protocol or count queued/failed frames as completed publication.
+- Add production-body ownership, failure-injection, transfer, console and producer regressions. Native linkage and physical Metal/desktop qualification remain separate admission requirements; this entry is not boot authorization.
+
 ## 3.0
 
 ### Fixes

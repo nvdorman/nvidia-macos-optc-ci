@@ -26,6 +26,8 @@
     <key>com.apple.kpi.libkern</key><string>8.0</string>
     <key>com.apple.kpi.mach</key><string>8.0</string>
     <key>com.apple.kpi.bsd</key><string>8.0</string>
+    <!-- Exact 25G342 Unsupported KPI exports PE_state (EXP-013 authority). -->
+    <key>com.apple.kpi.unsupported</key><string>8.0</string>
     <key>com.apple.iokit.IOPCIFamily</key><string>1.0.0</string>
     <key>com.apple.iokit.IOGraphicsFamily</key><string>1.0.0</string>
   </dict>

@@ -27,3 +27,10 @@ static inline unsigned long long nvResBackingPitch(const volatile unsigned char 
 { return NV_RES_NARROW ? *(const volatile unsigned int *)(r + 0xbc) : *(const volatile unsigned long long *)(r + 0xc0); }
 static inline unsigned long long nvResFaceSize(const volatile unsigned char *r)
 { return NV_RES_NARROW ? *(const volatile unsigned int *)(r + 0xc8) : *(const volatile unsigned long long *)(r + 0xd0); }
+
+/* 25G342 lock_vidmem@0x237be: the actual native kernel CPU mapping, never written by us. */
+class IOMemoryMap;
+static inline IOMemoryMap *nvRes25G342KernelCPUMap(const void *resource)
+{
+    return *(IOMemoryMap *const volatile *)((const unsigned char *)resource + 0x178);
+}

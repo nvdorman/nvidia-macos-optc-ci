@@ -42,7 +42,7 @@ public:
     virtual void _RESERVEDIOAccelMemoryMap3();
     virtual void _RESERVEDIOAccelMemoryMap4();
     virtual void _RESERVEDIOAccelMemoryMap5();
-    virtual void redirect(IOAccelMemory *);
+    virtual bool redirect(IOAccelMemory *);
 private:
     uint8_t _opaque[kIOAccelMemoryMapSize - sizeof(OSObject)];
 };

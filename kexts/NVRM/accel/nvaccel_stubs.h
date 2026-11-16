@@ -16,11 +16,141 @@ class NVAccel;
 #include "IOAccelCLContext2.h"
 #include "IOAccelVideoContext2.h"
 #include "nvres_fields.h"
+#include "nvaccel_owner_policy.h"
+#include "nvaccel_frame_transfer.h"
+#include "nm_intelfb_present_abi.h"
+class NVVramOwner;
+class NVVramAllocation;
+class NVGpuVaRecord;
+class NVStockLifetime;
+class NVDisplayPipe;
+class NVVidMemory;
+class NVVramLease {
+    NVVramAllocation *fAllocation = nullptr;
+    NVLeaseUse fUse = NVLeaseUse::CpuAccess;
+    friend class NVVramAllocation;
+public:
+    NVVramLease() = default;
+    NVVramLease(const NVVramLease &) = delete;
+    NVVramLease &operator=(const NVVramLease &) = delete;
+    ~NVVramLease();
+    void reset();
+    NVVramAllocation *get() const { return fAllocation; }
+    NVVramAllocation *take() { NVVramAllocation *a = fAllocation; fAllocation = nullptr; return a; }
+};
+struct NVRetiredScanout {
+    IOService *framebuffer = nullptr;
+    OSObject *frontSurface = nullptr, *previousSurface = nullptr;
+    NVVramAllocation *front = nullptr, *previous = nullptr;
+};
+class NVVramOwner : public IOService {
+    OSDeclareDefaultStructors(NVVramOwner)
+public:
+    IOLock *fLock = nullptr;
+    NVOwnerState fState;
+    IOService *fNvrm = nullptr, *fStock = nullptr;
+    IOPCIDevice *fPci = nullptr;
+    bool fDirect = false, fAttached = false, fDeferred = false, fLifetimeHeld = false;
+    bool fRetirementPending = false;
+    IOOptionBits fTerminateOptions = 0;
+    NVStockLifetime *fStockLifetime = nullptr;
+    NVStockLifetime *fDisplayLifetime[5] = {};
+    bool bindDisplay(IOService *, unsigned);
+    struct NvKmsKapiFunctionsTable *fKms = nullptr;
+    struct NvKmsKapiDevice *fDevice = nullptr;
+    uint64_t fBarBytes = 0, fMappedBytes = 0;
+    NVRMRmHandles fHandles = {};
+    NVVramAllocation *fAllocations = nullptr;
+    NVGpuVaRecord *fReservations = nullptr;
+    struct thread_call *fReaper = nullptr;
+    NVRetiredScanout fRetiredScanout[5];
+    bool retireScanout(unsigned, IOService *, OSObject *, OSObject *, NVVramAllocation *, NVVramAllocation *);
+    bool reapScanouts();
+    bool scanoutRetiring(unsigned);
+    static NVVramOwner *create(IOService *, IOPCIDevice *, bool);
+    bool ensureDeviceLocked();
+    bool handles(NVRMRmHandles *);
+    bool active();
+    bool borrow();
+    void unborrow();
+    bool enter();
+    void leave();
+    void waitOperations();
+    void beginDrain();
+    bool isDrained();
+    void reap();
+    void scheduleReap();
+    static void reapCall(void *, void *);
+    IOReturn call(const char *, void *);
+    IOReturn cpuAccess(IOReturn (*)(void *), void *);
+    NVVramAllocation *allocate(uint64_t);
+    bool willTerminate(IOService *, IOOptionBits) APPLE_KEXT_OVERRIDE;
+    bool didTerminate(IOService *, IOOptionBits, bool *) APPLE_KEXT_OVERRIDE;
+    void free() APPLE_KEXT_OVERRIDE;
+};
+class NVStockLifetime : public IOService {
+    OSDeclareDefaultStructors(NVStockLifetime)
+public:
+    NVVramOwner *fOwner = nullptr;
+    IOService *fFramebuffer = nullptr;
+    bool fDeferred = false;
+    IOOptionBits fOptions = 0;
+    bool willTerminate(IOService *, IOOptionBits) APPLE_KEXT_OVERRIDE;
+    bool didTerminate(IOService *, IOOptionBits, bool *) APPLE_KEXT_OVERRIDE;
+    void free() APPLE_KEXT_OVERRIDE;
+};
+class NVVramAllocation : public OSObject {
+    OSDeclareDefaultStructors(NVVramAllocation)
+public:
+    NVVramOwner *fOwner = nullptr;
+    NVVramAllocation *fNext = nullptr;
+    NVBackingState fState;
+    NVRMVramRequest fReceipt = {};
+    uint32_t fCache = 0;
+    bool acquire(NVLeaseUse, NVVramLease *);
+    void releaseLease(NVLeaseUse);
+    void retire();
+    bool park();
+    bool unpark();
+    NVBackingKey key() const { return fState.key; }
+    void free() APPLE_KEXT_OVERRIDE;
+};
+class NVVramMemoryDescriptor : public IOGeneralMemoryDescriptor {
+    OSDeclareDefaultStructors(NVVramMemoryDescriptor)
+    NVVramLease fLease;
+public:
+    bool initWithAllocation(NVVramAllocation *, uint64_t, uint64_t);
+    NVVramAllocation *allocation() const { return fLease.get(); }
+    void free() APPLE_KEXT_OVERRIDE;
+    IOMemoryMap *makeMapping(IOMemoryDescriptor *, task_t, IOVirtualAddress, IOOptionBits, IOByteCount, IOByteCount) APPLE_KEXT_OVERRIDE;
+};
+class NVGpuVaRecord : public OSObject {
+    OSDeclareDefaultStructors(NVGpuVaRecord)
+public:
+    NVVramOwner *fOwner = nullptr;
+    NVGpuVaRecord *fNext = nullptr;
+    NVRMGpuVaRequest fRequest = {};
+    NVVramLease fLease;
+    NVBackingKey fKey = {};
+    bool fMapped = false, fRetiring = false;
+    bool unmap(bool releaseVa);
+    void free() APPLE_KEXT_OVERRIDE;
+};
+enum class NVFramebufferPhase { Empty, Candidate, Ready, Retiring };
 class NVResource : public IOAccelResource2 {
     OSDeclareDefaultStructors(NVResource)
     NM_TAHOE_FWD(NVResource)
 public:
     class NVAccel *fAccel = nullptr;   // the accelerator that made this object (NVAccel::resolve)
+    NVDisplayPipe *fFramebufferPipe = nullptr; // weak; cleared by the vendor destroy callback
+    NVVidMemory *fFramebufferMemory = nullptr; // explicit retain, independent of the adopted bank
+    unsigned fSuccessfulPrepares = 0;
+    bool fAbortWithoutPrepare = false, fMemoryPinned = false;
+    NVBackingKey fApertureKey = {}, fCpuPublicationKey = {};
+    uint64_t fCpuPublication = 0;
+    bool prepare() APPLE_KEXT_OVERRIDE;
+    void complete() APPLE_KEXT_OVERRIDE;
+    void releaseFramebufferBacking();
     unsigned int fPbLogged = 0;
     void rebuildPagingBuffer() APPLE_KEXT_OVERRIDE { if (fPbLogged < 4) { fPbLogged++; ALOG("NVResource::rebuildPagingBuffer -- nothing to rebuild until there are page tables (rung 5)"); } }
     uint64_t getLevelOffset(unsigned char a0, unsigned char a1, int* a2) APPLE_KEXT_OVERRIDE {
@@ -66,6 +196,7 @@ public:
 #else
     void pageoff(IOAccelEvent *, bool, bool *, unsigned long long) APPLE_KEXT_OVERRIDE;
 #endif
+    void pageoffLegacy(IOAccelEvent *, bool, bool *, unsigned long long);
     unsigned int fApLogged = 0;
     IOMemoryDescriptor *fApDesc = nullptr;
     // Set by the plugin's surface-dirty escape: the allocation cookie of the VRAM the GPU wrote for this resource. The
@@ -88,29 +219,21 @@ class NVVidMemory : public IOAccelVidMemory {
     NM_TAHOE_FWD(NVVidMemory)
 public:
     class NVAccel *fAccel = nullptr;   // the accelerator that made this object (NVAccel::resolve)
-    void              *fRmHandle = nullptr;
-    unsigned long long fAllocationCookie = 0;
-    void              *fKva      = nullptr;
-    unsigned long long fPhys     = 0;
-    unsigned long long fBytes    = 0;
-    bool fScanout = false;
-    // VRAM kept across deallocPhysical/allocPhysical (debug.nvaccel_vm_sticky): see NVVidMemory::deallocPhysical
-    void              *fParkHandle = nullptr;
-    void              *fParkKva    = nullptr;
-    unsigned long long fParkPhys = 0, fParkBytes = 0, fParkCookie = 0;
-    void releaseVram(void *handle, void *kva, unsigned long long bytes, unsigned long long cookie);
+    NVVramOwner *fOwner = nullptr;
+    NVVramAllocation *fBacking = nullptr, *fParked = nullptr;
+    bool fDestroying = false, fScanout = false;
+    uint64_t fScanoutPhysical = 0, fScanoutBytes = 0;
+    bool bindOwner(NVVramOwner *);
     void releaseParked();
-
+    void *handle() const { return fBacking ? fBacking->fReceipt.handle : nullptr; }
+    void *kva() const { return fBacking ? fBacking->fReceipt.kva : nullptr; }
+    uint64_t physical() const { return fBacking ? fBacking->fReceipt.phys : fScanoutPhysical; }
+    uint64_t capacity() const { return fBacking ? fBacking->fReceipt.actualSize : fScanoutBytes; }
+    uint64_t cookie() const { return fBacking ? fBacking->fReceipt.allocationCookie : 0; }
     bool allocPhysical() APPLE_KEXT_OVERRIDE;
     void deallocPhysical() APPLE_KEXT_OVERRIDE;
     void free() APPLE_KEXT_OVERRIDE;
-
-    uint64_t getPhysicalSegment(unsigned long long a0, unsigned long long* a1) APPLE_KEXT_OVERRIDE {
-        const unsigned long long total = *(const volatile unsigned long long *)((const unsigned char *)this + 0x40);
-        if (!fPhys || a0 >= total) { if (a1) *a1 = 0; return 0; }
-        if (a1) *a1 = total - a0;
-        return fPhys + a0;
-    }
+    uint64_t getPhysicalSegment(unsigned long long, unsigned long long *) APPLE_KEXT_OVERRIDE;
 };
 OSDefineMetaClassAndStructors(NVVidMemory, IOAccelVidMemory)
 class NVSurface : public IOAccelLegacySurface {
@@ -173,6 +296,19 @@ class NVDisplayPipe : public IOAccelLegacyDisplayPipe {
 public:
     class NVAccel *fAccel = nullptr;   // the accelerator that made this object (NVAccel::resolve)
     IOAccelMemory *initFramebufferResource(unsigned int index, IOAccelResource2 *res) APPLE_KEXT_OVERRIDE;
+    void destroyFramebufferResource(unsigned int, IOAccelResource2 *) APPLE_KEXT_OVERRIDE;
+    void displayModeWillChange() APPLE_KEXT_OVERRIDE;
+    NVFramebufferPhase fFramebufferPhase = NVFramebufferPhase::Empty;
+    NVResource *fFramebufferResource = nullptr; // native resource owns its adopted memory
+    NMIntelFramebufferInfo fFramebufferInfo = {};
+    NVTransactionState fTransaction;
+    IOLock *fTransactionLock = nullptr;
+    bool fTransactionBusy = false;
+    void finishTransaction(const NVTransactionState &, IOReturn);
+    uint64_t fNextSequence = 0;
+    IOReturn presentFinal(IOService *, const nv_frame_span &);
+    IOReturn performLegacyTransaction(IOAccelDisplayPipeTransaction2 *);
+    IOReturn performCandidateTransaction(IOAccelDisplayPipeTransaction2 *, IOService *, unsigned);
     IOReturn validateTransaction(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;
     IOReturn performTransaction(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;
     bool     isTransactionComplete(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;

@@ -30,6 +30,8 @@ enum { kIOSurfaceLockReadOnly = 1 };
 typedef struct { unsigned w,h,bpp; unsigned char gpu[4]; } Image;
 static dispatch_semaphore_t entered, release_read;
 static unsigned uploads, gpu_seed;
+static int readStatus=0, unlockStatus=0;
+static BOOL blockRead=YES;
 static unsigned long long g_surfin_skip, g_surfin_copy;
 static uint32_t IOSurfaceGetSeed(IOSurfaceRef s) { return s->seed; }
 static unsigned IOSurfaceGetID(IOSurfaceRef s) { return 1; }
@@ -40,7 +42,7 @@ static IOReturn IOSurfaceLock(IOSurfaceRef s, unsigned opts, uint32_t *seed) {
 }
 static IOReturn IOSurfaceUnlock(IOSurfaceRef s, unsigned opts, uint32_t *seed) {
     if (seed) *seed=s->seed;
-    return 0;
+    return unlockStatus;
 }
 static void *IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef s, uint32_t p) { return s->cpu; }
 static size_t IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef s, uint32_t p) { return 4; }
@@ -80,8 +82,11 @@ static int nvmtl_vk_image_write(void *q, Image *i, void *base, size_t row) {
     memcpy(i->gpu,base,4); uploads++; return 0;
 }
 static int nvmtl_vk_image_read(void *q, Image *i, void *base, size_t row) {
-    dispatch_semaphore_signal(entered);
-    assert(!dispatch_semaphore_wait(release_read,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC)));
+    if (readStatus) return readStatus;
+    if (blockRead) {
+        dispatch_semaphore_signal(entered);
+        assert(!dispatch_semaphore_wait(release_read,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC)));
+    }
     memcpy(base,i->gpu,4); return 0;
 }
 @interface NVMTLTexture : NSObject {
@@ -160,6 +165,18 @@ int main(int argc, char **argv) { @autoreleasepool {
     assert(busyWaits==1 && c->_clientWritten);
     busyForeign=0; cs.seed++; [c nvmtlSurfaceIn];
     assert(busyWaits==2);
+    // A private image is not published when readback or IOSurface unlock fails.
+    Surface failed={.seed=11};
+    NVMTLTexture *f=[NVMTLTexture new]; f->_surf=&failed; f->_i=(Image){.w=1,.h=1,.bpp=4,.gpu={1,2,3,255}};
+    blockRead=NO; readStatus=-1;
+    assert(![f nvmtlSurfaceOut] && !f->_surfSynced && f->_surfSeed==0);
+    assert(failed.cpu[0]==0);
+    readStatus=0; unlockStatus=1;
+    assert(![f nvmtlSurfaceOut] && !f->_surfSynced && f->_surfSeed==0);
+    unlockStatus=0;
+    assert([f nvmtlSurfaceOut] && f->_surfSynced && f->_surfSeed==failed.seed);
+    assert(!memcmp(failed.cpu,f->_i.gpu,sizeof failed.cpu));
+    puts("OPTC_CASE {\"id\":\"publication_failure\",\"result\":\"PASS\"}");
     puts("PASS: overlapping publication preserves GPU pixels; later CPU edits import; a publication after the commit's "
          "VRAM mark never waits for the accelerator lock and retries a busy re-mark off its thread; another process's "
          "write is waited for before import");

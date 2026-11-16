@@ -7,6 +7,7 @@
 #include "nv-xnu.h"
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
+#include <libkern/OSAtomic.h>
 
 extern "C" {
 #include "nvtypes.h"
@@ -31,6 +32,7 @@ struct NvGpuVaSpace {
     NvU32 hClient;
     NvU32 hDevice;
     NvU32 hVaSpace;
+    unsigned reservations;
 };
 static NvGpuVaSpace gSpaces[kNvGpuVaMaxDevices];
 static unsigned     gSpaceCount;
@@ -51,9 +53,15 @@ static bool nvGpuVaResolve(struct NVRMGpuVaRequest *r)
     return true;
 }
 
-static void nvGpuVaInitOnce(void)
+static bool nvGpuVaInitOnce(void)
 {
-    if (!gSpaceLock) gSpaceLock = IOLockAlloc();
+    if (!__atomic_load_n(&gSpaceLock, __ATOMIC_ACQUIRE)) {
+        IOLock *lock = IOLockAlloc();
+        if (!lock) return false;
+        if (!OSCompareAndSwapPtr(nullptr, lock, (void *volatile *)&gSpaceLock))
+            IOLockFree(lock);
+    }
+    return true;
 }
 
 static NvV32 nvGpuVaRmAlloc(NvU32 hRoot, NvU32 hParent, NvU32 hClass,
@@ -89,11 +97,15 @@ static NvV32 nvGpuVaRmFree(NvU32 hRoot, NvU32 hParent, NvU32 hObject)
 
 static NvV32 nvGpuVaSpaceFor(NvU32 hClient, NvU32 hDevice, NvU32 *hVaOut)
 {
-    nvGpuVaInitOnce();
-    if (!gSpaceLock) return NV_ERR_INVALID_STATE;
+    if (!nvGpuVaInitOnce()) return NV_ERR_INVALID_STATE;
     IOLockLock(gSpaceLock);
     for (unsigned i = 0; i < gSpaceCount; i++) {
         if (gSpaces[i].hClient == hClient && gSpaces[i].hDevice == hDevice) {
+            if (gSpaces[i].reservations == ~0u) {
+                IOLockUnlock(gSpaceLock);
+                return NV_ERR_INSUFFICIENT_RESOURCES;
+            }
+            ++gSpaces[i].reservations;
             *hVaOut = gSpaces[i].hVaSpace;
             IOLockUnlock(gSpaceLock);
             return 0;
@@ -117,11 +129,54 @@ static NvV32 nvGpuVaSpaceFor(NvU32 hClient, NvU32 hDevice, NvU32 *hVaOut)
     gSpaces[gSpaceCount].hClient  = hClient;
     gSpaces[gSpaceCount].hDevice  = hDevice;
     gSpaces[gSpaceCount].hVaSpace = hVa;
+    gSpaces[gSpaceCount].reservations = 1;
     gSpaceCount++;
     IOLockUnlock(gSpaceLock);
     GVLOG("FERMI_VASPACE_A 0x%x created for client 0x%x device 0x%x", hVa, hClient, hDevice);
     *hVaOut = hVa;
     return 0;
+}
+
+static bool nvGpuVaDropReservation(NvU32 client, NvU32 device)
+{
+    if (!gSpaceLock) return false;
+    IOLockLock(gSpaceLock);
+    bool found = false;
+    for (unsigned i = 0; i < gSpaceCount; ++i) {
+        if (gSpaces[i].hClient == client && gSpaces[i].hDevice == device &&
+            gSpaces[i].reservations) {
+            --gSpaces[i].reservations;
+            found = true;
+            break;
+        }
+    }
+    IOLockUnlock(gSpaceLock);
+    return found;
+}
+
+extern "C" int nvrm_gpuva_drain(struct NVRMGpuVaRequest *r)
+{
+    if (!r || r->version != NVRM_GPUVA_ABI_VERSION) return -1;
+    r->status = 0;
+    if (!nvGpuVaResolve(r)) { r->status = NV_ERR_INVALID_ARGUMENT; return -1; }
+    if (!nvGpuVaInitOnce()) { r->status = NV_ERR_NO_MEMORY; return -1; }
+    IOLockLock(gSpaceLock);
+    for (unsigned i = 0; i < gSpaceCount; ++i) {
+        NvGpuVaSpace &space = gSpaces[i];
+        if (space.hClient != r->hClient || space.hDevice != r->hDevice) continue;
+        if (space.reservations) {
+            r->status = NV_ERR_STATE_IN_USE;
+        } else {
+            r->status = (int)nvGpuVaRmFree(space.hClient, space.hDevice, space.hVaSpace);
+            if (!r->status) {
+                space = gSpaces[--gSpaceCount];
+                nvGvZero(&gSpaces[gSpaceCount], sizeof gSpaces[gSpaceCount]);
+            }
+        }
+        break;
+    }
+    IOLockUnlock(gSpaceLock);
+    return r->status ? -1 : 0;
 }
 
 extern "C" int nvrm_gpuva_alloc(struct NVRMGpuVaRequest *r)
@@ -150,6 +205,7 @@ extern "C" int nvrm_gpuva_alloc(struct NVRMGpuVaRequest *r)
     NvU32 hVirt = 0;
     st = nvGpuVaRmAlloc(r->hClient, r->hDevice, NVRM_CLS_NV50_MEMORY_VIRTUAL, &vp, sizeof vp, &hVirt);
     if (st != 0 || !hVirt) {
+        nvGpuVaDropReservation(r->hClient, r->hDevice);
         r->status = st ? (int)st : NV_ERR_GENERIC;
         if (gAllocLogged < 8) { gAllocLogged++;
             GVLOG("NV50_MEMORY_VIRTUAL refused %llu bytes (align %llu) -> status 0x%x",
@@ -222,11 +278,21 @@ extern "C" int nvrm_gpuva_free(struct NVRMGpuVaRequest *r)
         ops.params.unmapMemoryDma.flags     = 0;
         ops.params.unmapMemoryDma.dmaOffset = r->gpuva;
         rm_kernel_rmapi_op(NULL, &ops);
-        if (ops.params.unmapMemoryDma.status != 0)
-            GVLOG("UNMAP_MEMORY_DMA hVirt 0x%x -> status 0x%x (freeing anyway)",
-                  r->hVirt, ops.params.unmapMemoryDma.status);
+        r->status = (int)ops.params.unmapMemoryDma.status;
+        if (r->status) {
+            GVLOG("UNMAP_MEMORY_DMA hVirt 0x%x -> status 0x%x (ownership retained)",
+                  r->hVirt, (unsigned)r->status);
+            return -1;
+        }
+        r->hMemory = 0;
     }
     if (r->flags & NVRM_GPUVA_FLAG_UNMAP_ONLY) return 0;
     r->status = (int)nvGpuVaRmFree(r->hClient, r->hDevice, r->hVirt);
+    if (!r->status) {
+        if (!nvGpuVaDropReservation(r->hClient, r->hDevice))
+            r->status = NV_ERR_INVALID_STATE;
+        r->hVirt = 0;
+        r->gpuva = 0;
+    }
     return r->status ? -1 : 0;
 }

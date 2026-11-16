@@ -1,12 +1,7 @@
 /* nvrm_devtab.h - which GPU objects exist, which one is primary, and when a card may start.
-   NVRM and NVAccel each used to keep one global pointer, set by the newest start() and never cleared. This table replaces
-   the pointer without changing what one card (or an un-opted several) does:
-
-     legacy (nvmultigpu absent): add() replaces the whole table with the newest object and remove() does nothing, which is
-     exactly "the global is set by every start() and never cleared". primary() is that global.
-
-     multi (boot argument nvmultigpu=1): the table holds every started card, the primary is the card the primary selector
-     marked (else the first to start), and remove() takes a stopped card out.
+   Callers serialize every lookup/update. A pointer acquired for use after releasing the
+   caller's lock must be retained under that lock. Single-GPU mode replaces the table;
+   both modes remove stopped devices before admitting another lookup.
 
    The start gate is the second half. The four-card report showed what unrestricted matching does: several cards began
    start-up at once, one reached RmInitAdapter and display set-up failed on another. In multi mode a card may begin only when
@@ -32,7 +27,7 @@ template <class T> struct NvrmDevTab {          /* zero-initialised static stora
         if (!prim || marked_primary) prim = d;
     }
     void remove(T *d, bool multi) {
-        if (!multi) return;                               /* legacy: the pointer was never cleared */
+        (void)multi;
         for (unsigned i = 0; i < n; i++) if (dev[i] == d) {
             for (unsigned j = i + 1; j < n; j++) dev[j - 1] = dev[j];
             dev[--n] = 0;

@@ -1,14 +1,7 @@
-// NMIntelFB: framebuffer for the built-in panel of laptops whose panel is wired to an Intel GPU macOS has no driver for
-// (display versions 12-20: Tiger Lake, Rocket Lake, Alder Lake, Raptor Lake, Meteor Lake, Arrow Lake, Lunar Lake).
-//
-// Phase 1 takes over the mode the firmware already lit: it finds the pipe whose primary plane is scanning out, checks
-// that the plane is linear 32-bit XRGB, and publishes that surface (through the graphics aperture, BAR2 + the plane's GGTT
-// offset) as an IOFramebuffer with the panel's real size and refresh. Nothing is written to the display engine, so a
-// laptop it does not understand keeps exactly the screen it had: start() fails, every reason is logged, and the firmware
-// framebuffer (IONDRVFramebuffer) takes the device as before.
-//
-// Register layout: Linux i915/xe display headers (MIT). Plane 1 of pipe P: PLANE_CTL 0x70180 + P*0x1000, STRIDE +0x08,
-// SIZE +0x10, SURF +0x1C. Transcoder T timings at 0x60000 + T*0x1000, TRANSCONF at 0x70008 + P*0x1000, PIPESRC 0x6001C.
+// NMIntelFB adopts, but never programs, the firmware's fixed linear panel mode.
+// The firmware sink is private UC memory, authorized by boot_args + EFI reservations
+// and an exact read-only GGTT walk. IOGraphics and clients see owned WC shadow pages.
+// nmIntelPresent synchronously publishes a completed NVAccel final image to both.
 
 #include <IOKit/IOLib.h>
 // IOPCIDevice (with its setBusMasterEnable) is marked deprecated in favour of PCIDriverKit, which runs in user space and
@@ -18,6 +11,9 @@
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/graphics/IODisplay.h>
 #include <IOKit/IOPlatformExpert.h>
+#include <IOKit/IOSubMemoryDescriptor.h>
+#include <pexpert/pexpert.h>
+#include <pexpert/i386/boot.h>
 #include <IOKit/ndrvsupport/IOMacOSVideo.h>
 #include "intelfb_console.h"
 #include <libkern/OSAtomic.h>
@@ -175,11 +171,58 @@ public:
     void free() override;
 };
 
+// IOSubMemoryDescriptor retains the owned pages through every client mapping.
+// x86 makeMapping receives a provisional IOMemoryMap in address (XNU ac9718fb);
+// a rejecting override consumes that reference just as the superclass does.
+class NMIntelShadowMemory final : public IOSubMemoryDescriptor {
+    OSDeclareDefaultStructors(NMIntelShadowMemory)
+public:
+    IOMemoryMap *makeMapping(IOMemoryDescriptor *owner, task_t task, IOVirtualAddress address,
+                             IOOptionBits options, IOByteCount offset, IOByteCount length) override {
+        if (!nm_intelfb_shadow_cache_ok(options, kIOMapCacheMask, kIOMapDefaultCache,
+                                       kIOMapWriteCombineCache)) {
+            if (address) reinterpret_cast<IOMemoryMap *>(address)->release();
+            return nullptr;
+        }
+        return IOSubMemoryDescriptor::makeMapping(owner, task, address, options, offset, length);
+    }
+};
+OSDefineMetaClassAndStructors(NMIntelShadowMemory, IOSubMemoryDescriptor)
+
 class NMIntelFB : public IOFramebuffer {
     OSDeclareDefaultStructors(NMIntelFB)
     IOPCIDevice *fPCI = nullptr;
     IOMemoryMap *fMMIO = nullptr;
-    IOMemoryMap *fSurfMap = nullptr;   // write-combined CPU view of the scan-out surface (NVIDIA frames land here)
+    IOMemoryDescriptor *fFirmwareMemory = nullptr;
+    IOMemoryMap *fSurfMap = nullptr;   // private UC/inhibited firmware sink, never returned to clients
+    IOBufferMemoryDescriptor *fShadowBuffer = nullptr;
+    NMIntelShadowMemory *fShadowMemory = nullptr;
+    IOLock *fPresentLock = nullptr;    // family lock -> this lock; never call family with it held
+    NMIntelPresentState fPresentState = { NMIntelPrepared, 1, 0, 0 };
+    NMIntelVideo fBootVideo = {};
+    NMIntelEfiMap fEfiMap = {};
+    NMIntelPlane fFirmwarePlane = {};
+    uint8_t *fEfiBytes = nullptr;
+    uint64_t fFrameBytes = 0, fRoundedBytes = 0, fConsoleKva = 0;
+    PE_Video fSavedConsole = {};
+    IONotifier *fFramebufferEvents = nullptr;
+    bool fPowered = true, fOpened = false, fBaseStarted = false;
+    thread_call_t fRefreshCall = nullptr;
+    volatile UInt32 fRefreshPending = 0;
+    bool captureBootAuthority();
+    bool prepareAperture();
+    bool revalidateAuthorityLocked(bool walk);
+    bool recordConsoleMappingLocked();
+    bool copyShadowLocked();
+    void revokePresentation(NMIntelPhase phase);
+    void cancelPresentation();
+    bool restoreConsole();
+    IOReturn reacquirePresentation();
+    IOReturn framebufferInfo(NMIntelFramebufferInfo *q);
+    IOReturn present(NMIntelPresentRequest *q);
+    static int readRegister(void *context, uint64_t offset, uint32_t *value);
+    static void refreshFire(thread_call_param_t context, thread_call_param_t);
+    static IOReturn framebufferEvent(OSObject *, void *, IOFramebuffer *, IOIndex, void *);
     // WindowServer paces an accelerated display on its VBL interrupt: the NVIDIA display pipe completes each frame on it.
     // Without one the first frame never completed and WindowServer stalled every display (in testing, the
     // virtual panel froze the Mac). A 60 Hz timer is the VBL, as NVRMFB's fallback is.
@@ -192,6 +235,8 @@ class NMIntelFB : public IOFramebuffer {
         NMIntelFB *me = (NMIntelFB *)p0;
         if (me->fStopping) return;
         if (me->fVbl.proc) { me->fVbl.proc(me->fVbl.target, me->fVbl.ref); me->fVblCalls++; }
+        if (me->fRefreshCall && OSCompareAndSwap(0, 1, &me->fRefreshPending))
+            thread_call_enter(me->fRefreshCall);
         uint64_t period; nanoseconds_to_absolutetime(me->fFrameNs, &period);
         uint64_t now = mach_absolute_time();
         me->fVblNext = (me->fVblNext && me->fVblNext + period > now) ? me->fVblNext + period : now + period;
@@ -203,25 +248,26 @@ class NMIntelFB : public IOFramebuffer {
         IFBLOG("vbl timer %s", fVblTimer ? "armed (60 Hz)" : "ALLOCATE FAILED");
     }
 #ifdef NMINTELFB_VIRTUAL
-    IOBufferMemoryDescriptor *fVBuf = nullptr;
-    IOTimerEventSource *fTimer = nullptr;
+    // Virtual builds use the identical shadow/info/present contract, without a physical sink.
     unsigned fSamples = 0;
-    // 64 pixels across the buffer: how many are non-black and how many differ from the first, published in the registry
+    // On-demand sample of the owned aperture; not evidence of physical scanout.
 public:
-    // 64 pixels across the buffer, read on demand through sysctl debug.nmintelfb_sample (the registry property the
-    // timer set never showed up)
+    // Virtual diagnostics share the presentation lock with teardown.
     void sampleInto(char *b, size_t n) {
-        if (!fSurfMap) { snprintf(b, n, "no surface"); return; }
-        const volatile uint32_t *px = (const volatile uint32_t *)fSurfMap->getVirtualAddress();
+        if (!fPresentLock) { snprintf(b, n, "no surface"); return; }
+        IOLockLock(fPresentLock);
+        if (!fShadowBuffer) { IOLockUnlock(fPresentLock); snprintf(b, n, "no surface"); return; }
+        const volatile uint32_t *px = (const volatile uint32_t *)fShadowBuffer->getBytesNoCopy();
         unsigned nz = 0, varied = 0; uint32_t first = px[0] & 0xFFFFFF;
         for (unsigned i = 0; i < 8; i++) for (unsigned j = 0; j < 8; j++) {
             uint32_t v = px[(fHeight * (2 * i + 1) / 16) * (fRowBytes / 4) + fWidth * (2 * j + 1) / 16] & 0xFFFFFF;
             if (v) nz++; if (v != first) varied++; }
         snprintf(b, n, "sample %u: nonzero %u/64 varied %u/64 first 0x%06x", ++fSamples, nz, varied, first);
+        IOLockUnlock(fPresentLock);
     }
     void sample() { char b[96]; sampleInto(b, sizeof b); setProperty("NMIntelFBSample", b); }
 private:
-#endif   // write-combined CPU view of the scan-out surface (NVIDIA frames land here)
+#endif
     volatile uint8_t *fRegs = nullptr;
     IOPhysicalAddress fApertureBase = 0;
     IOPhysicalLength fApertureLen = 0;
@@ -295,9 +341,17 @@ private:
     static int extPublish(void *c, void *o, unsigned slot); static void extUnpublish(void *c, void *o);
     static void extTakeDown(void *c, void *o, unsigned port); static void extRelease(void *c, void *o);
 
-    uint32_t rd(uint32_t off) const { return *(volatile uint32_t *)(fRegs + off); }
-    void wr(uint32_t off, uint32_t v) const { *(volatile uint32_t *)(fRegs + off) = v; }
+    uint32_t rd(uint32_t off) const {
+        if (!fRegs || !fMMIO || off > fMMIO->getLength() || fMMIO->getLength() - off < 4) return ~0u;
+        return *(volatile uint32_t *)(fRegs + off);
+    }
+    void wr(uint32_t off, uint32_t v) const {
+        if (!fRegs || !fMMIO || off > fMMIO->getLength() || fMMIO->getLength() - off < 4) return;
+        *(volatile uint32_t *)(fRegs + off) = v;
+    }
     bool adoptFirmwareMode();
+    bool adoptLegacyFirmwareMode();
+    void measureFirmwareTiming();
     uint32_t fPwmPeriod = 0;                     // firmware's PWM period; 0 = no brightness control
     NMIntelBacklight *fBacklight = nullptr;
     void publishBacklight();
@@ -320,6 +374,10 @@ public:
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
     void startUnwind();   // undo everything start() published; shared by a failed start and stop()
+    void free() override;
+    IOReturn open() override;
+    void close() override;
+    IOReturn setupForCurrentConfig() override;
 
     IOReturn enableController() override { return kIOReturnSuccess; }
     bool isConsoleDevice() override { return true; }
@@ -347,7 +405,7 @@ public:
         info->flags = kIODetailedTimingValid;
         return kIOReturnSuccess;
     }
-    IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override { return (mode == 1 && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupported; }
+    IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override;
     IOItemCount getConnectionCount() override { return 1; }
     IOReturn callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4) override;
     IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref, void **iref) override {
@@ -365,25 +423,8 @@ public:
     // Power and connection handling: acknowledge power transitions immediately instead of queuing on IOFramebuffer's
     // base controller power-work timeout. NMIntelFB uses its own independent Intel controller (IOFBDependentID =
     // NVRM_FB_CONTROLLER_ID_INTEL, local index 0) rather than sharing NVRMFB's controller, and handles power attributes directly.
-    IOReturn setPowerState(unsigned long ordinal, IOService *) override {
-        handleEvent(ordinal ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
-        if (fResumeOn) {
-            if (!ordinal) { fSlept = true; ifbStep(NMH_STEP_SUSPEND); }
-            else if (fSlept) { fSlept = false; thread_call_enter(fResumeCall); }   // off this thread: the replay waits on hardware
-        }
-        return kIOPMAckImplied;
-    }
-    IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
-        if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
-        if (attribute == kIOPowerAttribute) {
-            if (value) { IOReturn r = IOFramebuffer::setAttribute(attribute, value); handleEvent(kIOFBNotifyDidPowerOn);
-                         return r == kIOReturnUnsupported ? kIOReturnSuccess : r; }
-            handleEvent(kIOFBNotifyWillPowerOff);
-            IOReturn r = IOFramebuffer::setAttribute(attribute, value);
-            return r == kIOReturnUnsupported ? kIOReturnSuccess : r;
-        }
-        return IOFramebuffer::setAttribute(attribute, value);
-    }
+    IOReturn setPowerState(unsigned long ordinal, IOService *) override;
+    IOReturn setAttribute(IOSelect attribute, uintptr_t value) override;
     IOReturn setAttributeForConnection(IOIndex idx, IOSelect attribute, uintptr_t value) override {
         switch (attribute) {
         case kConnectionPower: case kConnectionColorModesSupported: case kConnectionColorDepthsSupported:
@@ -433,10 +474,18 @@ static int nmintelfb_dmc_want_read SYSCTL_HANDLER_ARGS
 }
 #ifdef NMINTELFB_VIRTUAL
 static NMIntelFB *gVirt;
+static IOLock *gVirtLock = nullptr;
 static int nmintelfb_sample_sysctl SYSCTL_HANDLER_ARGS
 {
     char b[128] = "no panel";
-    if (gVirt) gVirt->sampleInto(b, sizeof b);
+    NMIntelFB *target = nullptr;
+    if (gVirtLock) {
+        IOLockLock(gVirtLock);
+        target = gVirt;
+        if (target) target->retain();
+        IOLockUnlock(gVirtLock);
+    }
+    if (target) { target->sampleInto(b, sizeof b); target->release(); }
     return sysctl_handle_string(oidp, b, sizeof b, req);
 }
 SYSCTL_PROC(_debug, OID_AUTO, nmintelfb_sample, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
@@ -471,171 +520,616 @@ IOService *NMIntelFB::probe(IOService *provider, SInt32 *score)
     return IOFramebuffer::probe(provider, score);
 }
 
+// Read only the required boot fields, never the command line. bootArgs is a
+// kernel virtual pointer; MemoryMap is a physical address in the x86 ABI.
+#ifndef NMINTELFB_VIRTUAL
+static bool nmIntelReadBoot(NMIntelVideo *video, NMIntelEfiMap *map)
+{
+    static_assert(sizeof(boot_args) == 4096, "pinned x86 boot_args ABI");
+    const uintptr_t pointer = reinterpret_cast<uintptr_t>(PE_state.bootArgs);
+    if (!PE_state.initialized || (pointer & 3) || !nm_intelfb_kernel_span(pointer, sizeof(boot_args)))
+        return false;
+    const volatile boot_args *args = reinterpret_cast<const volatile boot_args *>(pointer);
+    if (!nm_intelfb_boot_header_ok(args->Version, args->Revision, args->efiMode)) return false;
+    *map = { args->MemoryMap, args->MemoryMapSize, args->MemoryMapDescriptorSize,
+             args->MemoryMapDescriptorVersion };
+    if (args->Video.v_baseAddr) {
+        *video = { args->Video.v_baseAddr, args->Video.v_width, args->Video.v_height,
+                   args->Video.v_rowBytes, args->Video.v_depth, args->Video.v_display, args->Video.v_rotate };
+    } else {
+        *video = { args->VideoV1.v_baseAddr, args->VideoV1.v_width, args->VideoV1.v_height,
+                   args->VideoV1.v_rowBytes, args->VideoV1.v_depth, args->VideoV1.v_display, 0 };
+    }
+    return nm_intelfb_efi_metadata_ok(map) && nm_intelfb_video_ok(video, nullptr, nullptr) &&
+           pointer == reinterpret_cast<uintptr_t>(PE_state.bootArgs);
+}
+
+static NMIntelVideo nmIntelConsoleVideo(const PE_Video &v)
+{
+    return { v.v_baseAddr, v.v_width, v.v_height, v.v_rowBytes, v.v_depth, v.v_display, v.v_rotate };
+}
+
+bool NMIntelFB::captureBootAuthority()
+{
+    NMIntelVideo afterVideo;
+    NMIntelEfiMap afterMap;
+    if (!nmIntelReadBoot(&fBootVideo, &fEfiMap) ||
+        !nm_intelfb_video_ok(&fBootVideo, &fFrameBytes, &fRoundedBytes)) return false;
+    const PE_Video console = PE_state.video;
+    const NMIntelVideo current = nmIntelConsoleVideo(console);
+    if (console.v_offset || (console.v_length && console.v_length != fFrameBytes) ||
+        !nm_intelfb_console_matches(&fBootVideo, &current, 0)) return false;
+    fEfiBytes = static_cast<uint8_t *>(IOMallocData(fEfiMap.bytes));
+    if (!fEfiBytes) return false;
+    IOMemoryDescriptor *map = IOMemoryDescriptor::withPhysicalAddress(
+        fEfiMap.address, fEfiMap.bytes, kIODirectionIn | kIOMemoryMapperNone);
+    bool ok = false;
+    if (map) {
+        if (map->prepare() == kIOReturnSuccess) {
+            ok = map->readBytes(0, fEfiBytes, fEfiMap.bytes) == fEfiMap.bytes;
+            if (map->complete() != kIOReturnSuccess) ok = false;
+        }
+        map->release();
+    }
+    if (!ok || !nmIntelReadBoot(&afterVideo, &afterMap) ||
+        !nm_intelfb_video_equal(&fBootVideo, &afterVideo) ||
+        !nm_intelfb_efi_metadata_equal(&fEfiMap, &afterMap) ||
+        !nm_intelfb_reserved(&fEfiMap, fEfiBytes, fBootVideo.base, fRoundedBytes)) return false;
+    fWidth = static_cast<uint32_t>(fBootVideo.width);
+    fHeight = static_cast<uint32_t>(fBootVideo.height);
+    fRowBytes = static_cast<uint32_t>(fBootVideo.pitch);
+    if (fBootVideo.pitch != fRowBytes) return false;
+    fConsPhys = fBootVideo.base;
+    fConsBytes = fFrameBytes;
+    fSavedConsole = console;
+    fSavedConsole.v_baseAddr = static_cast<unsigned long>(fBootVideo.base | 1ull);
+    return true;
+}
+#endif
+
+int NMIntelFB::readRegister(void *context, uint64_t offset, uint32_t *value)
+{
+    NMIntelFB *me = static_cast<NMIntelFB *>(context);
+    if (!value || !me->fRegs || !me->fMMIO || (offset & 3) ||
+        offset > me->fMMIO->getLength() || me->fMMIO->getLength() - offset < 4) return 0;
+    *value = *reinterpret_cast<volatile uint32_t *>(me->fRegs + offset);
+    return 1;
+}
+
+#ifndef NMINTELFB_VIRTUAL
 bool NMIntelFB::adoptFirmwareMode()
 {
-    // the panel is on whichever pipe the firmware used; take the first pipe whose transcoder and plane 1 are both on
-    for (int p = 0; p < 4; p++) {
-        fConsoleScanout = false; fConsPhys = 0; fConsBytes = 0;
-        uint32_t conf = rd(TRANSCONF(p)), ctl = rd(PLANE_CTL(p));
+    if (!captureBootAuthority()) {
+        IFBLOG("firmware boot-video/EFI reservation authority rejected");
+        return false;
+    }
+    int matched = -1;
+    NMIntelPlane accepted = {};
+    for (unsigned p = 0; p < 4; ++p) {
+        NMIntelPlane plane;
+        if (!nm_intelfb_translation(readRegister, this, fMMIO->getLength(), fVer, p,
+                                    &fBootVideo, &plane)) continue;
+        if (matched >= 0) {
+            IFBLOG("ambiguous firmware scanout: more than one plane matches");
+            return false;
+        }
+        matched = static_cast<int>(p);
+        accepted = plane;
+    }
+    if (matched < 0) {
+        IFBLOG("no stable linear plane has the firmware framebuffer's complete GGTT translation");
+        return false;
+    }
+    fPipe = matched;
+    fFirmwarePlane = accepted;
+    fStrideReg = accepted.stride;
+    fSurf = accepted.live & ~0xfffu;
+    fConsoleScanout = true;
+    measureFirmwareTiming();
+    return revalidateAuthorityLocked(true);
+}
+#endif
+
+void NMIntelFB::measureFirmwareTiming()
+{
+    fHT = (rd(HTOTAL(fPipe)) >> 16) + 1; fVT = (rd(VTOTAL(fPipe)) >> 16) + 1;
+    fHSS = (rd(HSYNC(fPipe)) & 0xffff) + 1; fHSE = (rd(HSYNC(fPipe)) >> 16) + 1;
+    fVSS = (rd(VSYNC(fPipe)) & 0xffff) + 1; fVSE = (rd(VSYNC(fPipe)) >> 16) + 1;
+    const uint32_t first = rd(FRMCOUNT(fPipe));
+    const uint64_t start = mach_absolute_time();
+    IOSleep(250);
+    const uint32_t frames = rd(FRMCOUNT(fPipe)) - first;
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+    if (frames >= 5 && frames <= 100 && ns) {
+        fFrameNs = ns / frames;
+        const uint64_t milliHz = static_cast<uint64_t>(frames) * 1000000000000ull / ns;
+        fRefresh16 = static_cast<uint32_t>((milliHz << 16) / 1000);
+        fPclk = static_cast<uint64_t>(fHT) * fVT * milliHz / 1000;
+    } else fPclk = static_cast<uint64_t>(fHT) * fVT * 60;
+}
+
+bool NMIntelFB::adoptLegacyFirmwareMode()
+{
+    // Keep the existing non-console BAR2/import modes separate. In particular,
+    // they cannot fall through to the removed unvalidated PE pointer fallback.
+    for (int p = 0; p < 4; ++p) {
+        const uint32_t conf = rd(TRANSCONF(p)), ctl = rd(PLANE_CTL(p));
         if (!(conf & kEnable) || !(ctl & kEnable)) continue;
-        if (fmtOf(ctl) != 8) { IFBLOG("pipe %c: plane format %u is not XRGB8888 - leaving the firmware screen", 'A' + p, fmtOf(ctl)); return false; }
-        if (tileOf(ctl) != 0) { IFBLOG("pipe %c: plane is tiled (%u) - leaving the firmware screen", 'A' + p, tileOf(ctl)); return false; }
-        uint32_t size = rd(PLANE_SIZE(p)), stride = rd(PLANE_STRIDE(p)) & 0x7FF;
+        if (fmtOf(ctl) != 8 || tileOf(ctl) != 0) return false;
+        const uint32_t size = rd(PLANE_SIZE(p));
         fStrideReg = rd(PLANE_STRIDE(p));
-        fWidth = (size & 0xFFFF) + 1; fHeight = ((size >> 16) & 0xFFFF) + 1;
-        fRowBytes = stride * 64;                     // linear planes count the stride in 64-byte units
-        fSurf = rd(PLANE_SURF(p)) & ~0xFFFu;         // GGTT offset of the surface, 4 KiB aligned
-        if (fWidth < 320 || fHeight < 200 || fRowBytes < fWidth * 4) {
-            IFBLOG("pipe %c: plane %ux%u stride %u is not a usable surface", 'A' + p, fWidth, fHeight, fRowBytes); return false;
-        }
-        if ((uint64_t)fSurf + (uint64_t)fRowBytes * fHeight > fApertureLen) {
-            PE_Video v; bzero(&v, sizeof v);
-            uint64_t cPhys = 0, cBytes = 0;
-            IOPlatformExpert *platform = getPlatform();
-            const bool consOk = platform && (platform->getConsoleInfo(&v) == kIOReturnSuccess)
-                && nm_intelfb_console_ok((uint64_t)v.v_baseAddr, (uint64_t)v.v_width, (uint64_t)v.v_height,
-                                         (uint64_t)v.v_rowBytes, (uint64_t)v.v_depth,
-                                         fWidth, fHeight, fRowBytes, &cPhys, &cBytes);
-            if (!consOk) {
-                IFBLOG("pipe %c: surface at 0x%x is past the %llu MiB aperture", 'A' + p, fSurf, (unsigned long long)(fApertureLen >> 20));
-                return false;
-            }
-            fConsoleScanout = true;
-            fConsPhys = (IOPhysicalAddress)cPhys;
-            fConsBytes = (IOPhysicalLength)cBytes;
-            IFBLOG("pipe %c: surface at 0x%x is past %llu MiB aperture -- using GOP console phys 0x%llx (%llu bytes, %ux%u pitch %u)",
-                   'A' + p, fSurf, (unsigned long long)(fApertureLen >> 20),
-                   (unsigned long long)fConsPhys, (unsigned long long)fConsBytes, fWidth, fHeight, fRowBytes);
-        }
-        // the transcoder that feeds pipe p is p on these display versions (eDP on transcoder A in every recording)
-        fHT = (rd(HTOTAL(p)) >> 16) + 1; fVT = (rd(VTOTAL(p)) >> 16) + 1;
-        fHSS = (rd(HSYNC(p)) & 0xFFFF) + 1; fHSE = (rd(HSYNC(p)) >> 16) + 1;
-        fVSS = (rd(VSYNC(p)) & 0xFFFF) + 1; fVSE = (rd(VSYNC(p)) >> 16) + 1;
-        // refresh: count vblanks for 250 ms (a 30-240 Hz panel gives 7-60 counts); fall back to 60 Hz if it does not move
-        uint32_t f0 = rd(FRMCOUNT(p)); uint64_t t0 = mach_absolute_time();
-        IOSleep(250);
-        uint32_t f1 = rd(FRMCOUNT(p)); uint64_t t1 = mach_absolute_time(), ns = 0;
-        absolutetime_to_nanoseconds(t1 - t0, &ns);
-        uint32_t frames = f1 - f0;
-        if (frames >= 5 && frames <= 100 && ns) {
-            fFrameNs = ns / frames;
-            uint64_t mhz = (uint64_t)frames * 1000000000000ull / ns;   // refresh in milli-Hz
-            fRefresh16 = (uint32_t)((mhz << 16) / 1000);
-            fPclk = (uint64_t)fHT * fVT * mhz / 1000;
-        } else fPclk = (uint64_t)fHT * fVT * 60;
+        fWidth = (size & 0xffff) + 1; fHeight = (size >> 16) + 1;
+        fRowBytes = (fStrideReg & 0x7ff) * 64;
+        fSurf = rd(PLANE_SURF(p)) & ~0xfffu;
+        uint64_t bytes;
+        if (fWidth < 320 || fHeight < 200 ||
+            !nm_intelfb_span(fWidth, fHeight, fRowBytes, fApertureLen, &bytes, nullptr) ||
+            fSurf > fApertureLen || bytes > fApertureLen - fSurf) return false;
         fPipe = p;
-        IFBLOG("pipe %c: %ux%u stride %u surface 0x%x totals %ux%u, %u vblanks in %llu ms -> %u.%02u Hz, pclk %llu", 'A' + p,
-               fWidth, fHeight, fRowBytes, fSurf, fHT, fVT, frames, (unsigned long long)(ns / 1000000),
-               fRefresh16 >> 16, ((fRefresh16 & 0xFFFF) * 100) >> 16, (unsigned long long)fPclk);
+        measureFirmwareTiming();
         return true;
     }
-    IFBLOG("no pipe is scanning out - the firmware left the panel off; leaving it to the firmware framebuffer");
     return false;
+}
+
+bool NMIntelFB::prepareAperture()
+{
+#ifndef NMINTELFB_VIRTUAL
+    // Pinned IOGeneralMemoryDescriptor buffer-cache field is bits 30:28.
+    // This agrees with XNU x86 initialize_screen's VM_WIMG_IO mapping.
+    constexpr IOOptionBits physicalInhibited = static_cast<IOOptionBits>(kIOInhibitCache) << 28;
+    IOAddressRange range = { fConsPhys, fRoundedBytes };
+    fFirmwareMemory = IOMemoryDescriptor::withOptions(&range, 1, 0, nullptr,
+        kIOMemoryTypePhysical64 | kIODirectionInOut | kIOMemoryMapperNone | physicalInhibited);
+    if (!fFirmwareMemory) return false;
+    fSurfMap = fFirmwareMemory->map(kIOMapInhibitCache);
+    if (!fSurfMap || !fSurfMap->getVirtualAddress() || fSurfMap->getLength() < fFrameBytes ||
+        (fSurfMap->getMapOptions() & kIOMapCacheMask) != kIOMapInhibitCache) return false;
+#endif
+    // PAGE_SIZE alignment makes IOBufferMemoryDescriptor allocate a page-rounded
+    // envelope (pinned initWithPhysicalMask), while getLength stays frameBytes.
+    // Zero the owned page tail too, since clients map whole pages.
+    fShadowBuffer = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+        kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryMapperNone | kIOMapWriteCombineCache,
+        fFrameBytes, PAGE_SIZE);
+    if (!fShadowBuffer || !fShadowBuffer->getBytesNoCopy() || fShadowBuffer->getLength() != fFrameBytes)
+        return false;
+    bzero(fShadowBuffer->getBytesNoCopy(), fRoundedBytes);
+    fShadowMemory = OSTypeAlloc(NMIntelShadowMemory);
+    if (!fShadowMemory || !fShadowMemory->initSubRange(fShadowBuffer, 0, fFrameBytes, kIODirectionInOut))
+        return false;
+    if (!revalidateAuthorityLocked(true)) return false;
+    if (fSurfMap && !nm_intelfb_copy_final(reinterpret_cast<const void *>(fSurfMap->getVirtualAddress()),
+            fFrameBytes, fRowBytes, fShadowBuffer->getBytesNoCopy(), fFrameBytes, nullptr, fFrameBytes,
+            fWidth, fHeight, fRowBytes)) return false;
+    nm_intelfb_store_drain();
+    fRefreshCall = thread_call_allocate(refreshFire, this);
+    return fRefreshCall != nullptr;
 }
 
 bool NMIntelFB::start(IOService *provider)
 {
+    fPresentLock = IOLockAlloc();
+    if (!fPresentLock) return false;
 #ifdef NMINTELFB_VIRTUAL
-    fWidth = 1920; fHeight = 1080; fRowBytes = 7680; fSurf = 0; fPipe = 0;
-    fHT = 2200; fVT = 1125; fHSS = 2008; fHSE = 2052; fVSS = 1084; fVSE = 1089; fPclk = 148500000ull;   // CEA 1080p60
-    fVBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
-                                                             (mach_vm_size_t)fRowBytes * fHeight, 0xFFFFFFFFFFFFF000ull);
-    if (!fVBuf || fVBuf->prepare() != kIOReturnSuccess) { IFBLOG("virtual: no contiguous buffer"); OSSafeReleaseNULL(fVBuf); return false; }
-    bzero(fVBuf->getBytesNoCopy(), fVBuf->getLength());
-    fApertureBase = fVBuf->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone); fApertureLen = fVBuf->getLength();
-    fSurfMap = fVBuf->map();
-    if (!fSurfMap) { IFBLOG("virtual: surface map failed"); fVBuf->complete(); OSSafeReleaseNULL(fVBuf); return false; }
-    // Before IOFramebuffer::start, so start() attaches an independent Intel controller at local index 0 (see the panel path below).
-    if (!publishDependentIdentity()) { OSSafeReleaseNULL(fSurfMap); fVBuf->complete(); OSSafeReleaseNULL(fVBuf); return false; }
-    if (!IOFramebuffer::start(provider)) {
-        removeProperty("IOFBDependentID"); removeProperty("IOFBDependentIndex");
-        OSSafeReleaseNULL(fSurfMap); fVBuf->complete(); OSSafeReleaseNULL(fVBuf); return false;
-    }
-    if (IOWorkLoop *wl = getWorkLoop()) {
-        fTimer = IOTimerEventSource::timerEventSource(this, [](OSObject *o, IOTimerEventSource *t) {
-            ((NMIntelFB *)o)->sample(); t->setTimeoutMS(2000); });
-        if (fTimer && wl->addEventSource(fTimer) == kIOReturnSuccess) fTimer->setTimeoutMS(2000);
-    }
-    armVbl();
-    registerPowerDriver(this, kPowerStates, 2);
-    gVirt = this; sysctl_register_oid(&sysctl__debug_nmintelfb_sample);
-    IFBLOG("virtual panel published (1920x1080 at phys 0x%llx)", (unsigned long long)fApertureBase);
-    return true;
-#endif
+    fHyLevel = NMH_COPY;
+    fConsoleScanout = true;
+    fWidth = 1920; fHeight = 1080; fRowBytes = 7680; fPipe = 0;
+    fFrameBytes = static_cast<uint64_t>(fRowBytes) * fHeight;
+    fRoundedBytes = (fFrameBytes + PAGE_SIZE - 1) & ~(static_cast<uint64_t>(PAGE_SIZE) - 1);
+    fHT = 2200; fVT = 1125; fHSS = 2008; fHSE = 2052; fVSS = 1084; fVSE = 1089; fPclk = 148500000ull;
+#else
     fPCI = OSDynamicCast(IOPCIDevice, provider);
     if (!fPCI) return false;
-    // nmhybriddelay=<s>: wait before taking the panel (some machines froze without it). Bounded at 120 s; the guard's
-    // verdict is read again afterwards, because a long wait is exactly when it can change.
-    { long long dv = 0; int dl = 0; const int present = PE_parse_boot_argn("nmhybriddelay", &dl, sizeof dl); dv = dl;
-      const unsigned secs = nmh_delay_parse(present, dv);
-      if (secs) {
-          ifbStep(NMH_STEP_DELAY);
-          IFBLOG("hybrid: waiting %u s before taking the panel (boot-arg nmhybriddelay)", secs);
-          for (unsigned i = 0; i < secs; i++) IOSleep(1000);
-          const int why = ifbStandDownWhy();
-          if (why) { ifbStep(NMH_STEP_STOOD_DOWN); IFBLOG("hybrid: standing down after the wait: %s", nmh_stay_name(why)); return false; }
-      } }
-    fPCI->setMemoryEnable(true);
-    fMMIO = fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
-    IODeviceMemory *ap = fPCI->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
-    if (!fMMIO || !ap) { IFBLOG("BAR0 or BAR2 is not mapped - leaving the firmware screen"); OSSafeReleaseNULL(fMMIO); return false; }
-    fRegs = (volatile uint8_t *)fMMIO->getVirtualAddress();
-    fApertureBase = ap->getPhysicalAddress(); fApertureLen = ap->getLength();
+    int delay = 0;
+    const int hasDelay = PE_parse_boot_argn("nmhybriddelay", &delay, sizeof delay);
+    const unsigned secs = nmh_delay_parse(hasDelay, delay);
+    if (secs) {
+        ifbStep(NMH_STEP_DELAY);
+        for (unsigned i = 0; i < secs; ++i) IOSleep(1000);
+    }
+    if (ifbStandDownWhy()) return false;
+    // The candidate only reads firmware-enabled decoding; preserve the existing
+    // decode enable operation for the separate, non-console legacy modes.
+    if (fHyLevel != NMH_COPY) fPCI->setMemoryEnable(true);
+    fMMIO = fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0, kIOMapInhibitCache);
+    if (!fMMIO || !fMMIO->getVirtualAddress()) { startUnwind(); return false; }
+    fRegs = reinterpret_cast<volatile uint8_t *>(fMMIO->getVirtualAddress());
     ifbStep(NMH_STEP_MMIO);
-    if (!adoptFirmwareMode()) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
+    if (fHyLevel == NMH_COPY) {
+        if (!adoptFirmwareMode()) { startUnwind(); return false; }
+    } else {
+        IODeviceMemory *ap = fPCI->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
+        if (!ap) { startUnwind(); return false; }
+        fApertureBase = ap->getPhysicalAddress(); fApertureLen = ap->getLength();
+        if (!adoptLegacyFirmwareMode()) { startUnwind(); return false; }
+        IODeviceMemory *surface = IODeviceMemory::withRange(fApertureBase + fSurf,
+            static_cast<IOPhysicalLength>(fRowBytes) * fHeight);
+        if (surface) { fSurfMap = surface->map(kIOMapWriteCombineCache); surface->release(); }
+        if (!fSurfMap) { startUnwind(); return false; }
+    }
     ifbStep(NMH_STEP_ADOPT);
-    // Independent Intel controller (NVRM_FB_CONTROLLER_ID_INTEL, local index 0) mapped to logical hybrid head 4 of
-    // NVAccel: WindowServer composites this panel on the NVIDIA card and the display pipe copies each frame into fSurfMap.
-    // The dependent ID and index must exist before IOFramebuffer::start so IOGraphicsFamily attaches this panel to its
-    // own Intel controller with local slot 0 populated (never sharing NVRMFB's controller ID or leaving slot 0 empty).
-    // The mapping is made here, before resumeCapture, tcStart and the DMC target publish anything another thread can
-    // reach, so a failure to map or publish identity unwinds cleanly before any service state is exposed.
-    const IOPhysicalAddress surfPhys = fConsoleScanout ? fConsPhys : (fApertureBase + fSurf);
-    const IOPhysicalLength surfLen = fConsoleScanout ? fConsBytes : ((IOPhysicalLength)fRowBytes * fHeight);
-    if (IODeviceMemory *sm = IODeviceMemory::withRange(surfPhys, surfLen)) {
-        fSurfMap = sm->map(kIOMapWriteCombineCache); sm->release();
+#endif
+    // Both mappings exist before IOFramebuffer publishes an independent Intel
+    // controller/local0, or a notifier/worker can observe this framebuffer.
+    if ((fConsoleScanout && !prepareAperture()) || !publishDependentIdentity()) { startUnwind(); return false; }
+#ifndef NMINTELFB_VIRTUAL
+    if (!fConsoleScanout) {
+        resumeCapture();
+        tcStart();
+        int enabled = 0;
+        fDmcOn = PE_parse_boot_argn("nmhybriddmc", &enabled, sizeof enabled) && enabled == 1;
+        const char *want = nmd_file_for(fVer, fPCI->configRead16(kIOPCIConfigDeviceID));
+        snprintf(fDmcWant, sizeof fDmcWant, "%s", want ? want : "none");
+        if (!gDmcLock) {
+            IOLock *lock = IOLockAlloc();
+            if (lock && !OSCompareAndSwapPtr(nullptr, lock, (void *volatile *)&gDmcLock)) IOLockFree(lock);
+        }
+        if (gDmcLock) { IOLockLock(gDmcLock); gDmcTarget = this; IOLockUnlock(gDmcLock); }
     }
-    if (!fSurfMap) {
-        IFBLOG("the surface would not map write-combined: leaving the panel to the firmware framebuffer");
-        OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false;
-    }
-    if (!publishDependentIdentity()) {
-        startUnwind();
-        return false;
-    }
-    resumeCapture();
-    tcStart();
-    { int a = 0; fDmcOn = PE_parse_boot_argn("nmhybriddmc", &a, sizeof a) && a == 1;
-      const char *want = nmd_file_for(fVer, fPCI->configRead16(kIOPCIConfigDeviceID));
-      snprintf(fDmcWant, sizeof fDmcWant, "%s", want ? want : "none");
-      if (!gDmcLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void * volatile *)&gDmcLock)) IOLockFree(l); }
-      if (gDmcLock) { IOLockLock(gDmcLock); gDmcTarget = this; IOLockUnlock(gDmcLock); } }
-    publishBacklight();   // before IOFramebuffer::start: IOFramebuffer::open looks for a service named "backlight"
-    if (!IOFramebuffer::start(provider)) {
-        // resumeCapture, tcStart and the DMC target already published state other threads reach: undo all of it.
-        startUnwind();
-        return false;
-    }
-    ifbStep(NMH_STEP_FB_START);
-    ifbStep(NMH_STEP_PUBLISHED);
-    IFBLOG("hybrid: provider NMIntelFB %ux%u pitch %u display version %u level %d (CPU-mapped scanout, no VRAM)",
-           fWidth, fHeight, fRowBytes, fVer, fHyLevel);
-    setProperty("NMIntelFBHybridLevel", (unsigned long long)fHyLevel, 32);
-    setProperty("NMIntelFBPipe", (unsigned long long)fPipe, 32);
+    publishBacklight();
+#endif
+    if (!IOFramebuffer::start(provider)) { startUnwind(); return false; }
+    fBaseStarted = true;
+    fFramebufferEvents = addFramebufferNotification(framebufferEvent, this, nullptr);
+    if (!fFramebufferEvents) { stop(provider); return false; }
+    setProperty("NMIntelFBHybridLevel", static_cast<unsigned long long>(fHyLevel), 32);
+    setProperty("NMIntelFBPipe", static_cast<unsigned long long>(fPipe), 32);
     setProperty("NMIntelFBDisplayVersion", fVer, 32);
-    setProperty("built-in", kOSBooleanTrue);   // the panel is the laptop's own (kConnectionFlags says so too)
+    setProperty("built-in", kOSBooleanTrue);
+    ifbStep(NMH_STEP_FB_START);
     armVbl();
+    if (!fVblTimer) { stop(provider); return false; }
     registerPowerDriver(this, kPowerStates, 2);
-    IFBLOG("built-in panel published (%ux%u)", fWidth, fHeight);
+#ifdef NMINTELFB_VIRTUAL
+    if (!gVirtLock) {
+        IOLock *lock = IOLockAlloc();
+        if (lock && !OSCompareAndSwapPtr(nullptr, lock, (void *volatile *)&gVirtLock)) IOLockFree(lock);
+    }
+    if (!gVirtLock) { stop(provider); return false; }
+    IOLockLock(gVirtLock);
+    const bool occupied = gVirt != nullptr;
+    if (!occupied) gVirt = this;
+    IOLockUnlock(gVirtLock);
+    if (occupied) { stop(provider); return false; }
+    sysctl_register_oid(&sysctl__debug_nmintelfb_sample);
+#endif
+    ifbStep(NMH_STEP_PUBLISHED);
+    IFBLOG("%s published: %ux%u pitch %u; independent Intel local0",
+           fConsoleScanout ? "owned aperture/private sink" : "legacy aperture",
+           fWidth, fHeight, fRowBytes);
     return true;
 }
 
-// Undoes what start() published before IOFramebuffer::start: the DMC target and its blob, the Type-C timer and any
-// external heads, the resume capture, the backlight service, and the mappings. Used by a failed start and by stop(),
-// so the two cannot drift apart.
+// Lifecycle revokes under the private lock, but never holds it across IOGraphics
+// calls, notifier removal, thread-call drain, or platform console callbacks.
+bool NMIntelFB::recordConsoleMappingLocked()
+{
+    if (!fVramMap || !fFrameBuffer) return !fOpened;
+    IOMemoryDescriptor *descriptor = fVramMap->getMemoryDescriptor();
+    if ((descriptor != fShadowBuffer && descriptor != fShadowMemory) ||
+        fVramMapOffset || fVramMap->getLength() < fFrameBytes ||
+        fVramMap->getVirtualAddress() != reinterpret_cast<uintptr_t>(fFrameBuffer) ||
+        (fVramMap->getMapOptions() & kIOMapCacheMask) != kIOMapWriteCombineCache)
+        return false;
+    fConsoleKva = reinterpret_cast<uintptr_t>(fFrameBuffer);
+    return true;
+}
+
+bool NMIntelFB::revalidateAuthorityLocked(bool walk)
+{
+    if (!fPowered) return false;
+#ifdef NMINTELFB_VIRTUAL
+    return fFrameBytes && fHyLevel == NMH_COPY;
+#else
+    NMIntelVideo video;
+    NMIntelEfiMap map;
+    if (!fEfiBytes || !nmIntelReadBoot(&video, &map) ||
+        !nm_intelfb_video_equal(&video, &fBootVideo) ||
+        !nm_intelfb_efi_metadata_equal(&map, &fEfiMap)) return false;
+    const PE_Video pe = PE_state.video;
+    const NMIntelVideo current = nmIntelConsoleVideo(pe);
+    if (pe.v_offset || (pe.v_length && pe.v_length != fFrameBytes) ||
+        !nm_intelfb_console_matches(&fBootVideo, &current, fConsoleKva)) return false;
+    NMIntelPlane plane;
+    if (!fMMIO || !nm_intelfb_plane_snapshot(readRegister, this, fMMIO->getLength(), fPipe, &plane) ||
+        !nm_intelfb_plane_equal(&plane, &fFirmwarePlane)) return false;
+    return !walk || (nm_intelfb_reserved(&fEfiMap, fEfiBytes, fBootVideo.base, fRoundedBytes) &&
+        nm_intelfb_translation(readRegister, this, fMMIO->getLength(), fVer, fPipe, &fBootVideo, nullptr));
+#endif
+}
+
+void NMIntelFB::revokePresentation(NMIntelPhase phase)
+{
+    if (!fPresentLock) return;
+    IOLockLock(fPresentLock);
+    nm_intelfb_revoke(&fPresentState, phase);
+    IOLockUnlock(fPresentLock);
+}
+
+IOReturn NMIntelFB::reacquirePresentation()
+{
+    if (!fPresentLock) return kIOReturnNotReady;
+    IOLockLock(fPresentLock);
+    const bool ok = !fStopping && fPresentState.phase != NMIntelStopped && fShadowMemory && fShadowBuffer &&
+        recordConsoleMappingLocked() && revalidateAuthorityLocked(true) &&
+        (!fOpened || nm_intelfb_activate(&fPresentState));
+    if (!ok && fPresentState.phase == NMIntelApertureActive)
+        nm_intelfb_revoke(&fPresentState, NMIntelRecovery);
+    IOLockUnlock(fPresentLock);
+    return ok ? kIOReturnSuccess : kIOReturnNotReady;
+}
+
+bool NMIntelFB::copyShadowLocked()
+{
+    if (!fShadowBuffer || !revalidateAuthorityLocked(false)) return false;
+    void *sink = fSurfMap ? reinterpret_cast<void *>(fSurfMap->getVirtualAddress()) : nullptr;
+#ifndef NMINTELFB_VIRTUAL
+    if (!sink || fSurfMap->getLength() < fFrameBytes) return false;
+#endif
+    // This path is not a coherent snapshot of concurrent arbitrary user writes.
+    // It only serializes driver transfers, and never acknowledges a Metal frame.
+    const bool ok = nm_intelfb_copy_final(fShadowBuffer->getBytesNoCopy(), fFrameBytes, fRowBytes,
+        fShadowBuffer->getBytesNoCopy(), fFrameBytes, sink, fFrameBytes, fWidth, fHeight, fRowBytes);
+    if (ok) nm_intelfb_store_drain();
+    return ok;
+}
+
+void NMIntelFB::refreshFire(thread_call_param_t context, thread_call_param_t)
+{
+    NMIntelFB *me = static_cast<NMIntelFB *>(context);
+    if (me->fPresentLock && IOLockTryLock(me->fPresentLock)) {
+        if (!me->fStopping && me->fPresentState.phase == NMIntelApertureActive &&
+            !me->copyShadowLocked())
+            nm_intelfb_revoke(&me->fPresentState, NMIntelRecovery);
+        IOLockUnlock(me->fPresentLock);
+    }
+    // A missed timer tick is coalesced, never queued behind a present.
+    OSCompareAndSwap(1, 0, &me->fRefreshPending);
+}
+
+void NMIntelFB::cancelPresentation()
+{
+    // Drain the producer first, then its single-flight refresh consumer.
+    if (fVblTimer) {
+        thread_call_cancel(fVblTimer);
+        while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(1); }
+        fVblTimer = nullptr;
+    }
+    if (fRefreshCall) {
+        thread_call_cancel(fRefreshCall);
+        while (!thread_call_free(fRefreshCall)) { thread_call_cancel(fRefreshCall); IOSleep(1); }
+        fRefreshCall = nullptr;
+    }
+    fRefreshPending = 0;
+}
+
+bool NMIntelFB::restoreConsole()
+{
+#ifdef NMINTELFB_VIRTUAL
+    return true;
+#else
+    if (!fConsoleScanout || !fPresentLock || !fConsoleKva) return true;
+    IOLockLock(fPresentLock);
+    const uint64_t own = fConsoleKva;
+    const PE_Video pe = PE_state.video;
+    const NMIntelVideo current = nmIntelConsoleVideo(pe);
+    const bool ours = pe.v_baseAddr == own &&
+        nm_intelfb_console_matches(&fBootVideo, &current, own);
+    if (ours && fPowered && revalidateAuthorityLocked(true)) (void)copyShadowLocked();
+    PE_Video saved = fSavedConsole;
+    IOLockUnlock(fPresentLock);
+    if (!ours) return pe.v_baseAddr != own;
+    IOPlatformExpert *platform = getPlatform();
+    if (!platform) return false;
+    // Recheck after dropping the private lock: never replace a foreign console.
+    PE_Video now = {};
+    if (platform->getConsoleInfo(&now) != kIOReturnSuccess) return false;
+    if (now.v_baseAddr != own) return true;
+    if (platform->setConsoleInfo(&saved, kPEBaseAddressChange) != kIOReturnSuccess) return false;
+    if (platform->getConsoleInfo(&now) != kIOReturnSuccess || now.v_baseAddr == own) return false;
+    if (now.v_baseAddr == saved.v_baseAddr)
+        return platform->setConsoleInfo(nullptr, kPEAcquireScreen) == kIOReturnSuccess;
+    return true;
+#endif
+}
+
+IOReturn NMIntelFB::open()
+{
+    if (!fConsoleScanout) return IOFramebuffer::open();
+    if (reacquirePresentation() != kIOReturnSuccess) return kIOReturnNotReady;
+    const IOReturn result = IOFramebuffer::open();
+    if (result != kIOReturnSuccess) {
+        revokePresentation(NMIntelRecovery);
+        (void)restoreConsole();
+        return result;
+    }
+    IOLockLock(fPresentLock);
+    fOpened = true;
+    IOLockUnlock(fPresentLock);
+    if (reacquirePresentation() == kIOReturnSuccess) return kIOReturnSuccess;
+    close();
+    return kIOReturnNotReady;
+}
+
+void NMIntelFB::close()
+{
+    if (!fConsoleScanout) { IOFramebuffer::close(); return; }
+    if (fPresentLock) {
+        IOLockLock(fPresentLock);
+        fOpened = false;
+        nm_intelfb_revoke(&fPresentState, NMIntelRecovery);
+        IOLockUnlock(fPresentLock);
+    }
+    IOFramebuffer::close();
+    if (!restoreConsole()) IFBLOG("console restore failed; owned pages remain retained");
+}
+
+IOReturn NMIntelFB::setupForCurrentConfig()
+{
+    if (!fConsoleScanout) return IOFramebuffer::setupForCurrentConfig();
+    if (reacquirePresentation() != kIOReturnSuccess) return kIOReturnNotReady;
+    revokePresentation(NMIntelRecovery);
+    const IOReturn result = IOFramebuffer::setupForCurrentConfig();
+    if (result != kIOReturnSuccess) return result;
+    return reacquirePresentation();
+}
+
+IOReturn NMIntelFB::setDisplayMode(IODisplayModeID mode, IOIndex depth)
+{
+    if (mode != 1 || depth != 0) return kIOReturnUnsupported;
+    if (!fConsoleScanout) return kIOReturnSuccess;
+    // Fixed geometry only: never replace the pages underneath an IOAF aperture.
+    revokePresentation(NMIntelRecovery);
+    return reacquirePresentation();
+}
+
+IOReturn NMIntelFB::framebufferEvent(OSObject *object, void *, IOFramebuffer *, IOIndex event, void *)
+{
+    NMIntelFB *me = static_cast<NMIntelFB *>(object);
+    if (!me->fConsoleScanout) return kIOReturnSuccess;
+    if (!me->fPresentLock) return kIOReturnNotReady;
+    switch (event) {
+    case kIOFBNotifyWillSleep: case kIOFBNotifyWillPowerOff: case kIOFBNotifyDidPowerOff:
+        IOLockLock(me->fPresentLock);
+        me->fPowered = false;
+        nm_intelfb_revoke(&me->fPresentState, NMIntelRecovery);
+        IOLockUnlock(me->fPresentLock);
+        break;
+    case kIOFBNotifyDisplayModeWillChange:
+        me->revokePresentation(NMIntelRecovery);
+        break;
+    case kIOFBNotifyDidWake: case kIOFBNotifyDidPowerOn:
+        IOLockLock(me->fPresentLock);
+        me->fPowered = true;
+        IOLockUnlock(me->fPresentLock);
+        return me->reacquirePresentation();
+    case kIOFBNotifyDisplayModeDidChange:
+        return me->reacquirePresentation();
+    case kIOFBNotifyTerminated:
+        me->revokePresentation(NMIntelStopped);
+        break;
+    default: break;
+    }
+    return kIOReturnSuccess;
+}
+
+IOReturn NMIntelFB::setPowerState(unsigned long ordinal, IOService *)
+{
+    if (!fConsoleScanout) {
+        handleEvent(ordinal ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
+        if (fResumeOn) {
+            if (!ordinal) { fSlept = true; ifbStep(NMH_STEP_SUSPEND); }
+            else if (fSlept) { fSlept = false; thread_call_enter(fResumeCall); }
+        }
+        return kIOPMAckImplied;
+    }
+    if (fPresentLock) {
+        IOLockLock(fPresentLock);
+        fPowered = ordinal != 0;
+        nm_intelfb_revoke(&fPresentState, NMIntelRecovery);
+        IOLockUnlock(fPresentLock);
+        if (ordinal) (void)reacquirePresentation();
+    }
+    handleEvent(ordinal ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
+    return kIOPMAckImplied;
+}
+
+IOReturn NMIntelFB::setAttribute(IOSelect attribute, uintptr_t value)
+{
+    if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
+    if (attribute != kIOPowerAttribute) return IOFramebuffer::setAttribute(attribute, value);
+    if (!fConsoleScanout) {
+        if (!value) handleEvent(kIOFBNotifyWillPowerOff);
+        const IOReturn result = IOFramebuffer::setAttribute(attribute, value);
+        if (value) handleEvent(kIOFBNotifyDidPowerOn);
+        return result == kIOReturnUnsupported ? kIOReturnSuccess : result;
+    }
+    if (fPresentLock) {
+        IOLockLock(fPresentLock);
+        fPowered = value != 0;
+        nm_intelfb_revoke(&fPresentState, NMIntelRecovery);
+        IOLockUnlock(fPresentLock);
+    }
+    if (!value) handleEvent(kIOFBNotifyWillPowerOff);
+    const IOReturn result = IOFramebuffer::setAttribute(attribute, value);
+    if (value) {
+        (void)reacquirePresentation();
+        handleEvent(kIOFBNotifyDidPowerOn);
+    }
+    return result == kIOReturnUnsupported ? kIOReturnSuccess : result;
+}
+
+IOReturn NMIntelFB::framebufferInfo(NMIntelFramebufferInfo *q)
+{
+    if (!q || q->version != NM_INTEL_FB_ABI_VERSION || q->structSize != sizeof(*q))
+        return kIOReturnBadArgument;
+    *q = { NM_INTEL_FB_ABI_VERSION, sizeof(*q), 0, 0, 0, 0, 0, 0, 0 };
+    if (!fConsoleScanout) return kIOReturnUnsupported;
+    if (!fPresentLock) return kIOReturnNotReady;
+    IOLockLock(fPresentLock);
+    const bool ok = !fStopping && fHyLevel == NMH_COPY && fShadowMemory &&
+        fPresentState.phase == NMIntelApertureActive && revalidateAuthorityLocked(false);
+    if (ok) *q = { NM_INTEL_FB_ABI_VERSION, sizeof(*q), getRegistryEntryID(),
+        fPresentState.epoch, fFrameBytes, fWidth, fHeight, fRowBytes, NM_INTEL_FB_FORMAT_BGRA };
+    IOLockUnlock(fPresentLock);
+    return ok ? kIOReturnSuccess : kIOReturnNotReady;
+}
+
+IOReturn NMIntelFB::present(NMIntelPresentRequest *q)
+{
+    if (!q || q->structSize != sizeof(*q)) return kIOReturnBadArgument;
+    q->completedSequence = 0;
+    if (q->version != NM_INTEL_FB_ABI_VERSION) return kIOReturnBadArgument;
+    if (!fConsoleScanout) return kIOReturnUnsupported;
+    NMIntelPresentRequest request = *q;
+    if (!fPresentLock) return kIOReturnNotReady;
+    IOLockLock(fPresentLock);
+    IOReturn result = kIOReturnSuccess;
+    const NMIntelPresentResult check = nm_intelfb_present_check(&fPresentState, getRegistryEntryID(),
+        fWidth, fHeight, fRowBytes, fShadowMemory ? fShadowMemory->getLength() : 0,
+        fFrameBytes, &request);
+    switch (check) {
+    case NMIntelPresentBadArgument: result = kIOReturnBadArgument; break;
+    case NMIntelPresentNotReady: result = kIOReturnNotReady; break;
+    case NMIntelPresentStale: result = kIOReturnNotPermitted; break;
+    case NMIntelPresentUnsupported: result = kIOReturnUnsupported; break;
+    case NMIntelPresentOverrun: result = kIOReturnOverrun; break;
+    default: break;
+    }
+    if (result == kIOReturnSuccess && (!nm_intelfb_kernel_span(
+            reinterpret_cast<uintptr_t>(request.sourceKva), request.sourceBytes)))
+        result = kIOReturnBadArgument;
+    if (result == kIOReturnSuccess && (fStopping || !fShadowBuffer ||
+        fHyLevel != NMH_COPY || !revalidateAuthorityLocked(false))) {
+        nm_intelfb_revoke(&fPresentState, NMIntelRecovery);
+        result = kIOReturnNotReady;
+    }
+    void *sink = fSurfMap ? reinterpret_cast<void *>(fSurfMap->getVirtualAddress()) : nullptr;
+#ifndef NMINTELFB_VIRTUAL
+    if (result == kIOReturnSuccess && (!sink || fSurfMap->getLength() < fFrameBytes))
+        result = kIOReturnVMError;
+#endif
+    if (result == kIOReturnSuccess) {
+        if (!nm_intelfb_copy_final(request.sourceKva, request.sourceBytes, request.pitch,
+                fShadowBuffer->getBytesNoCopy(), fFrameBytes, sink, fFrameBytes,
+                fWidth, fHeight, fRowBytes)) result = kIOReturnOverrun;
+        else {
+            nm_intelfb_present_complete(&fPresentState, &request);
+            q->completedSequence = request.completedSequence;
+        }
+    }
+    IOLockUnlock(fPresentLock);
+    return result;
+}
+
 void NMIntelFB::startUnwind()
 {
     fStopping = true;
+    revokePresentation(NMIntelStopped);
+    if (fFramebufferEvents) { fFramebufferEvents->remove(); fFramebufferEvents = nullptr; }
+    cancelPresentation();
     fResumeOn = false;
     if (gDmcLock) IOLockLock(gDmcLock);
     if (gDmcTarget == this) gDmcTarget = nullptr;
@@ -645,33 +1139,74 @@ void NMIntelFB::startUnwind()
     if (fExtOn) { nmhd_stop(&fHeads, &fHeadOps); fExtOn = false; }
     if (fResumeCall) { thread_call_cancel(fResumeCall); while (!thread_call_free(fResumeCall)) { thread_call_cancel(fResumeCall); IOSleep(5); } fResumeCall = nullptr; }
     if (fSnap) { IOFree(fSnap, sizeof *fSnap); fSnap = nullptr; }
-    if (fFwPte) { IOFree(fFwPte, (size_t)(fFwPteCount * sizeof(uint64_t))); fFwPte = nullptr; }
+    if (fFwPte) { IOFree(fFwPte, static_cast<size_t>(fFwPteCount * sizeof(uint64_t))); fFwPte = nullptr; }
 #ifdef NMINTELFB_VIRTUAL
-    if (gVirt == this) { sysctl_unregister_oid(&sysctl__debug_nmintelfb_sample); gVirt = nullptr; }
+    bool wasVirtualTarget = false;
+    if (gVirtLock) {
+        IOLockLock(gVirtLock);
+        wasVirtualTarget = gVirt == this;
+        if (wasVirtualTarget) gVirt = nullptr;
+        IOLockUnlock(gVirtLock);
+    }
+    if (wasVirtualTarget) sysctl_unregister_oid(&sysctl__debug_nmintelfb_sample);
 #endif
-    // thread_call_cancel_wait is not exported to kexts: cancel and retry the free until the callback is out (as NVRMFB)
-    if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
     if (fBacklight) { fBacklight->terminate(kIOServiceSynchronous); fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); }
     fPwmPeriod = 0;
+    const bool consoleReleased = restoreConsole();
+    if (fPresentLock) IOLockLock(fPresentLock);
+    if (consoleReleased) {
+        OSSafeReleaseNULL(fShadowMemory);
+        OSSafeReleaseNULL(fShadowBuffer);
+        fConsoleKva = 0;
+    }
+    OSSafeReleaseNULL(fSurfMap);
+    OSSafeReleaseNULL(fFirmwareMemory);
+    OSSafeReleaseNULL(fMMIO);
+    fRegs = nullptr;
+    if (fEfiBytes) { IOFreeData(fEfiBytes, fEfiMap.bytes); fEfiBytes = nullptr; }
+    if (fPresentLock) IOLockUnlock(fPresentLock);
     removeProperty("IOFBDependentID");
     removeProperty("IOFBDependentIndex");
-    OSSafeReleaseNULL(fSurfMap); OSSafeReleaseNULL(fMMIO); fRegs = nullptr;
 }
 
 void NMIntelFB::stop(IOService *provider)
 {
     fStopping = true;
-    if (fHyReady && fRing.live != -1) hybridHome();
-    if (fOwnReady && nmh_own_may_free(&fOwn)) ownRelease();
+    revokePresentation(NMIntelStopped);
+    if (fFramebufferEvents) { fFramebufferEvents->remove(); fFramebufferEvents = nullptr; }
+    cancelPresentation();
+    if (!fConsoleScanout && fHyReady && fRing.live != -1) hybridHome();
+    if (!fConsoleScanout && fOwnReady && nmh_own_may_free(&fOwn)) ownRelease();
+    // The base may still access its aperture or return console ownership.
+    if (fBaseStarted) { IOFramebuffer::stop(provider); fBaseStarted = false; }
     startUnwind();
-    IOFramebuffer::stop(provider);
+}
+
+void NMIntelFB::free()
+{
+    // Stop normally restored PE already. Never recycle pages beneath a console
+    // pointer if the platform refuses restoration during a failed-start unwind.
+    if (restoreConsole()) {
+        OSSafeReleaseNULL(fShadowMemory);
+        OSSafeReleaseNULL(fShadowBuffer);
+    } else IFBLOG("platform retained retired console pages; refusing to recycle them");
+    if (fPresentLock) { IOLockFree(fPresentLock); fPresentLock = nullptr; }
+    IOFramebuffer::free();
 }
 
 IODeviceMemory *NMIntelFB::getApertureRange(IOPixelAperture aperture)
 {
-    if (aperture != kIOFBSystemAperture) return nullptr;
-    if (fConsoleScanout) return IODeviceMemory::withRange(fConsPhys, fConsBytes);
-    return IODeviceMemory::withRange(fApertureBase + fSurf, (IOPhysicalLength)fRowBytes * fHeight);
+    if (aperture != kIOFBSystemAperture || !fPresentLock) return nullptr;
+    if (!fConsoleScanout)
+        return fStopping ? nullptr : IODeviceMemory::withRange(fApertureBase + fSurf,
+            static_cast<IOPhysicalLength>(fRowBytes) * fHeight);
+    IOLockLock(fPresentLock);
+    NMIntelShadowMemory *memory = !fStopping ? fShadowMemory : nullptr;
+    if (memory) memory->retain();
+    IOLockUnlock(fPresentLock);
+    // Same descriptor façade as Apple's IODeviceMemory::withSubRange; there is
+    // no invented IODeviceMemory subclass/metaclass or raw physical client map.
+    return reinterpret_cast<IODeviceMemory *>(memory);
 }
 
 IOReturn NMIntelFB::getInformationForDisplayMode(IODisplayModeID mode, IODisplayModeInformation *info)
@@ -1324,24 +1859,36 @@ IOReturn NMIntelFB::hybridImport(NMHybridReq *q)
 #endif
 }
 
-// NVAccel's display pipe asks every head for its scan-out (NVRM_VRAM_FN_SCANOUT). This head answers with a CPU mapping and
-// no VRAM address: phys 0 keeps NVAccel from treating Intel memory as NVIDIA VRAM (it is not in the NVIDIA card's BAR1),
-// so frames reach the panel only through the copy into kva.
+// Public legacy scanout/import ABIs are refused here. No destination address,
+// physical page, descriptor, or DMA list escapes the private presentation path.
 IOReturn NMIntelFB::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4)
 {
+    if (fn && fn->isEqualTo(NM_INTEL_FB_INFO_FN))
+        return framebufferInfo(static_cast<NMIntelFramebufferInfo *>(p1));
+    if (fn && fn->isEqualTo(NM_INTEL_FB_PRESENT_FN))
+        return present(static_cast<NMIntelPresentRequest *>(p1));
     if (fn && fn->isEqualTo(NMH_FN_IMPORT)) {
-        NMHybridReq *q = (NMHybridReq *)p1;
+        NMHybridReq *q = static_cast<NMHybridReq *>(p1);
         if (!q || q->version != NMH_ABI_VERSION) return kIOReturnBadArgument;
-        return hybridImport(q);
+        if (!fConsoleScanout) return hybridImport(q);
+        q->kva = nullptr; q->pages = nullptr; q->npages = 0;
+        q->result = NMH_E_PROVIDER;
+        return kIOReturnUnsupported;
     }
     if (fn && fn->isEqualTo(NVRM_VRAM_FN_SCANOUT)) {
-        NVRMVramRequest *r = (NVRMVramRequest *)p1;
-        if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
-        if (!fSurfMap) return kIOReturnNotReady;
-        r->kva = (void *)fSurfMap->getVirtualAddress();
-        r->phys = 0; r->actualSize = 0;
-        r->width = fWidth; r->height = fHeight; r->pitch = fRowBytes;
-        return kIOReturnSuccess;
+        NVRMVramRequest *q = static_cast<NVRMVramRequest *>(p1);
+        if (!q || q->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
+        if (!fConsoleScanout) {
+            if (!fSurfMap || fStopping) return kIOReturnNotReady;
+            q->kva = reinterpret_cast<void *>(fSurfMap->getVirtualAddress());
+            q->phys = 0; q->actualSize = 0;
+            q->width = fWidth; q->height = fHeight; q->pitch = fRowBytes;
+            return kIOReturnSuccess;
+        }
+        q->flags = 0; q->actualSize = 0; q->phys = 0; q->kva = nullptr;
+        q->handle = nullptr; q->mappedTotal = 0; q->width = q->height = q->pitch = 0;
+        q->allocationCookie = 0;
+        return kIOReturnUnsupported;
     }
     return IOFramebuffer::callPlatformFunction(fn, wait, p1, p2, p3, p4);
 }

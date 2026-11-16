@@ -23,7 +23,7 @@ public:
     virtual void sharedRelease(IOAccelShared2*);
     virtual void dirtyLevel(unsigned int, unsigned int);
     virtual bool prepare();
-    virtual bool complete();
+    virtual void complete();
     virtual void load();
     virtual void unload();
     virtual void addToChannel(IOAccelChannel2*, unsigned int);
@@ -60,6 +60,7 @@ public:
     virtual void pageoffIfNeeded(unsigned int, unsigned int);
     virtual void pageonIfNeeded();
     virtual void gartEvent();
+    bool requirePageoff() const;
 private:
     uint8_t _opaque[kIOAccelResource2Size - sizeof(OSObject)];
 };

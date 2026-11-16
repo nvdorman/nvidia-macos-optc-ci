@@ -121,26 +121,30 @@ static void stub_register_pending(struct accel_stub *a, int igpu_enabled)
 
 int main(void)
 {
-    uint64_t phys = 0, bytes = 0;
-    const int sentinel = 1;
+    uint64_t bytes = 0, rounded = 0;
 
-    /* NMIntelFB console fallback checks (2560x1600 @ 0x70800000, pitch 10240) */
-    CHK("valid Insyde GOP console accepted",
-        nm_intelfb_console_ok(0x70800000ULL, 2560, 1600, 10240, 32, 2560, 1600, 10240, &phys, &bytes) == 1 &&
-        phys == 0x70800000ULL && bytes == 16384000ULL);
-    CHK("PE_Video low flag bits masked before page check",
-        nm_intelfb_console_ok(0x70800003ULL, 2560, 1600, 10240, 32, 2560, 1600, 10240, &phys, &bytes) == 1 &&
-        phys == 0x70800000ULL);
-    CHK("zero baseAddr rejected",
-        nm_intelfb_console_ok(0ULL, 2560, 1600, 10240, 32, 2560, 1600, 10240, &phys, &bytes) == 0);
-    CHK("non-page-aligned baseAddr rejected",
-        nm_intelfb_console_ok(0x70800400ULL, 2560, 1600, 10240, 32, 2560, 1600, 10240, &phys, &bytes) == 0);
-    CHK("wrong console depth rejected",
-        nm_intelfb_console_ok(0x70800000ULL, 2560, 1600, 10240, 16, 2560, 1600, 10240, &phys, &bytes) == 0);
-    CHK("mismatched console width/height rejected",
-        nm_intelfb_console_ok(0x70800000ULL, 1920, 1080, 10240, 32, 2560, 1600, 10240, &phys, &bytes) == 0);
-    CHK("mismatched row stride rejected",
-        nm_intelfb_console_ok(0x70800000ULL, 2560, 1600, 10496, 32, 2560, 1600, 10240, &phys, &bytes) == 0);
+    /* Physical authority and current-console identity are separate checks. */
+    struct NMIntelVideo original = {0x70800000ULL, 2560, 1600, 10240, 32, 1, 0};
+    struct NMIntelVideo current = original;
+    CHK("valid original firmware geometry has an exact span",
+        nm_intelfb_video_ok(&original, &bytes, &rounded) &&
+        bytes == 16384000ULL && rounded == bytes);
+    current.base |= 1;
+    CHK("explicit physical console flag preserves known provenance",
+        nm_intelfb_console_matches(&original, &current, 0));
+    current.base |= 2;
+    CHK("unknown PE flags are not silently masked",
+        !nm_intelfb_console_matches(&original, &current, 0));
+    current = original; current.base = 0;
+    CHK("zero physical base rejected", !nm_intelfb_video_ok(&current, &bytes, &rounded));
+    current = original; current.base += 1024;
+    CHK("unaligned physical base rejected", !nm_intelfb_video_ok(&current, &bytes, &rounded));
+    current = original; current.depth = 16;
+    CHK("wrong console depth rejected", !nm_intelfb_console_matches(&original, &current, 0));
+    current = original; current.width = 1920;
+    CHK("changed console geometry rejected", !nm_intelfb_console_matches(&original, &current, 0));
+    current = original; current.pitch = 10496;
+    CHK("changed console pitch rejected", !nm_intelfb_console_matches(&original, &current, 0));
 
     /* NVAccel Option C policy checks */
     CHK("auto iGPU off when nmhybrid=0", nm_optc_should_enable_igpu(NMH_OFF, 0) == 0);
@@ -153,21 +157,6 @@ int main(void)
     CHK("active head via NMIntelFB when 0 NVIDIA heads", nm_optc_has_active_head(0, NMH_COPY, 1, 1) == 1);
     CHK("active head via NVIDIA FB always", nm_optc_has_active_head(1, NMH_OFF, 0, 0) == 1);
 
-    CHK("CPU-only offscreen BAR1 backing off at nmhybrid=0",
-        nm_optc_use_offscreen_fb_resource(NMH_OFF, &sentinel, 0ULL, 0) == 0);
-    CHK("CPU-only offscreen BAR1 backing off for NVIDIA FB",
-        nm_optc_use_offscreen_fb_resource(NMH_COPY, &sentinel, 0ULL, 1) == 0);
-    CHK("CPU-only offscreen BAR1 backing off if kva null",
-        nm_optc_use_offscreen_fb_resource(NMH_COPY, NULL, 0ULL, 0) == 0);
-    CHK("CPU-only offscreen BAR1 backing ON for NMIntelFB at nmhybrid>=1",
-        nm_optc_use_offscreen_fb_resource(NMH_COPY, &sentinel, 0ULL, 0) == 1);
-
-    CHK("scanout backing falls back to pitch*height when actualSize==0",
-        nm_optc_scanout_backing_bytes(0ULL, 10240U, 1600U) == 16384000ULL);
-    CHK("scanout backing page-aligns non-multiple sizes",
-        nm_optc_scanout_backing_bytes(0ULL, 7684U, 1080U) == ((7684ULL * 1080ULL + 0xFFFULL) & ~0xFFFULL));
-    CHK("scanout backing rejects empty geometry",
-        nm_optc_scanout_backing_bytes(0ULL, 0U, 1600U) == 0ULL);
 
     CHK("8 GiB Resizable BAR budget is half BAR1",
         nm_optc_vram_budget(8ULL << 30) == (4ULL << 30));
@@ -241,11 +230,11 @@ int main(void)
             stub_fb_published(&a, &nv1) == 1 && stub_fb_published(&a, &nv2) == 1 && stub_fb_published(&a, &nv3) == 1 &&
             a.slots[0] == NULL && a.primary_fb == NULL &&
             nm_optc_has_active_head(a.primary_fb != NULL, NMH_COPY, 1, a.slots[4] != NULL) == 0);
-        CHK("case 3b: Intel still enters slot 4, never slot 0 or fFB, keeping offscreen BAR1 path",
+        CHK("case 3b: Intel enters logical slot 4 without becoming the NVIDIA primary",
             stub_fb_published(&a, &intel) == 1 &&
             a.slots[4] == &intel && a.slots[0] == NULL && a.primary_fb == NULL &&
             nm_optc_should_set_primary_fb(NVRM_FB_INTEL, 4) == 0 &&
-            nm_optc_use_offscreen_fb_resource(NMH_COPY, &sentinel, 0ULL, 0) == 1);
+            nm_optc_has_active_head(0, NMH_COPY, 1, a.slots[4] != NULL) == 1);
     }
 
     /* Case 4: Missing props, out-of-range NVIDIA index, legacy Intel index 4, wrong/colliding ID, unknown class */

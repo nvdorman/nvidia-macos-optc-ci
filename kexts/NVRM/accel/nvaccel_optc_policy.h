@@ -53,25 +53,6 @@ static inline int nm_optc_has_active_head(
     return (has_nvidia_fb || (hybrid_level >= NMH_COPY && igpu_enabled && has_intel_fb)) ? 1 : 0;
 }
 
-static inline int nm_optc_use_offscreen_fb_resource(
-    int hybrid_level, const void *scanout_kva, uint64_t scanout_phys, int fb_is_nvidia)
-{
-    return (hybrid_level >= NMH_COPY && scanout_kva != 0 && scanout_phys == 0ULL && !fb_is_nvidia) ? 1 : 0;
-}
-
-static inline uint64_t nm_optc_scanout_backing_bytes(
-    uint64_t actual_size, uint32_t pitch, uint32_t height)
-{
-    uint64_t bytes = actual_size;
-    if (pitch && height) {
-        if (pitch > 16384U * 8U || height > 16384U) return 0ULL;
-        const uint64_t plane_bytes = (uint64_t)pitch * (uint64_t)height;
-        if (plane_bytes > bytes) bytes = plane_bytes;
-    }
-    if (!bytes || bytes > (1ULL << 32)) return 0ULL;
-    const uint64_t aligned = (bytes + 0xFFFULL) & ~0xFFFULL;
-    return (aligned >= bytes) ? aligned : 0ULL;
-}
 
 static inline uint64_t nm_optc_vram_budget(uint64_t bar1_len)
 {

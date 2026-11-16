@@ -5,6 +5,8 @@
  */
 
 #include "nv-xnu.h"
+#include "nvrm_owner_abi.h"
+#include <libkern/OSAtomic.h>
 
 extern "C" void nv_xnu_power_state(bool *acPlugged, bool *haveBattery);   // nv_xnu_power.cpp
 #include <sys/kauth.h>
@@ -346,8 +348,13 @@ static unsigned nv_xnu_maps_high;
 static IOLock *nv_xnu_maps_lock;
 extern "C" bool nv_xnu_maps_init(void)
 {
-    if (!nv_xnu_maps_lock) nv_xnu_maps_lock = IOLockAlloc();
-    return nv_xnu_maps_lock != NULL;
+    if (!__atomic_load_n(&nv_xnu_maps_lock, __ATOMIC_ACQUIRE)) {
+        IOLock *lock = IOLockAlloc();
+        if (!lock) return false;
+        if (!OSCompareAndSwapPtr(nullptr, lock, (void *volatile *)&nv_xnu_maps_lock))
+            IOLockFree(lock);
+    }
+    return true;
 }
 static inline void nv_xnu_map_publish(nv_xnu_map *m, IOMemoryDescriptor *md, IOMemoryMap *map,
                                       void *va, NvU64 phys, NvU64 size, void *alias)
@@ -362,14 +369,18 @@ void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode)
     if (!nv_pm_is_gpu(start, size)) {
         void *cookie = NULL; void *ava = nv_pm_alias(start, size, &cookie);
         if (ava) {
+            bool tracked = false;
             IOLockLock(nv_xnu_maps_lock);
             for (int i = 0; i < NV_XNU_MAX_MAPS; i++) if (nv_xnu_maps[i].va == NULL) {
                 nv_xnu_map_publish(&nv_xnu_maps[i], NULL, NULL, ava, start, size, cookie);
                 if ((unsigned)i + 1 > nv_xnu_maps_high) nv_xnu_maps_high = (unsigned)i + 1;
+                tracked = true;
                 break;
             }
             IOLockUnlock(nv_xnu_maps_lock);
-            return ava;
+            if (tracked) return ava;
+            nv_pm_alias_drop(cookie);
+            return NULL;
         }
         nv_pm_foreign(start, size, mode, __builtin_return_address(0));
     }
@@ -390,15 +401,10 @@ void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode)
         return va;
     }
     IOLockUnlock(nv_xnu_maps_lock);
-    {
-        static bool warned;
-        if (!warned) { warned = true;
-            kprintf("NVRM-xnu: *** nv_xnu_maps FULL at %u entries -- leaking bookkeeping for "
-                    "0x%llx (+0x%llx). The mapping is still VALID and returned; raise "
-                    "NV_XNU_MAX_MAPS. ***\n", (unsigned)NV_XNU_MAX_MAPS,
-                    (unsigned long long)start, (unsigned long long)size); }
-    }
-    return va;
+    map->release();
+    md->release();
+    kprintf("NVRM-xnu: kernel mapping table full; allocation mapping refused\n");
+    return NULL;
 }
 NvU64 nv_xnu_phys_for_kernel_va(const void *va)
 {
@@ -410,6 +416,38 @@ NvU64 nv_xnu_phys_for_kernel_va(const void *va)
             return nv_xnu_maps[i].phys + (NvU64)((const char *)va - base);
     }
     return 0;
+}
+
+bool nv_xnu_kernel_mapping_info(struct NVRMKernelMapInfo *r)
+{
+    if (!r || r->version != NVRM_OWNER_ABI_VERSION || r->structSize != sizeof(*r))
+        return false;
+    r->physical = r->availableBytes = 0;
+    r->cacheOptions = 0;
+    if (!nv_xnu_maps_lock || !r->address || !r->requiredBytes) return false;
+    const uintptr_t address = (uintptr_t)r->address;
+    bool found = false;
+    IOLockLock(nv_xnu_maps_lock);
+    for (unsigned i = 0; i < nv_xnu_maps_high; ++i) {
+        const nv_xnu_map &m = nv_xnu_maps[i];
+        if (!m.va || !m.md || !m.map || m.alias) continue;
+        const uintptr_t base = (uintptr_t)m.va;
+        if (address < base) continue;
+        const uint64_t offset = address - base;
+        const uint64_t mapped = m.map->getLength();
+        const uint64_t extent = mapped < m.size ? mapped : m.size;
+        if (offset >= extent || r->requiredBytes > extent - offset ||
+            m.phys > UINT64_MAX - offset) continue;
+        const IOOptionBits cache = m.map->getMapOptions() & kIOMapCacheMask;
+        if (cache != kIOMapInhibitCache && cache != kIOMapWriteCombineCache) continue;
+        r->physical = m.phys + offset;
+        r->availableBytes = extent - offset;
+        r->cacheOptions = cache;
+        found = true;
+        break;
+    }
+    IOLockUnlock(nv_xnu_maps_lock);
+    return found;
 }
 void NV_API_CALL os_unmap_kernel_space(void *va, NvU64 size)
 { NV_XNU_TRC;

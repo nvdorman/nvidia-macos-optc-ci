@@ -13,6 +13,7 @@
 #include "nvrm_bar_recover.h"
 #include "nvrm_shutdown_plan.h"
 #include "nvrm_aspm.h"
+#include "nvrm_owner_abi.h"
 
 extern "C" void nv_xnu_power_refresh(void);   // nv_xnu_power.cpp
 #include <IOKit/IOService.h>
@@ -49,6 +50,8 @@ extern "C" task_t current_task(void);
 extern "C" int nvrm_gpuva_alloc(struct NVRMGpuVaRequest *);
 extern "C" int nvrm_gpuva_map(struct NVRMGpuVaRequest *);
 extern "C" int nvrm_gpuva_free(struct NVRMGpuVaRequest *);
+extern "C" int nvrm_gpuva_drain(struct NVRMGpuVaRequest *);
+extern "C" bool nv_xnu_kernel_mapping_info(struct NVRMKernelMapInfo *);
 extern "C" bool nvrm_query_vram_kb(NvU32 gpuId, NvU32 *pRamKb, NvU32 *pTotalKb, NvU32 *pStatus);
 extern "C" bool nvrm_query_gpu_profile(NvU32 gpuId, NvU32 *pArch, NvU32 *pImpl, NvU32 *pCls3d, NvU32 *pClsCompute,
                                        NvU32 *pClsCopy, NvU32 *pClsEnc, NvU32 *pClsDec, NvU32 *pStatus);
@@ -69,8 +72,24 @@ static const uint64_t kUtilHangNs = 500ull * 1000 * 1000;
 extern "C" { NvBool nvkms_xnu_load(void); }
 class NVRM;
 #include "nvrm_devtab.h"
-// The GPU objects, newest-start-wins and never cleared unless the boot argument nvmultigpu=1 is present (nvrm_devtab.h).
+// Live GPU services; stopped entries are removed in both single- and multi-GPU mode.
 static NvrmDevTab<NVRM> gNVRMTab;
+static IOSimpleLock *gNVRMTableLock;
+static bool nvrmTableInit()
+{
+    if (!__atomic_load_n(&gNVRMTableLock, __ATOMIC_ACQUIRE)) {
+        IOSimpleLock *lock = IOSimpleLockAlloc();
+        if (!lock) return false;
+        if (!OSCompareAndSwapPtr(nullptr, lock, (void *volatile *)&gNVRMTableLock))
+            IOSimpleLockFree(lock);
+    }
+    return true;
+}
+struct NVRMTableGuard {
+    IOInterruptState state;
+    NVRMTableGuard() : state(IOSimpleLockLockDisableInterrupt(gNVRMTableLock)) {}
+    ~NVRMTableGuard() { IOSimpleLockUnlockEnableInterrupt(gNVRMTableLock, state); }
+};
 static NvrmStartGate gNVRMGate;
 static NvrmWaitQueue<IOService> gNVRMWait;
 // Offers the oldest refused card to IOKit again. registerService on its PCI device runs matching on it once more, which is
@@ -176,6 +195,16 @@ public:
     virtual IOReturn setPowerState(unsigned long ordinal, IOService *device) override;
     virtual void systemWillShutdown(IOOptionBits specifier) override;
 private:
+    IOLock *fOwnerLock = nullptr;
+    IOService *fAccelTarget = nullptr;
+    uint64_t fAccelGeneration = 0;
+    unsigned fOwnerCpuUsers = 0;
+    bool fOwnerCpuClosed = false;
+    bool fOwnerStopping = false;
+    IOService *copyAccelTarget();
+    IOReturn updateAccelTarget(const NVRMAccelTarget *request);
+    IOReturn ownerCpuAccess(const NVRMOwnerCpuAccess *request);
+    void closeOwnerCpuAccess(bool stopping);
     // PCIe link power (ASPM L1) and the BAR facts published for the app (nvrm-aspm, nvrm-bar1-*, nvrm-above-4g)
     UInt16 fOrigEpLnkCtl = 0xffff, fOrigUpLnkCtl = 0xffff;   // what the firmware left; 0xffff = not changed by us
     void enableAspmL1();
@@ -723,9 +752,17 @@ bool NVRM::startGPU(IOService *provider)
     if (!super::start(provider)) return false;
     fPCI = OSDynamicCast(IOPCIDevice, provider);
     if (!fPCI) return false;
+    fOwnerLock = IOLockAlloc();
+    if (!fOwnerLock) { super::stop(provider); return false; }
     // An unavailable telemetry lock disables this optional interface, not the GPU.
     fUtilizationLock = IOLockAlloc();
-    gNVRMTab.add(this, nvrmMultiGpu(), provider->getProperty("nullmoth-auto-primary") == kOSBooleanTrue);
+    if (!nvrmTableInit()) { super::stop(provider); return false; }
+    {
+        const bool multi = nvrmMultiGpu();
+        const bool marked = provider->getProperty("nullmoth-auto-primary") == kOSBooleanTrue;
+        NVRMTableGuard guard;
+        gNVRMTab.add(this, multi, marked);
+    }
     nv_xnu_log_init();
     // The kernel mapping table is serialised, so its lock has to exist before RM maps anything.
     if (!nv_xnu_maps_init()) { LOG("IOLockAlloc FAILED for the kernel mapping table"); return false; }
@@ -1963,6 +2000,16 @@ void NVRM::interruptOccurred(IOInterruptEventSource *src, int count)
 
 void NVRM::stop(IOService *provider)
 {
+    closeOwnerCpuAccess(true);
+    IOService *target = nullptr;
+    if (fOwnerLock) {
+        IOLockLock(fOwnerLock);
+        target = fAccelTarget;
+        fAccelTarget = nullptr;
+        fAccelGeneration = 0;
+        IOLockUnlock(fOwnerLock);
+    }
+    if (target) target->release();
     nvrm_power_stop();
     // Keep the lock until free(): another service can retain this object and
     // call its platform interface after stop(), when it must answer NotReady.
@@ -1986,7 +2033,11 @@ void NVRM::stop(IOService *provider)
     if (fIntSrc) { fIntSrc->disable(); if (fWorkLoop) fWorkLoop->removeEventSource(fIntSrc); fIntSrc->release(); fIntSrc = NULL; }
     if (fWorkLoop) { fWorkLoop->release(); fWorkLoop = NULL; }
     if (fPrivateState) { rm_free_private_state(NULL, &fNv); fPrivateState = false; }
-    gNVRMTab.remove(this, nvrmMultiGpu());   // a no-op without nvmultigpu=1: the old pointer was never cleared
+    if (gNVRMTableLock) {
+        const bool multi = nvrmMultiGpu();
+        NVRMTableGuard guard;
+        gNVRMTab.remove(this, multi);
+    }
     super::stop(provider);
 }
 
@@ -2148,6 +2199,8 @@ void NVRM::publishBarFacts()
 
 void NVRM::free()
 {
+    if (fAccelTarget) { fAccelTarget->release(); fAccelTarget = nullptr; }
+    if (fOwnerLock) { IOLockFree(fOwnerLock); fOwnerLock = nullptr; }
     if (fUtilizationLock) { IOLockFree(fUtilizationLock); fUtilizationLock = nullptr; }
     super::free();
 }
@@ -2170,6 +2223,8 @@ IOReturn NVRM::setPowerState(unsigned long ordinal, IOService *device)
 void NVRM::gpuSuspend()
 {
     uint64_t t0 = mach_absolute_time();
+    // CPU BAR1 users must finish before either NVKMS or RM enters standby.
+    closeOwnerCpuAccess(false);
     fPmCycles++;
     nvrm_power_suspend();
     OSCompareAndSwap(kGpuPmRunning, kGpuPmSuspended, &fGpuPm);
@@ -2209,6 +2264,11 @@ void NVRM::gpuResume()
     OSCompareAndSwap(kGpuPmSuspended, ok ? kGpuPmRunning : kGpuPmLost, &fGpuPm);
     nvkms_xnu_resume(fNv.gpu_id, ok);
     nv_xnu_pm_open();   // also when lost: RM then answers the waiting calls with errors instead of leaving them blocked
+    if (fOwnerLock) {
+        IOLockLock(fOwnerLock);
+        if (ok && !fOwnerStopping) fOwnerCpuClosed = false;
+        IOLockUnlock(fOwnerLock);
+    }
     if (ok) nvrm_power_resume();
     setProperty("nvrm-pm", ok ? "running" : "lost (resume failed)");
     uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
@@ -2420,8 +2480,111 @@ public:
 };
 OSDefineMetaClassAndStructors(IOAccelNVRMBridge, NVRMUserClient)
 
+IOService *NVRM::copyAccelTarget()
+{
+    if (!fOwnerLock) return nullptr;
+    IOLockLock(fOwnerLock);
+    IOService *target = (!fOwnerStopping && !isInactive()) ? fAccelTarget : nullptr;
+    if (target) target->retain();
+    IOLockUnlock(fOwnerLock);
+    return target;
+}
+
+IOReturn NVRM::updateAccelTarget(const NVRMAccelTarget *r)
+{
+    if (!r || r->version != NVRM_OWNER_ABI_VERSION || r->structSize != sizeof(*r) ||
+        !r->target || !r->generation || r->reserved ||
+        (r->operation != NVRM_ACCEL_TARGET_REGISTER && r->operation != NVRM_ACCEL_TARGET_UNREGISTER))
+        return kIOReturnBadArgument;
+    if (!fOwnerLock) return kIOReturnNotReady;
+    if (r->operation == NVRM_ACCEL_TARGET_REGISTER &&
+        (r->target->getProvider() != fPCI || !r->target->metaCast("NVAccel")))
+        return kIOReturnNotPermitted;
+    IOService *release = nullptr;
+    IOReturn result = kIOReturnSuccess;
+    IOLockLock(fOwnerLock);
+    if (r->operation == NVRM_ACCEL_TARGET_UNREGISTER) {
+        if (fAccelTarget == r->target && fAccelGeneration == r->generation) {
+            release = fAccelTarget;
+            fAccelTarget = nullptr;
+            fAccelGeneration = 0;
+        } else if (fAccelTarget) result = kIOReturnNotFound;
+    } else if (fOwnerStopping || isInactive()) {
+        result = kIOReturnNotReady;
+    } else if (fAccelTarget) {
+        if (fAccelTarget != r->target || fAccelGeneration != r->generation)
+            result = kIOReturnExclusiveAccess;
+    } else {
+        r->target->retain();
+        fAccelTarget = r->target;
+        fAccelGeneration = r->generation;
+    }
+    IOLockUnlock(fOwnerLock);
+    if (release) release->release();
+    return result;
+}
+
+IOReturn NVRM::ownerCpuAccess(const NVRMOwnerCpuAccess *r)
+{
+    if (!r || r->version != NVRM_OWNER_ABI_VERSION || r->structSize != sizeof(*r) ||
+        !r->owner || !r->ownerGeneration || !r->body)
+        return kIOReturnBadArgument;
+    if (!fOwnerLock || !gNvPmGate || r->owner->getProvider() != this)
+        return kIOReturnNotReady;
+    OSObject *property = r->owner->copyProperty(NVRM_OWNER_GENERATION_PROPERTY);
+    OSNumber *generation = OSDynamicCast(OSNumber, property);
+    const bool same = generation && generation->unsigned64BitValue() == r->ownerGeneration;
+    if (property) property->release();
+    if (!same) return kIOReturnNotPermitted;
+    int counted = 0;
+    if (!nv_xnu_pm_try_enter(&counted)) return kIOReturnNotReady;
+    IOLockLock(fOwnerLock);
+    const bool ready = !fOwnerStopping && !fOwnerCpuClosed && !isInactive() &&
+        fAdapter && fPassDone >= 2 && OSAddAtomic(0, &fGpuPm) == kGpuPmRunning &&
+        fOwnerCpuUsers != ~0u;
+    if (ready) {
+        ++fOwnerCpuUsers;
+        r->owner->retain();
+    }
+    IOLockUnlock(fOwnerLock);
+    IOReturn result = kIOReturnNotReady;
+    if (ready) {
+        result = r->body(r->context);
+        IOLockLock(fOwnerLock);
+        if (--fOwnerCpuUsers == 0) IOLockWakeup(fOwnerLock, &fOwnerCpuUsers, false);
+        IOLockUnlock(fOwnerLock);
+        r->owner->release();
+    }
+    nv_xnu_pm_exit(counted);
+    return result;
+}
+
+void NVRM::closeOwnerCpuAccess(bool stopping)
+{
+    if (!fOwnerLock) return;
+    IOLockLock(fOwnerLock);
+    fOwnerCpuClosed = true;
+    if (stopping) fOwnerStopping = true;
+    while (fOwnerCpuUsers)
+        IOLockSleep(fOwnerLock, &fOwnerCpuUsers, THREAD_UNINT);
+    IOLockUnlock(fOwnerLock);
+}
+
 IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4)
 {
+    if (fn && fn->isEqualTo(NVRM_ACCEL_TARGET_FN))
+        return updateAccelTarget((const NVRMAccelTarget *)p1);
+    if (fn && fn->isEqualTo(NVRM_OWNER_CPU_ACCESS_FN))
+        return ownerCpuAccess((const NVRMOwnerCpuAccess *)p1);
+    if (fn && fn->isEqualTo(NVRM_KERNEL_MAP_INFO_FN)) {
+        if (!fOwnerLock) return kIOReturnNotReady;
+        IOLockLock(fOwnerLock);
+        const bool stopping = fOwnerStopping || isInactive();
+        IOLockUnlock(fOwnerLock);
+        if (stopping) return kIOReturnNotReady;
+        return nv_xnu_kernel_mapping_info((NVRMKernelMapInfo *)p1)
+            ? kIOReturnSuccess : kIOReturnNotReadable;
+    }
     if (fn && fn->isEqualTo(NVRM_UTILIZATION_FN)) {
         NVRMUtilization *sample = (NVRMUtilization *)p1;
         if (!sample || sample->version != NVRM_UTILIZATION_ABI_VERSION) return kIOReturnBadArgument;
@@ -2499,7 +2662,7 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
     }
     if (fn && p1) {
         const bool rmCall = fn->isEqualTo(NVRM_GPUVA_FN_ALLOC) || fn->isEqualTo(NVRM_GPUVA_FN_MAP) || fn->isEqualTo(NVRM_GPUVA_FN_FREE)
-                         || fn->isEqualTo(NVRM_SS_FN_RM) || fn->isEqualTo(NVRM_SS_FN_PAGEOFF);
+                         || fn->isEqualTo(NVRM_GPUVA_DRAIN_FN) || fn->isEqualTo(NVRM_SS_FN_RM) || fn->isEqualTo(NVRM_SS_FN_PAGEOFF);
         NvXnuPmUse pmUse(rmCall);
         struct NVRMGpuVaRequest *g = (struct NVRMGpuVaRequest *)p1;
         if (fn->isEqualTo(NVRM_GPUVA_FN_ALLOC))
@@ -2508,6 +2671,8 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
             return nvrm_gpuva_map(g)   ? kIOReturnIOError : kIOReturnSuccess;
         if (fn->isEqualTo(NVRM_GPUVA_FN_FREE))
             return nvrm_gpuva_free(g)  ? kIOReturnIOError : kIOReturnSuccess;
+        if (fn->isEqualTo(NVRM_GPUVA_DRAIN_FN))
+            return nvrm_gpuva_drain(g) ? kIOReturnIOError : kIOReturnSuccess;
         if (fn->isEqualTo(NVRM_SS_FN_RM))
             return nvrm_surfshare_rm((struct NVRMSurfShareRm *)p1) ? kIOReturnIOError : kIOReturnSuccess;
         if (fn->isEqualTo(NVRM_SS_FN_PAGEOFF))
@@ -2802,12 +2967,35 @@ IOReturn NVRMUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
     IOExternalMethodDispatch d = tbl[selector];
     return super::externalMethod(selector, args, &d, this, reference);
 }
-extern "C" nv_state_t *nv_xnu_gpu_state(void) { NVRM *s = gNVRMTab.primary(); return s ? &s->fNv : NULL; }
-extern "C" void *nv_xnu_gpu_os_device(void) { return gNVRMTab.primary(); }
+// RM callers hold their provider/client lifetime; the table lock protects discovery.
+extern "C" nv_state_t *nv_xnu_gpu_state(void) {
+    if (!gNVRMTableLock) return nullptr;
+    NVRMTableGuard guard;
+    NVRM *s = gNVRMTab.primary();
+    return s ? &s->fNv : nullptr;
+}
+extern "C" void *nv_xnu_gpu_os_device(void) {
+    if (!gNVRMTableLock) return nullptr;
+    NVRMTableGuard guard;
+    return gNVRMTab.primary();
+}
 // the same answers for card number `index` (0 is the first started); only meaningful with nvmultigpu=1, where the table holds every card
-extern "C" nv_state_t *nv_xnu_gpu_state_at(unsigned index) { NVRM *s = gNVRMTab.at(index); return s ? &s->fNv : NULL; }
-extern "C" void *nv_xnu_gpu_os_device_at(unsigned index) { return gNVRMTab.at(index); }
-extern "C" unsigned nv_xnu_gpu_count(void) { return gNVRMTab.count(); }
+extern "C" nv_state_t *nv_xnu_gpu_state_at(unsigned index) {
+    if (!gNVRMTableLock) return nullptr;
+    NVRMTableGuard guard;
+    NVRM *s = gNVRMTab.at(index);
+    return s ? &s->fNv : nullptr;
+}
+extern "C" void *nv_xnu_gpu_os_device_at(unsigned index) {
+    if (!gNVRMTableLock) return nullptr;
+    NVRMTableGuard guard;
+    return gNVRMTab.at(index);
+}
+extern "C" unsigned nv_xnu_gpu_count(void) {
+    if (!gNVRMTableLock) return 0;
+    NVRMTableGuard guard;
+    return gNVRMTab.count();
+}
 
 // Selectors 4 and 5 handed a caller's buffer to NVKMS as a kernel-space client, which trusts the pointers inside it
 // (flip heads, LUT ramps, clip lists) as kernel addresses: root could make the kernel read and write where it chose.
@@ -2966,12 +3154,21 @@ IOReturn NVRMUserClient::esc(uint32_t cmd, void *data, uint32_t size)
         if (size != sizeof(struct NVRMSurfShareEsc)) return kIOReturnBadArgument;
         struct NVRMSurfShareEsc *ss = (struct NVRMSurfShareEsc *)data;
         ss->status = NVRM_SS_OFF;
-        static IOService *accel;
-        if (!accel) { OSDictionary *m = IOService::serviceMatching("NVAccel");
-                      if (m) { accel = IOService::waitForMatchingService(m, 100ULL * 1000 * 1000); m->release(); } }
+        ss->hSrcClient = ss->hSrcMemory = 0;
+        IOService *accel = fOwner->copyAccelTarget();
         if (!accel) return kIOReturnSuccess;
         const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVACCEL_SS_FN);
-        if (sym) { accel->callPlatformFunction(sym, false, ss, (void *)current_task(), (void *)(uintptr_t)cmd, NULL); sym->release(); }
+        IOReturn result = kIOReturnNoMemory;
+        if (sym) {
+            result = accel->callPlatformFunction(sym, false, ss, (void *)current_task(),
+                                                (void *)(uintptr_t)cmd, nullptr);
+            sym->release();
+        }
+        accel->release();
+        if (result != kIOReturnSuccess) {
+            ss->hSrcClient = ss->hSrcMemory = 0;
+            ss->status = NVRM_SS_OFF;
+        }
         return kIOReturnSuccess;
     }
     default: {

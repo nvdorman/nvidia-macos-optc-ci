@@ -3,13 +3,17 @@
 # Flags are the discrete framebuffer's, minus the NVIDIA resource-manager includes, which this file does not use.
 # Both personalities are built: the real one, and the virtual test build whose panel is attached on demand
 # through a sysctl (the one to try first on a machine whose screen must not go dark).
-set -u
+set -eu
 SRC=$(cd "$(dirname "$0")" && pwd)
 OUT=${1:-$SRC/out}
 mkdir -p "$OUT" || exit 1
 
 SDK=$(xcrun --show-sdk-path)
 KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
+# The actual SDK declarations, not reconstructed IODeviceMemory overrides,
+# must provide the superclass APIs used by the owned aperture.
+test -r "$KHDR/IOKit/IOSubMemoryDescriptor.h"
+test -r "$KHDR/pexpert/i386/boot.h"
 CFLAGS=( -arch x86_64 -fapple-kext -mkernel -nostdinc -I"$KHDR" -I"$SRC" -I"$SRC/../NVRM/accel" -I"$SRC/../NVRM"
   -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT
   -mmacosx-version-min=${MINVER:-15.0} -g0
@@ -26,22 +30,22 @@ for VARIANT in real virtual; do
     fi
     echo "=== $NAME"
     E="$OUT/$NAME.err"
-    xcrun clang++ "${CFLAGS[@]}" "${DEFS[@]}" -c "$SRC/intelfb.cpp" -o "$OUT/$NAME.o" 2> "$E"
-    rc=$?
+    rc=0
+    xcrun clang++ "${CFLAGS[@]}" "${DEFS[@]}" -c "$SRC/intelfb.cpp" -o "$OUT/$NAME.o" 2> "$E" || rc=$?
     if [ $rc -ne 0 ]; then
         echo "  COMPILE FAILED (rc=$rc), $(grep -c "error:" "$E") errors, $(grep -c "warning:" "$E") warnings"
-        grep "error:" "$E" | head -12
-        continue
+        grep "error:" "$E" | head -12 || true
+        exit "$rc"
     fi
     echo "  compiled: $(grep -c "warning:" "$E") warnings"
     bash "$SRC/../../build/warn_ceiling.sh" nmintelfb "$(grep -c ": warning:" "$E")" "$E" || exit 4
     K="$OUT/$NAME.kext"
     mkdir -p "$K/Contents/MacOS"
+    lrc=0
     xcrun clang++ -arch x86_64 -mmacosx-version-min=${MINVER:-15.0} -fapple-kext -nostdlib \
-        -Xlinker -kext -lkmodc++ -lkmod -lcc_kext "$OUT/$NAME.o" -o "$K/Contents/MacOS/$NAME" 2> "$OUT/$NAME.link.err"
-    lrc=$?
+        -Xlinker -kext -lkmodc++ -lkmod -lcc_kext "$OUT/$NAME.o" -o "$K/Contents/MacOS/$NAME" 2> "$OUT/$NAME.link.err" || lrc=$?
     if [ $lrc -ne 0 ]; then
-        echo "  LINK FAILED (rc=$lrc)"; head -12 "$OUT/$NAME.link.err"; continue
+        echo "  LINK FAILED (rc=$lrc)"; head -12 "$OUT/$NAME.link.err"; exit "$lrc"
     fi
     bash "$SRC/../../build/warn_ceiling.sh" nmintelfb-link "$(grep -c 'warning' "$OUT/$NAME.link.err")" "$OUT/$NAME.link.err" || exit 4
     cp "$PLIST" "$K/Contents/Info.plist"

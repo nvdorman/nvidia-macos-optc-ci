@@ -41,6 +41,7 @@ enum { kNvVidMemPhysOff = 0xb8 };
 enum { kNvVidMemPhysOff = 0xc8 };
 #endif
 #include "../nvrm_gpuva_abi.h"
+#include "../nvrm_owner_abi.h"
 #include "nvaccel_lock_owner.h"
 #include "../nvrm_devtab.h"
 #include "../nvrm_utilization_abi.h"
@@ -54,6 +55,20 @@ static bool               nvAccelCopyToScanout(IOAccelResource2 *res);
 void                      nvAccelSwapProbe(IOAccelResource2 *a1, IOAccelResource2 *a2);
 bool                      nvAccelResHasContent(IOAccelResource2 *res);
 static void               nvAccelWriteStamp(int index, unsigned int value);
+static bool nvFamLock(NVAccel *, bool);
+static void nvFamUnlock(NVAccel *);
+class NVDisplayPipe;
+static void nvAccelDrainPresent(NVAccel *);
+static void nvAccelDrainPipe(NVDisplayPipe *);
+struct NVRetain {
+    OSObject *object;
+    bool display = false;
+    explicit NVRetain(OSObject *adopted) : object(adopted) {}
+    explicit NVRetain(NVAccel *);
+    ~NVRetain();
+    NVRetain(const NVRetain &) = delete;
+    NVRetain &operator=(const NVRetain &) = delete;
+};
 #ifdef NMX_ACCEL
 #define NV_LOG_TAG "NMXAccel: "
 #else
@@ -66,6 +81,7 @@ static bool nvaccel_verbose() { static int v = -1; if (v < 0) { int x = 0; v = P
 #define ALOGV(fmt, ...) do { if (nvaccel_verbose()) ALOG(fmt, ##__VA_ARGS__); } while (0)
 #include <libkern/c++/OSSymbol.h>
 #include "nvrm_vram_abi.h"
+static_assert(sizeof(NVRMVramRequest) == 80 && __builtin_offsetof(NVRMVramRequest, allocationCookie) == 72, "stock VRAMv2 ABI");
 #include <IOKit/IODeviceMemory.h>
 #include "tahoe_fwd.h"   // macOS 26: inherited slots Apple no longer exports, forwarded through its vtables
 #include "nvaccel_stubs.h"
@@ -110,6 +126,9 @@ static constexpr uint64_t kNvUtilMaxAgeNs    = 5000000000ULL;
 extern "C" {   // kern/thread_call.h and kern/clock.h clash with the family headers here, so the KPIs are declared by hand
 struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
 int thread_call_enter_delayed(struct thread_call *call, uint64_t deadline);
+bool thread_call_cancel_wait(struct thread_call *);
+bool thread_call_cancel(struct thread_call *);
+bool thread_call_free(struct thread_call *);
 void clock_interval_to_deadline(uint32_t interval, uint32_t scale_factor, uint64_t *result);
 uint64_t mach_absolute_time(void);
 uint64_t mach_continuous_time(void);
@@ -177,6 +196,7 @@ OSDefineMetaClassAndStructors(NVEventMachine, IOAccelEventMachineFast2)
 static void (*gEnableAccel)(const char *why) = nullptr;
 static int gNvScanout = 0;
 static int gNvAperture = 0;
+static int gNvIop = 0;
 class NVDisplayMachine : public IOAccelLegacyDisplayMachine {
     OSDeclareDefaultStructors(NVDisplayMachine)
     NM_TAHOE_FWD(NVDisplayMachine)
@@ -215,28 +235,16 @@ class NVMemoryMap : public IOAccelMemoryMap {
     OSDeclareDefaultStructors(NVMemoryMap)
     NM_TAHOE_FWD(NVMemoryMap)
 public:
-    IOAccelMemory     *fMem       = nullptr;
-    unsigned int       fHVirt     = 0;
-    unsigned int       fHRmMemory = 0;
-    unsigned long long fGpuVa     = 0;
-    unsigned long long fVaLen     = 0;
-    bool               fMapped    = false;
-    NVAccel           *fAccel     = nullptr;   // the accelerator that made this map (NVAccel::resolve)
-    unsigned int fCommits = 0;
-    bool init(IOGraphicsAccelerator2 *a, IOAccelTask *t, IOAccelMemory *m,
-              unsigned int o) APPLE_KEXT_OVERRIDE {
-        if (!IOAccelMemoryMap::init(a, t, m, o)) return false;
-        fMem = m;
-        if (fMem) fMem->retain();
-        return true;
-    }
-    void free() APPLE_KEXT_OVERRIDE {
-        if (fMem) { fMem->release(); fMem = nullptr; }
-        IOAccelMemoryMap::free();
-    }
+    IOAccelMemory *fMem = nullptr; // borrowed from the base map; changed only after successful base redirect
+    NVGpuVaRecord *fRecord = nullptr;
+    NVVramOwner *fOwner = nullptr;
+    NVAccel *fAccel = nullptr;
+    bool init(IOGraphicsAccelerator2 *, IOAccelTask *, IOAccelMemory *, unsigned int) APPLE_KEXT_OVERRIDE;
+    void free() APPLE_KEXT_OVERRIDE;
+    bool redirect(IOAccelMemory *) APPLE_KEXT_OVERRIDE;
     bool commitIntoGPUPageTable() APPLE_KEXT_OVERRIDE;
     void releaseFromGPUPageTable() APPLE_KEXT_OVERRIDE;
-    bool updateGPUPageTable() APPLE_KEXT_OVERRIDE { return fMapped; }
+    bool updateGPUPageTable() APPLE_KEXT_OVERRIDE { return fRecord && fRecord->fMapped; }
 };
 OSDefineMetaClassAndStructors(NVMemoryMap, IOAccelMemoryMap)
 
@@ -316,6 +324,8 @@ public:
         NVDisplayPipe *p = OSTypeAlloc(NVDisplayPipe);
         if (!p) { ALOG("newDisplayPipe: OSTypeAlloc FAILED - the family will store this NULL unchecked"); return NULL; }
         p->fAccel = this;
+        p->fTransactionLock = IOLockAlloc();
+        if (!p->fTransactionLock) { p->release(); return nullptr; }
         ALOG("newDisplayPipe -> %p", p); return p; }
     OSObject *newDisplayMachine() APPLE_KEXT_OVERRIDE { NVDisplayMachine *d = OSTypeAlloc(NVDisplayMachine);
         fDM = d;
@@ -326,7 +336,12 @@ public:
     OSObject *new2DContext() APPLE_KEXT_OVERRIDE { NV2DContext *c = OSTypeAlloc(NV2DContext); ALOGV("new2DContext -> %p", c); return c; }
     OSObject *newVideoContext() APPLE_KEXT_OVERRIDE { NVVideoContext *c = OSTypeAlloc(NVVideoContext); ALOGV("newVideoContext -> %p", c); return c; }
     OSObject *newSysMemory() APPLE_KEXT_OVERRIDE { NVSysMemory *m = OSTypeAlloc(NVSysMemory); ALOGV("newSysMemory -> %p", m); return m; }
-    OSObject *newVidMemory() APPLE_KEXT_OVERRIDE { NVVidMemory *m = OSTypeAlloc(NVVidMemory); if (m) m->fAccel = this; ALOGV("newVidMemory -> %p", m); return m; }
+    OSObject *newVidMemory() APPLE_KEXT_OVERRIDE {
+        NVVidMemory *m = OSTypeAlloc(NVVidMemory);
+        if (m && !m->bindOwner(fOwner)) { m->release(); m = nullptr; }
+        if (m) m->fAccel = this;
+        return m;
+    }
     OSObject *newResource() APPLE_KEXT_OVERRIDE { NVResource *r = OSTypeAlloc(NVResource); if (r) r->fAccel = this; OSAddAtomic64(1, &gCntResNew); ALOGV("newResource -> %p", r); return r; }
     OSObject *newMemoryMap() APPLE_KEXT_OVERRIDE { NVMemoryMap *m = OSTypeAlloc(NVMemoryMap); if (m) m->fAccel = this; ALOGV("newMemoryMap -> %p", m); return m; }
 
@@ -351,53 +366,51 @@ public:
     IONotifier *fFBNote = nullptr;
     IONotifier *fIntelNote = nullptr;
     IONotifier *fGopNote = nullptr;     // NMGopFB: an AMD integrated GPU's panel, published as head 4 with the hybrid switch on
-    static NVAccel *gAccel;                // the primary card's accelerator: what the single-card code paths read
-    static NvrmDevTab<NVAccel> gAccelTab;  // every accelerator (more than the primary only with nvmultigpu=1)
+    static IOLock *gAccelLock;
+    static NvrmDevTab<NVAccel> gAccelTab;
     static NvrmStartGate gAccelGate;
-    static NvrmWaitQueue<IOService> gAccelWait;   // providers refused by the gate, offered again when a start finishes
-    // nvmultigpu=1: tell Metal clients which accelerator is the primary (NVAccelPrimary); the plugin binds a process to one card
+    static NvrmWaitQueue<IOService> gAccelWait;
     static void publishPrimary() {
-        if (!nvaccelMultiGpu()) return;
-        for (unsigned i = 0; i < gAccelTab.count(); i++) {
-            NVAccel *a = gAccelTab.at(i);
-            a->setProperty("NVAccelPrimary", a == gAccelTab.primary() ? kOSBooleanTrue : kOSBooleanFalse);
+        if (!nvaccelMultiGpu() || !gAccelLock) return;
+        NVAccel *snapshot[NVRM_DEVTAB_MAX] = {}, *primary = nullptr;
+        IOLockLock(gAccelLock);
+        primary = gAccelTab.primary();
+        for (unsigned i = 0; i < gAccelTab.count(); ++i) {
+            snapshot[i] = gAccelTab.at(i); snapshot[i]->retain();
+        }
+        IOLockUnlock(gAccelLock);
+        for (unsigned i = 0; i < NVRM_DEVTAB_MAX; ++i) if (snapshot[i]) {
+            snapshot[i]->setProperty("NVAccelPrimary", snapshot[i] == primary ? kOSBooleanTrue : kOSBooleanFalse);
+            snapshot[i]->release();
         }
     }
     static void reofferNext() { if (IOService *p = gAccelWait.next()) { p->registerService(kIOServiceAsynchronous); p->release(); } }
-    static unsigned count() { return gAccelTab.count(); }
-    static NVAccel *at(unsigned i) { return gAccelTab.at(i); }
     friend struct NVAccelStartScope;
     // Which thread holds the accelerator lock, kept from the family's own did-lock / will-unlock calls (nvFamLock and
     // nvFamUnlock call them too). A page-off lets go of the lock for its GPU wait only when the current thread is the
     // recorded owner at one level (debug.nvaccel_pageoff_unlocked_wait).
     nvaccel_lock_owner fLockOwner;   // per accelerator: each card has its own accelerator lock
     bool mayRelease() { return nvaccel_owner_may_release(&fLockOwner, current_thread()); }
+    bool familyOwned() const { return __atomic_load_n(&fLockOwner.owner, __ATOMIC_ACQUIRE) == current_thread() && __atomic_load_n(&fLockOwner.depth, __ATOMIC_RELAXED) > 0; }
     void acceleratorDidLock(char const *f, int l) APPLE_KEXT_OVERRIDE { IOGraphicsAccelerator2::acceleratorDidLock(f, l); nvaccel_owner_did_lock(&fLockOwner, current_thread()); }
     void acceleratorWillUnlock(char const *f, int l) APPLE_KEXT_OVERRIDE { nvaccel_owner_will_unlock(&fLockOwner, current_thread()); IOGraphicsAccelerator2::acceleratorWillUnlock(f, l); }
-    // Which accelerator a piece of code talks to. An object the accelerator made (memory, resource, map, pipe) holds its
-    // maker in fAccel and passes it here; resolve() gives that maker, or the primary for code with no owner. With one card
-    // the maker IS the primary, so every answer equals the single global the code used to read (tools/check_accel_resolution.py
-    // keeps raw uses of the global out of everything else). Display, scanout and flip paths belong to the primary: it is the only
-    // card with a display (NVKMS binds the primary).
-    static NVAccel *resolve(NVAccel *owner) { return nvrm_resolve(owner, gAccel); }
-    static NVAccel *forDisplay() { return gAccel; }
-    struct NVRMRmHandles fRmHandles;
-    bool fRmHandlesValid = false;
-    // this accelerator's NVRM service: with nvmultigpu=1 the NVRM that is a client of the same PCI device, else the first NVRM
+    static NVAccel *resolve(NVAccel *owner) { return owner; }
+    // Callers adopt the returned reference before dropping it; stop removes the entry first.
+    static NVAccel *forDisplay() {
+        if (!gAccelLock) return nullptr;
+        IOLockLock(gAccelLock);
+        NVAccel *a = gAccelTab.primary();
+        if (a && !a->fStopping && a->fOwner && a->fOwner->enter()) a->retain(); else a = nullptr;
+        IOLockUnlock(gAccelLock);
+        return a;
+    }
+    NVVramOwner *fOwner = nullptr;
+    bool fCandidate = false, fStopping = false, fTargetRegistered = false;
     IOService *locateNVRM();
     IOService *fFB = nullptr;
     IOService *volatile fFBs[kNvMaxFB] = {};
     unsigned fFBRegistered = 0;
     IOLock *fRegLock = nullptr;
-    IOLock *fKapiLock = nullptr;
-    typedef NvU64 (*nvrm_phys_for_va_t)(const void *);
-    struct NvKmsKapiFunctionsTable *fDirectKms = nullptr;
-    struct NvKmsKapiDevice *fDirectDev = nullptr;
-    nvrm_phys_for_va_t fDirectPhysForVa = nullptr;
-    unsigned long long fDirectBarLen = 0;
-    volatile SInt64 fDirectVramMapped = 0;
-    unsigned fDirectAllocLogged = 0;
-    SInt64 fDirectRefused = 0;
     OSObject *fMetalPlugin = nullptr;
     unsigned fHead4AssocLogs = 0;
     bool fHead4AssocActive = false;
@@ -507,186 +520,18 @@ public:
     bool hasActiveHead() const {
         return nm_optc_has_active_head(fFB != nullptr ? 1 : 0, gNmHybrid, gNvIgpu, fFBs[4] != nullptr ? 1 : 0) != 0;
     }
-    bool findDirectGpuId(IOService *nvrm, NvU32 *outGpuId) {
-        if (nvrm) {
-            if (OSIterator *it = nvrm->getClientIterator()) {
-                while (OSObject *o = it->getNextObject()) {
-                    IOService *c = OSDynamicCast(IOService, o);
-                    OSNumber *gn = c ? OSDynamicCast(OSNumber, c->getProperty("gpu-id")) : nullptr;
-                    if (gn) { *outGpuId = (NvU32)gn->unsigned32BitValue(); it->release(); return true; }
-                }
-                it->release();
-            }
-        }
-        if (!nvaccelMultiGpu()) {
-            if (OSDictionary *dm = IOService::serviceMatching("NVRMDisplay")) {
-                if (OSIterator *it = IOService::getMatchingServices(dm)) {
-                    while (OSObject *o = it->getNextObject()) {
-                        IOService *c = OSDynamicCast(IOService, o);
-                        OSNumber *gn = c ? OSDynamicCast(OSNumber, c->getProperty("gpu-id")) : nullptr;
-                        if (gn) { *outGpuId = (NvU32)gn->unsigned32BitValue(); it->release(); dm->release(); return true; }
-                    }
-                    it->release();
-                }
-                dm->release();
-            }
-        }
-        return false;
-    }
-    bool ensureDirectKapi(struct NvKmsKapiFunctionsTable **outKms, struct NvKmsKapiDevice **outDev, nvrm_phys_for_va_t *outPfv) {
-        if (!fKapiLock) return false;
-        IOLockLock(fKapiLock);
-        if (fDirectKms && fDirectDev && fDirectPhysForVa) {
-            if (outKms) *outKms = fDirectKms;
-            if (outDev) *outDev = fDirectDev;
-            if (outPfv) *outPfv = fDirectPhysForVa;
-            IOLockUnlock(fKapiLock);
-            return true;
-        }
-        IOService *nvrm = locateNVRM();
-        if (!nvrm) {
-            IOLockUnlock(fKapiLock);
-            return false;
-        }
-        struct NVRMDisplayPointers dp = {};
-        dp.version = NVRM_DISPLAY_PTRS_ABI_VERSION;
-        const OSSymbol *dpSym = OSSymbol::withCStringNoCopy(NVRM_DISPLAY_PTRS_FN);
-        IOReturn dpr = dpSym ? nvrm->callPlatformFunction(dpSym, false, &dp, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
-        if (dpSym) dpSym->release();
-        struct NvKmsKapiFunctionsTable *kms = (dpr == kIOReturnSuccess) ? (struct NvKmsKapiFunctionsTable *)dp.kapi : nullptr;
-        nvrm_phys_for_va_t pfv = (dpr == kIOReturnSuccess) ? (nvrm_phys_for_va_t)dp.physForVa : nullptr;
-        NvU32 gpuId = 0;
-        if (!kms || !pfv || !kms->allocateDevice || !kms->freeDevice || !kms->allocateMemory || !kms->freeMemory || !kms->mapMemory || !kms->unmapMemory || !findDirectGpuId(nvrm, &gpuId)) {
-            ALOG("direct KAPI init deferred (dpr 0x%x kapi %p pfv %p gpuIdOk %d)", (unsigned)dpr, dp.kapi, dp.physForVa, gpuId ? 1 : 0);
-            IOLockUnlock(fKapiLock);
-            return false;
-        }
-        struct NvKmsKapiAllocateDeviceParams ap = {};
-        ap.gpuId = gpuId;
-        struct NvKmsKapiDevice *dev = kms->allocateDevice(&ap);
-        if (!dev) {
-            ALOG("direct KAPI: allocateDevice(gpuId 0x%x) failed", (unsigned)gpuId);
-            IOLockUnlock(fKapiLock);
-            return false;
-        }
-        if (!fDirectBarLen && fPCI) {
-            if (IODeviceMemory *bar1 = fPCI->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress1))
-                fDirectBarLen = (unsigned long long)bar1->getLength();
-        }
-        fDirectKms = kms;
-        fDirectDev = dev;
-        fDirectPhysForVa = pfv;
-        ALOG("direct KAPI ready (gpu-id 0x%x, kapiDevice %p, BAR1 %llu MiB) -- hybrid VRAM active without NVIDIA displays",
-             (unsigned)gpuId, dev, fDirectBarLen >> 20);
-        if (outKms) *outKms = kms;
-        if (outDev) *outDev = dev;
-        if (outPfv) *outPfv = pfv;
-        IOLockUnlock(fKapiLock);
-        return true;
-    }
-    bool ensureDirectKapiHandle(void **outDev) {
-        struct NvKmsKapiDevice *dev = nullptr;
-        if (!ensureDirectKapi(nullptr, &dev, nullptr) || !dev) return false;
-        if (outDev) *outDev = dev;
-        return true;
-    }
-    void freeDirectKapi() {
-        IOLock *kl = fKapiLock;
-        if (!kl) return;
-        IOLockLock(kl);
-        struct NvKmsKapiFunctionsTable *kms = fDirectKms;
-        struct NvKmsKapiDevice *dev = fDirectDev;
-        fDirectDev = nullptr;
-        fDirectKms = nullptr;
-        fDirectPhysForVa = nullptr;
-        fKapiLock = nullptr;
-        IOLockUnlock(kl);
-        if (kms && dev && kms->freeDevice) kms->freeDevice(dev);
-        IOLockFree(kl);
-    }
-    IOReturn directVramOp(struct NVRMVramRequest *r, bool alloc) {
-        if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
-        struct NvKmsKapiFunctionsTable *kms = nullptr;
-        struct NvKmsKapiDevice *dev = nullptr;
-        nvrm_phys_for_va_t pfv = nullptr;
-        if (!ensureDirectKapi(&kms, &dev, &pfv)) return kIOReturnNotAttached;
-        if (!alloc) {
-            struct NvKmsKapiMemory *mem = (struct NvKmsKapiMemory *)r->handle;
-            if (!mem) return kIOReturnBadArgument;
-            if (r->kva) kms->unmapMemory(dev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, r->kva);
-            kms->freeMemory(dev, mem);
-            if (r->actualSize) OSAddAtomic64(-(SInt64)r->actualSize, &fDirectVramMapped);
-            r->handle = nullptr; r->kva = nullptr; r->phys = 0; r->actualSize = 0; r->allocationCookie = 0;
-            return kIOReturnSuccess;
-        }
-        r->phys = 0; r->kva = nullptr; r->handle = nullptr; r->actualSize = 0; r->mappedTotal = 0;
-        const unsigned long long want = nm_optc_align_vram_size(r->size);
-        if (!want) return kIOReturnBadArgument;
-        const SInt64 budget = (SInt64)nm_optc_vram_budget(fDirectBarLen);
-        const SInt64 before = OSAddAtomic64((SInt64)want, &fDirectVramMapped);
-        if (before + (SInt64)want > budget) {
-            OSAddAtomic64(-(SInt64)want, &fDirectVramMapped);
-            const SInt64 nRef = OSAddAtomic64(1, &fDirectRefused) + 1;
-            if (nRef <= 8 || (nRef & 255) == 0)
-                ALOG("directVramOp(%llu): BAR1 budget spent (%lld / %lld bytes)", want, (long long)before, (long long)budget);
-            return kIOReturnNoMemory;
-        }
-        struct NvKmsKapiAllocateMemoryParams mp = {};
-        NvU8 compressible = 0;
-        mp.layout = NvKmsSurfaceMemoryLayoutPitch;
-        mp.type = NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT;
-        mp.size = want;
-        mp.noDisplayCaching = NV_FALSE;
-        mp.useVideoMemory = NV_TRUE;
-        mp.compressible = &compressible;
-        struct NvKmsKapiMemory *mem = kms->allocateMemory(dev, &mp);
-        if (!mem) {
-            OSAddAtomic64(-(SInt64)want, &fDirectVramMapped);
-            return kIOReturnNoMemory;
-        }
-        void *kva = nullptr;
-        if (!kms->mapMemory(dev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, &kva) || !kva) {
-            kms->freeMemory(dev, mem);
-            OSAddAtomic64(-(SInt64)want, &fDirectVramMapped);
-            return kIOReturnVMError;
-        }
-        const NvU64 phys = pfv(kva);
-        if (!phys) {
-            kms->unmapMemory(dev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, kva);
-            kms->freeMemory(dev, mem);
-            OSAddAtomic64(-(SInt64)want, &fDirectVramMapped);
-            return kIOReturnNotReadable;
-        }
-        bzero(kva, (size_t)want);
-        volatile NvU64 *q = (volatile NvU64 *)kva;
-        q[0] = 0x5A5AA5A5C0FFEE01ull;
-        const NvU64 back = q[0];
-        q[0] = 0;
-        if (back != 0x5A5AA5A5C0FFEE01ull) {
-            ALOG("directVramOp(%llu): BAR1 aperture readback mismatch (kva %p phys 0x%llx read 0x%llx)",
-                 want, kva, (unsigned long long)phys, (unsigned long long)back);
-            kms->unmapMemory(dev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, kva);
-            kms->freeMemory(dev, mem);
-            OSAddAtomic64(-(SInt64)want, &fDirectVramMapped);
-            return kIOReturnIOError;
-        }
-        r->handle = mem;
-        r->kva = kva;
-        r->phys = (unsigned long long)phys;
-        r->actualSize = want;
-        r->mappedTotal = (unsigned long long)(before + (SInt64)want);
-        r->allocationCookie = 0x4F50544344495231ull;
-        if (fDirectAllocLogged < 16) {
-            fDirectAllocLogged++;
-            ALOG("directVramOp #%u: %llu bytes REAL BAR1 VRAM -- kva %p phys 0x%llx [mapped %llu / %lld]",
-                 fDirectAllocLogged, want, kva, (unsigned long long)phys, r->mappedTotal, (long long)budget);
-        }
-        return kIOReturnSuccess;
+    IOReturn registerTarget(bool add) {
+        if (!fOwner) return kIOReturnNotReady;
+        NVRMAccelTarget q = { NVRM_OWNER_ABI_VERSION, sizeof(q),
+            add ? NVRM_ACCEL_TARGET_REGISTER : NVRM_ACCEL_TARGET_UNREGISTER, 0, this, fOwner->fState.generation };
+        IOReturn r = fOwner->call(NVRM_ACCEL_TARGET_FN, &q);
+        if (r == kIOReturnSuccess) fTargetRegistered = add;
+        return r;
     }
     static bool fbPublished(void *target, void *ref, IOService *newService, IONotifier *note) {
         (void)ref; (void)note;
         NVAccel *me = (NVAccel *)target;
-        if (!me || !newService) return true;
+        if (!me || !newService || __atomic_load_n(&me->fStopping, __ATOMIC_ACQUIRE)) return true;
         const enum nvrm_fb_kind kind = classifyFramebuffer(newService);
         int hasId = 0, hasIdx = 0;
         uint64_t depId = 0; uint32_t localIdx = 0;
@@ -699,6 +544,7 @@ public:
             return true;
         }
         const unsigned slot = (unsigned)logical;
+        if (kind == NVRM_FB_NVIDIA && (!me->fOwner || !me->fOwner->bindDisplay(newService, slot))) return true;
         const char *what = "kept";
         bool validOwner = false;
         enum nm_optc_claim_outcome outcome = nm_optc_decide_claim(me->fFBs[slot], newService);
@@ -742,6 +588,7 @@ public:
         ALOG("%s (%s) published -- display machine framebuffer count = %u (depID 0x%llx local %u -> logical %u %s)",
              newService->getName(), newService->getMetaClass()->getClassName(), before,
              (unsigned long long)depId, localIdx, slot, what);
+        if (me->fCandidate) { me->registerFramebuffer(1); return true; }
         if (gNvAccelArmed)
             ALOG("  logical %u published AFTER the arm: it gets a pipe only when debug.nvaccelfb=3 is written again, "
                  "and WindowServer composites it only after a WindowServer restart", slot);
@@ -859,7 +706,7 @@ public:
     }
     static void headlessCheck(void *p0, void *) {
         NVAccel *me = (NVAccel *)p0;
-        if (!me || me != gAccel) return;
+        if (!me || __atomic_load_n(&me->fStopping, __ATOMIC_ACQUIRE)) return;
         if (me->fRegLock) IOLockLock(me->fRegLock);
         const char *why = me->hasActiveHead() ? "a display head published" : !me->fMetalPlugin ? "no plugin name to restore"
                         : me->getProperty("MetalPluginName") ? "the plugin name is already back" : nullptr;
@@ -1039,23 +886,11 @@ public:
         if (after > before) { onCountGrewLocked(); return true; }
         return false;
     }
-    const OSSymbol *fSymAlloc = nullptr, *fSymFree = nullptr;
-    IOReturn askFramebufferForVram(struct NVRMVramRequest *r, bool alloc) {
-        if (!alloc && r && r->allocationCookie == 0x4F50544344495231ull && fDirectDev)
-            return directVramOp(r, false);
-        if (!fFB) {
-            if (hasActiveHead()) return directVramOp(r, alloc);
-            return kIOReturnNotAttached;
-        }
-        if (!fSymAlloc) fSymAlloc = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_ALLOC);
-        if (!fSymFree)  fSymFree  = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_FREE);
-        const OSSymbol *fn = alloc ? fSymAlloc : fSymFree;
-        if (!fn) return kIOReturnNoMemory;
-        return fFB->callPlatformFunction(fn, false, r, nullptr, nullptr, nullptr);
-    }
+    // Intel never exports a borrowed scanout pointer; its only consumer is presentFinal().
     IOReturn askFramebufferForScanout(struct NVRMVramRequest *r, IOService *fb = nullptr) {
         if (!fb) fb = fFB;
-        if (!fb) return kIOReturnNotAttached;
+        if (!fb || fStopping || fb->isInactive()) return kIOReturnNotAttached;
+        if (fb->metaCast("NMIntelFB")) { if (r) bzero(r, sizeof(*r)); return kIOReturnUnsupported; }
         if (!fSymScanout) fSymScanout = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_SCANOUT);
         return fb->callPlatformFunction(fSymScanout, false, r, nullptr, nullptr, nullptr);
     }
@@ -1111,31 +946,32 @@ public:
         return kIOReturnSuccess;
     }
     static void triggerFromSysctl(int how) {
-        if (!gAccel) { ALOG("sysctl debug.nvaccelfb=%d but no NVAccel is running", how); return; }
+        NVAccel *a = forDisplay(); NVRetain retained(a);
+        if (!a) return;
         if (how >= 4) gNvAperture = 1;
         if (how >= 3) {
             gNvScanout = 1;
             ALOG("  level %d: registering any published head that has no pipe yet", how);
-            if (gAccel->fRegLock) IOLockLock(gAccel->fRegLock);
-            if (gAccel->registerFramebufferLocked(1))
+            if (a->fRegLock) IOLockLock(a->fRegLock);
+            if (a->registerFramebufferLocked(1))
                 ALOG("sysctl debug.nvaccelfb=%d: scanout-backed display pipe ENABLED; the registration just delivered the mode "
                      "change -- not delivering it twice", how);
             else {
                 ALOG("sysctl debug.nvaccelfb=%d: scanout-backed display pipe ENABLED, re-delivering the mode change", how);
-                gAccel->deliverModeChange();
+                a->deliverModeChange();
             }
-            if (gAccel->fRegLock) IOLockUnlock(gAccel->fRegLock);
+            if (a->fRegLock) IOLockUnlock(a->fRegLock);
             return;
         }
-        gAccel->registerFramebuffer(how);
+        a->registerFramebuffer(how);
     }
     static void enableFromHook(const char *why) {
-        if (!gAccel) return;
-        gAccel->enableAccelerator();
-        gAccel->fEnableCount++;
-        ALOG("enableAccelerator() from %s (call #%u)", why, gAccel->fEnableCount);
-        gAccel->setProperty("NVAccelEnabledFrom", why);
-        gAccel->setProperty("NVAccelEnableCount", gAccel->fEnableCount, 32);
+        NVAccel *a = forDisplay(); NVRetain retained(a);
+        if (!a) return;
+        a->enableAccelerator();
+        a->fEnableCount++;
+        a->setProperty("NVAccelEnabledFrom", why);
+        a->setProperty("NVAccelEnableCount", a->fEnableCount, 32);
     }
     unsigned fEnableCount = 0;
     unsigned fUcLogged = 0;
@@ -1203,25 +1039,79 @@ public:
             ALOG("NVRM owns %04x:%04x (waited %u ms) - starting", pci->configRead16(0x00), pci->configRead16(0x02), waited * 100);
         }
 #endif
+        fPCI = OSDynamicCast(IOPCIDevice, provider);
+        int hybrid = 0;
+        const int hasHybrid = PE_parse_boot_argn("nmhybrid", &hybrid, sizeof hybrid);
+        gNmHybrid = nmh_level_parse(hasHybrid, hybrid);
+        fCandidate = gNmHybrid == NMH_COPY;
+        fRegLock = IOLockAlloc();
+        if (!gAccelLock) {
+            IOLock *lock = IOLockAlloc();
+            if (lock && !OSCompareAndSwapPtr(nullptr, lock, (void *volatile *)&gAccelLock)) IOLockFree(lock);
+        }
+        if (!fPCI || !fRegLock || !gAccelLock) return false;
+        IOService *nvrm = locateNVRM();
+        fOwner = nvrm ? NVVramOwner::create(nvrm, fPCI, fCandidate) : nullptr;
+        if (!fOwner) return false;
+        // Capability policy and the retained dispatch target precede the family's service publication.
+        if (fCandidate) {
+            removeProperty("NVAccelSurfaceWait");
+            gNvScanout = 1; gNvAperture = 1; gNvIgpu = 1; gNvIop = 1;
+            OSDictionary *caps = OSDictionary::withCapacity(2);
+            if (!caps) return false;
+            caps->setObject("DisplayPipeSupported", kOSBooleanTrue);
+            caps->setObject("TransactionsSupported", kOSBooleanTrue);
+            setProperty("IOAccelDisplayPipeCapabilities", caps); caps->release();
+        }
+        else setProperty("NVAccelSurfaceWait", 1ULL, 32);
+        if (registerTarget(true) != kIOReturnSuccess) { fOwner->beginDrain(); return false; }
+        if (fCandidate) {
+            const char *classes[] = { "NVRMNVDAFramebuffer", "NMIntelFB" };
+            for (unsigned k = 0; k < 2; ++k) {
+                OSDictionary *matching = serviceMatching(classes[k]);
+                OSIterator *it = matching ? getMatchingServices(matching) : nullptr;
+                if (matching) matching->release();
+                if (it) {
+                    while (OSObject *object = it->getNextObject()) {
+                        IOService *fb = OSDynamicCast(IOService, object);
+                        if (fb) fbPublished(this, nullptr, fb, nullptr);
+                    }
+                    it->release();
+                }
+            }
+        }
         ALOG("start(%s): calling IOGraphicsAccelerator2::start — the family's own bring-up", provider ? provider->getName() : "?");
         bool r = IOGraphicsAccelerator2::start(provider);
         ALOG("IOGraphicsAccelerator2::start -> %d", r);
         if (r) {
-            // Tells the Metal plugin that NVResource::pageoff waits for a surface WindowServer's GPU is still writing
-            // (nvSurfWaitReady). Only then does the plugin mark WindowServer's surfaces newest in VRAM at commit; with an
-            // accelerator that does not wait, that mark would let a CPU lock or a copied present read a surface before
-            // its pixels landed, so the plugin keeps marking them after the GPU finishes.
-            setProperty("NVAccelSurfaceWait", 1ULL, 32);
+            if (fCandidate) removeProperty("NVAccelSurfaceWait");
             // Properties an Apple accelerator publishes that programs read when they walk the registry for the GPU in use
             // (game engines list IOAccelerator services to pick the primary GPU, and the OpenGL renderer id ties a
             // display GPU to a CGL renderer). Only added when nothing else has set them.
             if (!getProperty("IOAccelRevision")) setProperty("IOAccelRevision", 2ULL, 32);
             if (!getProperty("IOVARendererID")) setProperty("IOVARendererID", 0x01020000ULL | (gAccelTab.count() & 0xffff), 32);
             registerService(); ALOG("registerService() called — Metal can now find MetalPluginName=%s", "NVMTLDriver");
+            IOLockLock(gAccelLock);
             gAccelTab.add(this, scope.multi, provider->getProperty("nullmoth-auto-primary") == kOSBooleanTrue);
-            gAccel = gAccelTab.primary(); gEnableAccel = &NVAccel::enableFromHook;
+            IOLockUnlock(gAccelLock);
+            gEnableAccel = &NVAccel::enableFromHook;
             publishPrimary();
             scope.started = true;
+            if (fCandidate && fDM) {
+                IOLockLock(fRegLock);
+                const unsigned count = fDM->getFramebufferCount();
+                for (unsigned i = 0; i < count && i < 16; ++i) {
+                    void *pipe = *(void **)((unsigned char *)fDM + 0x88 + i * 8);
+                    unsigned head = 0;
+                    if (pipe && pipeFramebuffer(pipe, &head)) {
+                        fFBRegistered |= 1u << head; gNvHeadsPiped |= 1u << head;
+                    }
+                }
+                gNvHeadsRegistered = fFBRegistered;
+                syncHead4AssociationLocked();
+                if (count) onCountGrewLocked();
+                IOLockUnlock(fRegLock);
+            }
             for (unsigned i = 0; i < NV_CARRIERS; i++) {
                 IOAccelNVRMCarrier *c = OSTypeAlloc(IOAccelNVRMCarrier);
                 if (!c) break;
@@ -1238,8 +1128,6 @@ public:
             startTemperature();
             startUtilization();
             ALOG("display machine framebuffer count after the family sweep = %u", fDM ? fDM->getFramebufferCount() : 0xFFFFFFFFu);
-            fRegLock = IOLockAlloc();
-            if (!fKapiLock) fKapiLock = IOLockAlloc();
             ALOG("multi-head: up to %u heads, registration lock %p%s", kNvMaxFB, fRegLock,
                  fRegLock ? "" : " -- NULL: two sysctl writers could interleave a registration");
 #ifdef NMX_ACCEL
@@ -1269,7 +1157,7 @@ public:
                     ALOG("watching for a firmware-framebuffer panel (NMGopFB) -> notifier %p", fGopNote);
                 }
                 nvaccelInstallSysctl();
-                if (getProperty("MetalPluginName")) {
+                if (getProperty("MetalPluginName") && (!fCandidate || !hasActiveHead())) {
                     OSObject *mp = getProperty("MetalPluginName"); if (mp) mp->retain();
                     fMetalPlugin = mp;
                     removeProperty("MetalPluginName");
@@ -1279,6 +1167,7 @@ public:
                 }
             } else ALOG("serviceMatching(NVRMFramebuffer) returned NULL -- cannot watch for the framebuffer");
         }
+        if (!r) { if (fTargetRegistered) registerTarget(false); fOwner->beginDrain(); }
         return r;
     }
     // ---- GPU core temperature ------------------------------------------------
@@ -1473,102 +1362,524 @@ public:
     }
 
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE {
-        ALOG("stop");
-        if (fRegLock) {
-            IOLockLock(fRegLock);
-            clearHead4AssociationLocked();
-            IOLockUnlock(fRegLock);
-        } else {
-            clearHead4AssociationLocked();
+        __atomic_store_n(&fStopping, true, __ATOMIC_RELEASE);
+        if (fOwner) fOwner->beginDrain();
+        if (fTargetRegistered) registerTarget(false);
+        if (gAccelLock) {
+            IOLockLock(gAccelLock); gAccelTab.remove(this, nvaccelMultiGpu()); IOLockUnlock(gAccelLock);
         }
         if (fFBNote) { fFBNote->remove(); fFBNote = nullptr; }
         if (fIntelNote) { fIntelNote->remove(); fIntelNote = nullptr; }
         if (fGopNote) { fGopNote->remove(); fGopNote = nullptr; }
+        if (fHeadlessCall) { thread_call_cancel_wait(fHeadlessCall); thread_call_free(fHeadlessCall); fHeadlessCall = nullptr; }
         stopTemperature();
         stopUtilization();
-        gAccelTab.remove(this, nvaccelMultiGpu());   // a no-op without nvmultigpu=1
-        gAccel = gAccelTab.primary();
-        publishPrimary();
+        if (fOwner) fOwner->waitOperations();
+        nvAccelDrainPresent(this);
+        if (fRegLock) { IOLockLock(fRegLock); clearHead4AssociationLocked(); IOLockUnlock(fRegLock); }
+        // Native teardown may still unmap and complete memory; the child owner keeps the device alive.
         IOGraphicsAccelerator2::stop(provider);
-        freeDirectKapi();
+        fDM = nullptr;
+        if (fStamps) { fStamps->complete(); fStamps->release(); fStamps = nullptr; }
+        for (unsigned i = 0; i < 32; ++i) if (fRanges[i]) { fRanges[i]->release(); fRanges[i] = nullptr; }
+        for (unsigned i = 0; i < NV_CARRIERS; ++i) if (fCarriers[i]) {
+            fCarriers[i]->stop(this); fCarriers[i]->detach(this); fCarriers[i]->release(); fCarriers[i] = nullptr;
+        }
+        if (fFB) { fFB->release(); fFB = nullptr; }
+        for (unsigned i = 0; i < kNvMaxFB; ++i) if (fFBs[i]) { fFBs[i]->release(); fFBs[i] = nullptr; }
+        if (fNVRM) { fNVRM->release(); fNVRM = nullptr; }
+        if (fMetalPlugin) { fMetalPlugin->release(); fMetalPlugin = nullptr; }
+        if (fSymScanout) { fSymScanout->release(); fSymScanout = nullptr; }
+        if (fOwner) { fOwner->scheduleReap(); fOwner->release(); fOwner = nullptr; }
+        publishPrimary();
+    }
+    void free() APPLE_KEXT_OVERRIDE {
+        if (fRegLock) { IOLockFree(fRegLock); fRegLock = nullptr; }
+        if (fOwner) { fOwner->beginDrain(); fOwner->release(); fOwner = nullptr; }
+        if (fNVRM) { fNVRM->release(); fNVRM = nullptr; }
+        IOGraphicsAccelerator2::free();
     }
     virtual IOReturn callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4) APPLE_KEXT_OVERRIDE;
 };
 OSDefineMetaClassAndStructors(NVAccel, IOGraphicsAccelerator2)
-NVAccel *NVAccel::gAccel = nullptr;
+NVRetain::NVRetain(NVAccel *a) : object(a), display(a != nullptr) {}
+NVRetain::~NVRetain() { if (display) ((NVAccel *)object)->fOwner->leave(); if (object) object->release(); }
+IOLock *NVAccel::gAccelLock = nullptr;
 NvrmDevTab<NVAccel> NVAccel::gAccelTab;
 NvrmStartGate NVAccel::gAccelGate;
 NvrmWaitQueue<IOService> NVAccel::gAccelWait;
 NVAccelStartScope::~NVAccelStartScope() { nvrm_gate_leave(&NVAccel::gAccelGate, multi, started); if (multi) NVAccel::reofferNext(); }
 
-IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAccelResource2 *res)
+OSDefineMetaClassAndStructors(NVVramOwner, IOService)
+OSDefineMetaClassAndStructors(NVStockLifetime, IOService)
+OSDefineMetaClassAndStructors(NVVramAllocation, OSObject)
+OSDefineMetaClassAndStructors(NVVramMemoryDescriptor, IOGeneralMemoryDescriptor)
+OSDefineMetaClassAndStructors(NVGpuVaRecord, OSObject)
+static uint64_t gOwnerGeneration;
+
+NVVramOwner *NVVramOwner::create(IOService *provider, IOPCIDevice *pci, bool direct)
 {
-    if (!gNvScanout) {
-        ALOG("NVDisplayPipe::initFramebufferResource(index %u): scanout gate CLOSED -- returning NULL, "
-             "which is the family's own default (sysctl debug.nvaccelfb=3 opens it)", index);
+    if (!provider || !pci || provider->getProvider() != pci || provider->isInactive()) return nullptr;
+    NVVramOwner *o = OSTypeAlloc(NVVramOwner);
+    if (!o || !o->init()) { if (o) o->release(); return nullptr; }
+    o->fLock = IOLockAlloc();
+    o->fReaper = thread_call_allocate(&NVVramOwner::reapCall, o);
+    if (!o->fLock || !o->fReaper) { o->release(); return nullptr; }
+    uint64_t previous = __atomic_load_n(&gOwnerGeneration, __ATOMIC_ACQUIRE), generation;
+    do {
+        generation = previous;
+        if (!nvNextGeneration(&generation, &generation)) { o->release(); return nullptr; }
+    } while (!__atomic_compare_exchange_n(&gOwnerGeneration, &previous, generation, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+    o->fState.activate(generation);
+    o->fNvrm = provider; provider->retain();
+    o->fPci = pci; pci->retain(); o->fDirect = direct;
+    IODeviceMemory *bar = pci->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress1);
+    o->fBarBytes = bar ? bar->getLength() : 0;
+    if (!o->setProperty(NVRM_OWNER_GENERATION_PROPERTY, generation, 64) || !o->attach(provider)) { o->release(); return nullptr; }
+    o->fAttached = true;
+    if (!o->start(provider)) { o->detach(provider); o->fAttached = false; o->release(); return nullptr; }
+    o->retain(); o->fLifetimeHeld = true;
+    o->registerService();
+    return o;
+}
+IOReturn NVVramOwner::call(const char *name, void *request)
+{
+    if (!fNvrm) return kIOReturnNotAttached;
+    const OSSymbol *symbol = OSSymbol::withCStringNoCopy(name);
+    if (!symbol) return kIOReturnNoMemory;
+    IOReturn r = fNvrm->callPlatformFunction(symbol, false, request, nullptr, nullptr, nullptr);
+    symbol->release(); return r;
+}
+bool NVVramOwner::bindDisplay(IOService *fb, unsigned head)
+{
+    if (!fb || head >= 5) return false;
+    IORegistryEntry *parent = fb;
+    for (unsigned depth = 0; parent && parent != fPci && depth < 8; ++depth) parent = parent->getParentEntry(gIOServicePlane);
+    if (parent != fPci) return false;
+    IOLockLock(fLock);
+    if (fDisplayLifetime[head]) {
+        bool same = fState.phase == NVOwnerPhase::Active && fDisplayLifetime[head]->fFramebuffer == fb;
+        IOLockUnlock(fLock); return same;
+    }
+    if (fState.phase != NVOwnerPhase::Active) { IOLockUnlock(fLock); return false; }
+    NVStockLifetime *guard = OSTypeAlloc(NVStockLifetime);
+    bool initialized = guard && guard->init();
+    bool attached = initialized && guard->attach(fb);
+    bool started = attached && guard->start(fb);
+    if (started) {
+        guard->fOwner = this; guard->fFramebuffer = fb; fb->retain(); fDisplayLifetime[head] = guard;
+    } else {
+        if (attached) guard->detach(fb);
+        if (guard) guard->release();
+    }
+    IOLockUnlock(fLock);
+    return started;
+}
+bool NVVramOwner::ensureDeviceLocked()
+{
+    if (fDevice) return true;
+    if (fState.phase != NVOwnerPhase::Active || fNvrm->isInactive()) return false;
+    if (!fDirect) {
+        OSDictionary *matching = IOService::serviceMatching("NVRMNVDAFramebuffer");
+        OSIterator *it = matching ? IOService::getMatchingServices(matching) : nullptr;
+        if (matching) matching->release();
+        if (it) {
+            while (OSObject *object = it->getNextObject()) {
+                IOService *fb = OSDynamicCast(IOService, object);
+                IORegistryEntry *p = fb;
+                for (unsigned depth = 0; p && p != fPci && depth != 8; ++depth) p = p->getParentEntry(gIOServicePlane);
+                if (fb && p == fPci && !fb->isInactive()) { fStock = fb; fStock->retain(); break; }
+            }
+            it->release();
+        }
+        if (!fStock) return false;
+        NVStockLifetime *guard = OSTypeAlloc(NVStockLifetime);
+        if (!guard || !guard->init()) { if (guard) guard->release(); fStock->release(); fStock = nullptr; return false; }
+        guard->fOwner = this;
+        if (!guard->attach(fStock)) { guard->release(); fStock->release(); fStock = nullptr; return false; }
+        if (!guard->start(fStock)) { guard->detach(fStock); guard->release(); fStock->release(); fStock = nullptr; return false; }
+        guard->fFramebuffer = fStock; fStock->retain();
+        fStockLifetime = guard;
+        const OSSymbol *symbol = OSSymbol::withCStringNoCopy(NVRM_GPUVA_FN_HANDLES);
+        fHandles = {}; fHandles.version = NVRM_GPUVA_ABI_VERSION;
+        IOReturn r = symbol ? fStock->callPlatformFunction(symbol, false, &fHandles, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
+        if (symbol) symbol->release();
+        if (r != kIOReturnSuccess || !fHandles.kapiDevice) {
+            fStockLifetime->stop(fStock); fStockLifetime->detach(fStock); fStockLifetime->release(); fStockLifetime = nullptr;
+            fStock->release(); fStock = nullptr; fHandles = {}; return false;
+        }
+        fDevice = (NvKmsKapiDevice *)fHandles.kapiDevice; return true;
+    }
+    NVRMDisplayPointers dp = {}; dp.version = NVRM_DISPLAY_PTRS_ABI_VERSION;
+    if (call(NVRM_DISPLAY_PTRS_FN, &dp) != kIOReturnSuccess) return false;
+    NvKmsKapiFunctionsTable *k = (NvKmsKapiFunctionsTable *)dp.kapi;
+    if (!k || !k->allocateDevice || !k->freeDevice || !k->allocateMemory || !k->freeMemory || !k->mapMemory || !k->unmapMemory) return false;
+    NvU32 gpuId = 0; bool found = false;
+    OSIterator *clients = fNvrm->getClientIterator();
+    if (clients) {
+        while (OSObject *object = clients->getNextObject()) {
+            IOService *s = OSDynamicCast(IOService, object);
+            OSNumber *n = s ? OSDynamicCast(OSNumber, s->getProperty("gpu-id")) : nullptr;
+            if (n) { gpuId = n->unsigned32BitValue(); found = true; break; }
+        }
+        clients->release();
+    }
+    if (!found) return false;
+    NvKmsKapiAllocateDeviceParams ap = {}; ap.gpuId = gpuId;
+    fDevice = k->allocateDevice(&ap);
+    if (!fDevice) return false;
+    fKms = k; fHandles = {}; fHandles.version = NVRM_GPUVA_ABI_VERSION; fHandles.kapiDevice = fDevice;
+    return true;
+}
+bool NVVramOwner::active()
+{ IOLockLock(fLock); bool ok = fState.phase == NVOwnerPhase::Active; IOLockUnlock(fLock); return ok; }
+bool NVVramOwner::enter()
+{ IOLockLock(fLock); bool ok = fState.enter(); IOLockUnlock(fLock); return ok; }
+void NVVramOwner::leave()
+{ IOLockLock(fLock); fState.leave(); IOLockWakeup(fLock, &fState.operations, false); IOLockUnlock(fLock); scheduleReap(); }
+void NVVramOwner::waitOperations()
+{ IOLockLock(fLock); while (fState.operations) IOLockSleep(fLock, &fState.operations, THREAD_UNINT); IOLockUnlock(fLock); }
+bool NVVramOwner::borrow()
+{
+    IOLockLock(fLock);
+    bool ok = fState.phase == NVOwnerPhase::Active && fState.borrowers != UINT32_MAX;
+    if (ok) { ++fState.borrowers; retain(); }
+    IOLockUnlock(fLock); return ok;
+}
+void NVVramOwner::unborrow()
+{
+    IOLockLock(fLock); if (fState.borrowers) --fState.borrowers; IOLockUnlock(fLock);
+    scheduleReap(); release();
+}
+bool NVVramOwner::handles(NVRMRmHandles *out)
+{
+    IOLockLock(fLock);
+    bool ok = fState.phase == NVOwnerPhase::Active && ensureDeviceLocked();
+    if (ok) *out = fHandles;
+    IOLockUnlock(fLock); return ok;
+}
+IOReturn NVVramOwner::cpuAccess(IOReturn (*body)(void *), void *context)
+{
+    if (!body || !enter()) return kIOReturnNotReady;
+    NVRMOwnerCpuAccess q = { NVRM_OWNER_ABI_VERSION, sizeof(q), this, fState.generation, body, context };
+    IOReturn r = call(NVRM_OWNER_CPU_ACCESS_FN, &q);
+    leave(); return r;
+}
+NVVramAllocation *NVVramOwner::allocate(uint64_t bytes)
+{
+    const uint64_t want = nm_optc_align_vram_size(bytes);
+    if (!want || !enter()) return nullptr;
+    NVVramAllocation *a = OSTypeAlloc(NVVramAllocation);
+    if (!a || !a->init()) { if (a) a->release(); leave(); return nullptr; }
+    IOLockLock(fLock);
+    uint64_t generation = 0;
+    bool ok = fState.phase == NVOwnerPhase::Active && ensureDeviceLocked() && fState.allocations != UINT32_MAX &&
+              nvNextGeneration(&fState.nextAllocation, &generation);
+    NVRMVramRequest r = {}; r.version = NVRM_VRAM_ABI_VERSION; r.size = want;
+    if (ok && fDirect) {
+        const uint64_t budget = nm_optc_vram_budget(fBarBytes);
+        ok = fMappedBytes <= budget && want <= budget - fMappedBytes;
+        if (ok) {
+            NvKmsKapiAllocateMemoryParams mp = {}; NvU8 compressible = 0;
+            mp.layout = NvKmsSurfaceMemoryLayoutPitch; mp.type = NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT;
+            mp.size = want; mp.useVideoMemory = NV_TRUE; mp.compressible = &compressible;
+            r.handle = fKms->allocateMemory(fDevice, &mp);
+            ok = r.handle && fKms->mapMemory(fDevice, (NvKmsKapiMemory *)r.handle, NVKMS_KAPI_MAPPING_TYPE_KERNEL, &r.kva) && r.kva;
+            r.actualSize = want; r.allocationCookie = generation;
+        }
+    } else if (ok) {
+        const OSSymbol *s = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_ALLOC);
+        ok = s && !fStock->isInactive() && fStock->callPlatformFunction(s, false, &r, nullptr, nullptr, nullptr) == kIOReturnSuccess;
+        if (s) s->release();
+    }
+    NVRMKernelMapInfo mi = { NVRM_OWNER_ABI_VERSION, sizeof(mi), r.kva, want, 0, 0, 0, 0 };
+    ok = ok && r.handle && r.kva && r.actualSize >= want && r.actualSize <= UINT64_MAX - fMappedBytes &&
+         call(NVRM_KERNEL_MAP_INFO_FN, &mi) == kIOReturnSuccess && mi.physical && mi.availableBytes >= r.actualSize &&
+         (mi.cacheOptions == kIOMapInhibitCache || mi.cacheOptions == kIOMapWriteCombineCache);
+    if (ok) {
+        struct Clear { void *kva; size_t size; } clear = { r.kva, (size_t)r.actualSize };
+        NVRMOwnerCpuAccess access = { NVRM_OWNER_ABI_VERSION, sizeof(access), this, fState.generation,
+            [](void *p) -> IOReturn { Clear *c = (Clear *)p; bzero(c->kva, c->size); nv_frame_store_drain(); return kIOReturnSuccess; }, &clear };
+        ok = call(NVRM_OWNER_CPU_ACCESS_FN, &access) == kIOReturnSuccess;
+    }
+    if (ok) {
+        r.phys = mi.physical;
+        a->fOwner = this; retain(); a->fState.key = { fState.generation, generation };
+        a->fReceipt = r; a->fCache = mi.cacheOptions;
+        a->fNext = fAllocations; fAllocations = a; a->retain();
+        ++fState.allocations; fMappedBytes += r.actualSize;
+    } else if (r.handle) {
+        if (fDirect) {
+            if (r.kva) fKms->unmapMemory(fDevice, (NvKmsKapiMemory *)r.handle, NVKMS_KAPI_MAPPING_TYPE_KERNEL, r.kva);
+            fKms->freeMemory(fDevice, (NvKmsKapiMemory *)r.handle);
+        } else {
+            const OSSymbol *s = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_FREE);
+            const bool released = s && fStock->callPlatformFunction(s, false, &r, nullptr, nullptr, nullptr) == kIOReturnSuccess;
+            if (s) s->release();
+            if (!released) {
+                a->fOwner = this; retain(); a->fState.key = { fState.generation, generation };
+                a->fState.retire(); a->fReceipt = r;
+                a->fNext = fAllocations; fAllocations = a; a->retain();
+                ++fState.allocations; fMappedBytes += r.actualSize; fRetirementPending = true;
+            }
+        }
+    }
+    IOLockUnlock(fLock); leave();
+    if (!ok) { a->release(); return nullptr; }
+    return a;
+}
+void NVVramOwner::beginDrain()
+{
+    if (!fLock) return;
+    IOLockLock(fLock);
+    fState.drain(); fHandles = {};
+    for (NVVramAllocation *a = fAllocations; a; a = a->fNext) a->fState.retire();
+    IOLockUnlock(fLock);
+    removeProperty(NVRM_OWNER_GENERATION_PROPERTY);
+    scheduleReap();
+}
+bool NVVramOwner::isDrained()
+{ IOLockLock(fLock); bool done = fState.phase == NVOwnerPhase::Dead; IOLockUnlock(fLock); return done; }
+void NVVramOwner::scheduleReap()
+{
+    if (!fReaper || !fLock) return;
+    IOLockLock(fLock); bool needed = fRetirementPending || fState.phase == NVOwnerPhase::Draining; IOLockUnlock(fLock);
+    if (!needed) return;
+    uint64_t deadline = 0; clock_interval_to_deadline(1, kMillisecondScale, &deadline);
+    thread_call_enter_delayed(fReaper, deadline);
+}
+void NVVramOwner::reapCall(void *p, void *) { ((NVVramOwner *)p)->reap(); }
+bool NVVramOwner::retireScanout(unsigned head, IOService *fb, OSObject *frontSurface, OSObject *previousSurface,
+                                NVVramAllocation *front, NVVramAllocation *previous)
+{
+    if (head >= 5 || !fb) return false;
+    if (!front && !previous && !frontSurface && !previousSurface) return true;
+    IOLockLock(fLock);
+    if (fRetiredScanout[head].framebuffer || fState.borrowers == UINT32_MAX) { IOLockUnlock(fLock); return false; }
+    fRetiredScanout[head] = { fb, frontSurface, previousSurface, front, previous };
+    fb->retain(); retain(); ++fState.borrowers; fRetirementPending = true;
+    IOLockUnlock(fLock);
+    scheduleReap(); return true;
+}
+bool NVVramOwner::scanoutRetiring(unsigned head)
+{
+    if (head >= 5) return true;
+    IOLockLock(fLock); bool pending = fRetiredScanout[head].framebuffer != nullptr; IOLockUnlock(fLock); return pending;
+}
+bool NVVramOwner::reapScanouts()
+{
+    bool pending = false;
+    for (unsigned head = 0; head < 5; ++head) {
+        IOLockLock(fLock); NVRetiredScanout record = fRetiredScanout[head]; IOLockUnlock(fLock);
+        if (!record.framebuffer) continue;
+        NVRMFlipRequest q = {}; q.version = NVRM_FLIP_ABI_VERSION; q.flags = 1;
+        const OSSymbol *symbol = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
+        IOReturn result = symbol ? record.framebuffer->callPlatformFunction(symbol, false, &q, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
+        if (symbol) symbol->release();
+        if (result != kIOReturnSuccess) { pending = true; continue; }
+        IOLockLock(fLock); fRetiredScanout[head] = {}; --fState.borrowers; IOLockUnlock(fLock);
+        if (record.frontSurface) record.frontSurface->release();
+        if (record.previousSurface) record.previousSurface->release();
+        if (record.front) { record.front->releaseLease(NVLeaseUse::Present); record.front->release(); }
+        if (record.previous) { record.previous->releaseLease(NVLeaseUse::Present); record.previous->release(); }
+        record.framebuffer->release(); release();
+    }
+    return pending;
+}
+void NVVramOwner::reap()
+{
+    bool retry = reapScanouts(), finished = false, deferred = false;
+    IOLockLock(fLock);
+    NVGpuVaRecord **v = &fReservations;
+    while (*v) {
+        NVGpuVaRecord *r = *v;
+        if (!r->fRetiring) { v = &r->fNext; continue; }
+        r->retain(); IOLockUnlock(fLock);
+        bool done = r->unmap(true);
+        IOLockLock(fLock);
+        if (done) {
+            v = &fReservations; while (*v && *v != r) v = &(*v)->fNext;
+            if (*v) { *v = r->fNext; --fState.reservations; IOLockUnlock(fLock); r->release(); IOLockLock(fLock); }
+        } else { retry = true; v = &r->fNext; }
+        IOLockUnlock(fLock); r->release(); IOLockLock(fLock);
+    }
+    NVVramAllocation **link = &fAllocations;
+    while (*link) {
+        if (fState.operations) break;
+        NVVramAllocation *a = *link;
+        if (!a->fState.releasable()) { link = &a->fNext; continue; }
+        bool ok = true;
+        if (fDirect) {
+            fKms->unmapMemory(fDevice, (NvKmsKapiMemory *)a->fReceipt.handle, NVKMS_KAPI_MAPPING_TYPE_KERNEL, a->fReceipt.kva);
+            fKms->freeMemory(fDevice, (NvKmsKapiMemory *)a->fReceipt.handle);
+        } else {
+            NVRMVramRequest receipt = a->fReceipt;
+            const OSSymbol *s = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_FREE);
+            ok = s && fStock->callPlatformFunction(s, false, &receipt, nullptr, nullptr, nullptr) == kIOReturnSuccess;
+            if (s) s->release();
+        }
+        if (!ok) { retry = true; link = &a->fNext; continue; }
+        *link = a->fNext; --fState.allocations; fMappedBytes -= a->fReceipt.actualSize;
+        a->fState.phase = NVBackingPhase::Released;
+        IOLockUnlock(fLock); a->release(); IOLockLock(fLock);
+    }
+    fRetirementPending = retry;
+    for (NVVramAllocation *a = fAllocations; a; a = a->fNext)
+        if (a->fState.phase == NVBackingPhase::Retiring) fRetirementPending = true;
+    if (fState.drained()) {
+        NVRMGpuVaRequest q = {}; q.version = NVRM_GPUVA_ABI_VERSION; q.kapiDevice = fDevice;
+        if (!fDevice || call(NVRM_GPUVA_DRAIN_FN, &q) == kIOReturnSuccess) {
+            if (fDirect && fDevice) fKms->freeDevice(fDevice);
+            fDevice = nullptr; fKms = nullptr; fState.phase = NVOwnerPhase::Dead;
+            finished = true; deferred = fDeferred; fDeferred = false;
+        } else retry = true;
+    }
+    IOLockUnlock(fLock);
+    if (retry) { uint64_t when = 0; clock_interval_to_deadline(100, kMillisecondScale, &when); thread_call_enter_delayed(fReaper, when); }
+    if (finished) {
+        thread_call_cancel(fReaper); // discard a retirement wake queued before the final Dead transition
+        for (unsigned head = 0; head < 5; ++head) if (fDisplayLifetime[head]) {
+            NVStockLifetime *guard = fDisplayLifetime[head]; fDisplayLifetime[head] = nullptr;
+            guard->fOwner = nullptr;
+            if (guard->fDeferred) { bool defer = false; guard->IOService::didTerminate(guard->fFramebuffer, guard->fOptions, &defer); }
+            else { guard->stop(guard->fFramebuffer); guard->detach(guard->fFramebuffer); }
+            guard->release();
+        }
+        if (fStockLifetime) {
+            NVStockLifetime *guard = fStockLifetime; fStockLifetime = nullptr;
+            guard->fOwner = nullptr;
+            if (guard->fDeferred) { bool defer = false; guard->IOService::didTerminate(fStock, guard->fOptions, &defer); }
+            else { guard->stop(fStock); guard->detach(fStock); }
+            guard->release();
+        }
+        if (deferred) { bool defer = false; IOService::didTerminate(fNvrm, fTerminateOptions, &defer); }
+        else if (fAttached) { stop(fNvrm); detach(fNvrm); fAttached = false; }
+        if (fLifetimeHeld) { fLifetimeHeld = false; release(); }
+    }
+}
+void NVStockLifetime::free()
+{ if (fFramebuffer) fFramebuffer->release(); IOService::free(); }
+bool NVStockLifetime::willTerminate(IOService *provider, IOOptionBits options)
+{ if (fOwner) fOwner->beginDrain(); return IOService::willTerminate(provider, options); }
+bool NVStockLifetime::didTerminate(IOService *provider, IOOptionBits options, bool *defer)
+{
+    NVVramOwner *owner = fOwner;
+    if (owner) {
+        IOLockLock(owner->fLock);
+        fOptions = options; fDeferred = owner->fState.phase != NVOwnerPhase::Dead; *defer = fDeferred;
+        IOLockUnlock(owner->fLock);
+    }
+    return IOService::didTerminate(provider, options, defer);
+}
+bool NVVramOwner::willTerminate(IOService *provider, IOOptionBits options)
+{ beginDrain(); return IOService::willTerminate(provider, options); }
+bool NVVramOwner::didTerminate(IOService *provider, IOOptionBits options, bool *defer)
+{
+    IOLockLock(fLock);
+    fDeferred = fState.phase != NVOwnerPhase::Dead; fTerminateOptions = options; *defer = fDeferred;
+    IOLockUnlock(fLock);
+    return IOService::didTerminate(provider, options, defer);
+}
+void NVVramOwner::free()
+{
+    if (fReaper) { thread_call_free(fReaper); fReaper = nullptr; }
+    if (fStock) fStock->release();
+    if (fPci) fPci->release();
+    if (fNvrm) fNvrm->release();
+    if (fLock) IOLockFree(fLock);
+    IOService::free();
+}
+NVVramLease::~NVVramLease() { reset(); }
+void NVVramLease::reset()
+{ NVVramAllocation *a = fAllocation; fAllocation = nullptr; if (a) { a->releaseLease(fUse); a->release(); } }
+bool NVVramAllocation::acquire(NVLeaseUse use, NVVramLease *lease)
+{
+    if (!lease || lease->get()) return false;
+    IOLockLock(fOwner->fLock);
+    bool ok = fState.acquire(fOwner->fState.phase, use);
+    if (ok) { retain(); lease->fAllocation = this; lease->fUse = use; }
+    IOLockUnlock(fOwner->fLock); return ok;
+}
+void NVVramAllocation::releaseLease(NVLeaseUse use)
+{ IOLockLock(fOwner->fLock); fState.release(use); IOLockUnlock(fOwner->fLock); fOwner->scheduleReap(); }
+void NVVramAllocation::retire()
+{ IOLockLock(fOwner->fLock); fState.retire(); fOwner->fRetirementPending = true; IOLockUnlock(fOwner->fLock); fOwner->scheduleReap(); }
+bool NVVramAllocation::park()
+{ IOLockLock(fOwner->fLock); bool ok = fOwner->fState.phase == NVOwnerPhase::Active && fState.park(); IOLockUnlock(fOwner->fLock); return ok; }
+bool NVVramAllocation::unpark()
+{ IOLockLock(fOwner->fLock); bool ok = fOwner->fState.phase == NVOwnerPhase::Active && fState.unpark(); IOLockUnlock(fOwner->fLock); return ok; }
+void NVVramAllocation::free() { if (fOwner) fOwner->release(); OSObject::free(); }
+bool NVVramMemoryDescriptor::initWithAllocation(NVVramAllocation *a, uint64_t offset, uint64_t length)
+{
+    if (!a || !length || offset > a->fReceipt.actualSize || length > a->fReceipt.actualSize - offset ||
+        a->fReceipt.phys > UINT64_MAX - offset || !a->acquire(NVLeaseUse::CpuAccess, &fLease)) return false;
+    IOAddressRange range = { a->fReceipt.phys + offset, length };
+    if (!IOGeneralMemoryDescriptor::initWithOptions(&range, 1, 0, nullptr,
+            kIOMemoryTypePhysical64 | kIODirectionInOut | kIOMemoryMapperNone |
+            ((a->fCache >> kIOMapCacheShift) << 28), nullptr)) {
+        fLease.reset(); return false;
+    }
+    return true;
+}
+IOMemoryMap *NVVramMemoryDescriptor::makeMapping(IOMemoryDescriptor *owner, task_t task, IOVirtualAddress address, IOOptionBits options, IOByteCount offset, IOByteCount length)
+{
+    NVVramAllocation *a = fLease.get();
+    const IOOptionBits cache = options & kIOMapCacheMask;
+    if (!a || !a->fOwner->active() || (cache != kIOMapDefaultCache && cache != a->fCache)) {
+        if (address) ((IOMemoryMap *)address)->release();
         return nullptr;
     }
-    NVAccel *a = NVAccel::resolve(fAccel);
-    if (!a || !res) { ALOG("NVDisplayPipe::initFramebufferResource: no accelerator or no resource"); return nullptr; }
-    unsigned head = 0;
-    IOService *fb = a->pipeFramebuffer(this, &head);
-    if (!fb) {
-        ALOG("NVDisplayPipe::initFramebufferResource(index %u): pipe %p drives framebuffer %p, which is none of ours -- "
-             "refusing (never head 0's pages: that IS the bug)", index, this,
-             *(void *const volatile *)((const uint8_t *)this + 0x98));
-        return nullptr;
-    }
+    return IOGeneralMemoryDescriptor::makeMapping(owner, task, address,
+        (options & ~kIOMapCacheMask) | a->fCache, offset, length);
+}
+void NVVramMemoryDescriptor::free()
+{
+    // Release the descriptor's mapping state before allowing the allocation to retire.
+    NVVramAllocation *a = fLease.take();
+    IOGeneralMemoryDescriptor::free();
+    if (a) { a->releaseLease(NVLeaseUse::CpuAccess); a->release(); }
+}
 
-    struct NVRMVramRequest r;
-    for (unsigned i = 0; i < sizeof r; i++) ((volatile unsigned char *)&r)[i] = 0;
-    r.version = NVRM_VRAM_ABI_VERSION;
-    IOReturn ret = a->askFramebufferForScanout(&r, fb);
-    if (ret == kIOReturnSuccess && r.kva && !r.phys) {
-        const bool isNvidiaFb = fb->metaCast("NVRMNVDAFramebuffer") != nullptr;
-        if (!nm_optc_use_offscreen_fb_resource(gNmHybrid, r.kva, r.phys, isNvidiaFb ? 1 : 0)) {
-            ALOG("NVDisplayPipe::initFramebufferResource(head %u, index %u): CPU-only scanout %u x %u pitch %u (another GPU's "
-                 "panel) -- no framebuffer resource, frames are copied", head, index, r.width, r.height, r.pitch);
-            return nullptr;
-        }
-        const unsigned long long bytes = nm_optc_scanout_backing_bytes(r.actualSize, r.pitch, r.height);
-        if (!bytes) {
-            ALOG("NVDisplayPipe::initFramebufferResource(head %u, index %u): CPU-only scanout has invalid geometry %u x %u pitch %u",
-                 head, index, r.width, r.height, r.pitch);
-            return nullptr;
-        }
-        OSObject *o = a->createVidMemory(nullptr, res, bytes, nullptr);
-        NVVidMemory *m = OSDynamicCast(NVVidMemory, o);
-        if (!m) {
-            ALOG("NVDisplayPipe::initFramebufferResource: createVidMemory gave %p, not an NVVidMemory", o);
-            if (o) o->release();
-            return nullptr;
-        }
-        m->fScanout = false;
-        ALOG("NVDisplayPipe::initFramebufferResource(head %u, index %u, res %p) -> OFFSCREEN BAR1 vidmem %p (%llu bytes) for CPU scanout %u x %u pitch %u",
-             head, index, res, m, bytes, r.width, r.height, r.pitch);
-        return (IOAccelMemory *)m;
-    }
-    if (ret != kIOReturnSuccess || !r.phys || !r.actualSize) {
-        ALOG("NVDisplayPipe::initFramebufferResource: framebuffer would not describe its scanout (0x%x)", (unsigned)ret);
-        return nullptr;
-    }
+extern "C" void _ZN18IOAccelDisplayPipe28destroy_framebuffer_resourceEP16IOAccelResource2(IOAccelDisplayPipe *, IOAccelResource2 *);
+extern "C" mach_vm_address_t _ZN16IOAccelResource216lockForCPUAccessEP4task9eLockTypejbhhPi(
+    IOAccelResource2 *, task_t, unsigned int, unsigned int, bool, unsigned char, unsigned char, int *);
+extern "C" void _ZN16IOAccelResource218unlockForCPUAccessEP4task9eLockType(IOAccelResource2 *, task_t, unsigned int);
 
-    OSObject *o = a->createVidMemory(nullptr, res, r.actualSize, nullptr);
-    NVVidMemory *m = OSDynamicCast(NVVidMemory, o);
-    if (!m) {
-        ALOG("NVDisplayPipe::initFramebufferResource: createVidMemory gave %p, not an NVVidMemory", o);
-        if (o) o->release();
-        return nullptr;
+IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAccelResource2 *resource)
+{
+    (void)index;
+    NVResource *res = OSDynamicCast(NVResource, resource);
+    NVAccel *a = fAccel;
+    if (!gNvScanout || !a || a->fStopping || !res || fFramebufferResource) return nullptr;
+    IOService *fb = a->pipeFramebuffer(this, nullptr);
+    if (!fb) return nullptr;
+    uint64_t bytes = 0;
+    if (fb->metaCast("NMIntelFB")) {
+        NMIntelFramebufferInfo info = {}; info.version = NM_INTEL_FB_ABI_VERSION; info.structSize = sizeof(info);
+        const OSSymbol *s = OSSymbol::withCStringNoCopy(NM_INTEL_FB_INFO_FN);
+        IOReturn status = s ? fb->callPlatformFunction(s, false, &info, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
+        if (s) s->release();
+        bytes = (uint64_t)info.pitch * info.height;
+        if (!a->fCandidate || status != kIOReturnSuccess || info.framebufferRegistryID != fb->getRegistryEntryID() ||
+            !info.epoch || !info.width || !info.height || (uint64_t)info.width * 4 > info.pitch ||
+            !bytes || bytes > info.actualSize || info.format != NM_INTEL_FB_FORMAT_BGRA) return nullptr;
+        fFramebufferInfo = info;
+    } else {
+        NVRMVramRequest q = {}; q.version = NVRM_VRAM_ABI_VERSION;
+        if (a->askFramebufferForScanout(&q, fb) != kIOReturnSuccess) return nullptr;
+        bytes = (uint64_t)q.pitch * q.height;
+        if (!bytes || bytes > q.actualSize || !q.width || (uint64_t)q.width * 4 > q.pitch) return nullptr;
     }
-    m->fScanout = true;
-    m->fPhys    = r.phys;
-    m->fBytes   = r.actualSize;
-    *(volatile unsigned long long *)((unsigned char *)m + kNvVidMemPhysOff) = r.phys;
-    ALOG("NVDisplayPipe::initFramebufferResource(head %u, index %u, res %p) -> vidmem %p over the LIVE SCANOUT "
-         "phys 0x%llx %u x %u pitch %u (%llu bytes)",
-         head, index, res, m, (unsigned long long)r.phys, r.width, r.height, r.pitch,
-         (unsigned long long)r.actualSize);
-    return (IOAccelMemory *)m;
+    const uint64_t rounded = nm_optc_align_vram_size(bytes);
+    if (!rounded) return nullptr;
+    OSObject *object = a->createVidMemory(nullptr, res, rounded, nullptr);
+    NVVidMemory *memory = OSDynamicCast(NVVidMemory, object);
+    if (!memory) { if (object) object->release(); return nullptr; }
+    memory->fScanout = false;
+    res->fFramebufferPipe = this;
+    fFramebufferResource = res;
+    fFramebufferPhase = NVFramebufferPhase::Candidate;
+    return memory;
 }
 
 static NVVidMemory *nvres_vidmem(IOAccelResource2 *r)
@@ -1581,38 +1892,101 @@ static NVVidMemory *nvres_vidmem(IOAccelResource2 *r)
 bool NVResource::addToAperture()
 {
     NVVidMemory *m = nvres_vidmem(this);
-    if (fApLogged < 4) { fApLogged++;
-        ALOG("NVResource::addToAperture -> true (vidmem %p phys 0x%llx %llu bytes, already in BAR1)",
-             m, m ? m->fPhys : 0ull, m ? m->fBytes : 0ull); }
-    return m && m->fPhys && m->fBytes;
+    return m && m->fBacking && m->fOwner->active();
 }
-
-void NVResource::removeFromAperture() { }
-
-void *NVResource::getApertureMemoryDescriptor(unsigned long long *a0)
+void NVResource::removeFromAperture()
 {
-    if (a0) *a0 = 0;
-    if (!gNvAperture) {
-        if (fApLogged < 4) { fApLogged++;
-            ALOG("NVResource::getApertureMemoryDescriptor: aperture gate CLOSED -- returning nullptr "
-                 "(sysctl debug.nvaccelfb=4 opens it)"); }
-        return nullptr;
-    }
-    if (fApDesc) return fApDesc;
+    if (fApDesc) { fApDesc->release(); fApDesc = nullptr; }
+    fApertureKey = {};
+}
+void *NVResource::getApertureMemoryDescriptor(unsigned long long *offset)
+{
+    if (offset) *offset = 0;
     NVVidMemory *m = nvres_vidmem(this);
-    if (!m || !m->fPhys || !m->fBytes) {
-        if (fApLogged < 8) { fApLogged++;
-            ALOG("NVResource::getApertureMemoryDescriptor: no BAR1-backed vidmem at +0x88 (mem %p)", m); }
-        return nullptr;
+    if ((!gNvAperture && !fFramebufferPipe) || !m || !m->fBacking || !m->fOwner->active()) return nullptr;
+    const NVBackingKey key = m->fBacking->key();
+    if (fApDesc && !nvBackingKeyEqual(fApertureKey, key)) removeFromAperture();
+    if (!fApDesc) {
+        NVVramMemoryDescriptor *descriptor = OSTypeAlloc(NVVramMemoryDescriptor);
+        if (!descriptor || !descriptor->initWithAllocation(m->fBacking, 0, m->capacity())) {
+            if (descriptor) descriptor->release();
+            return nullptr;
+        }
+        fApDesc = descriptor; fApertureKey = key;
     }
-    IODeviceMemory *d = IODeviceMemory::withRange((IOPhysicalAddress)m->fPhys, (IOPhysicalLength)m->fBytes);
-    if (!d) { ALOG("NVResource::getApertureMemoryDescriptor: IODeviceMemory::withRange(0x%llx, %llu) FAILED",
-                   m->fPhys, m->fBytes); return nullptr; }
-    fApDesc = d;
-    if (fApLogged < 8) { fApLogged++;
-        ALOG("NVResource::getApertureMemoryDescriptor -> %p over BAR1 phys 0x%llx (%llu bytes), offset 0",
-             d, m->fPhys, m->fBytes); }
     return fApDesc;
+}
+bool NVResource::prepare()
+{
+    NVVramOwner *owner = fAccel ? fAccel->fOwner : nullptr;
+    const bool admitted = owner && owner->enter();
+    struct Operation { NVVramOwner *owner; ~Operation() { if (owner) owner->leave(); } } operation = { admitted ? owner : nullptr };
+    NVDisplayPipe *pipe = fFramebufferPipe;
+    if (!pipe) return admitted && IOAccelResource2::prepare();
+    const bool initial = pipe->fFramebufferPhase == NVFramebufferPhase::Candidate && !fSuccessfulPrepares;
+    const bool prepared = admitted && fSuccessfulPrepares != UINT32_MAX && IOAccelResource2::prepare();
+    if (prepared) ++fSuccessfulPrepares;
+    if (!initial) return prepared;
+    if (prepared) {
+        fFramebufferMemory = nvres_vidmem(this);
+        if (fFramebufferMemory) {
+            fFramebufferMemory->retain();
+            fMemoryPinned = fFramebufferMemory->prepare();
+            if (fMemoryPinned && fFramebufferMemory->fBacking &&
+                (!pipe->fFramebufferInfo.actualSize ||
+                 (uint64_t)pipe->fFramebufferInfo.pitch * pipe->fFramebufferInfo.height <= fFramebufferMemory->capacity()) &&
+                getApertureMemoryDescriptor(nullptr)) {
+                pipe->fFramebufferPhase = NVFramebufferPhase::Ready;
+                return true;
+            }
+        }
+    }
+    // 25G342 adopts memory before prepare, but does not unwind a failed prepare.
+    // Suppress exactly the native destructor's unmatched completion, and nothing else.
+    fAbortWithoutPrepare = !prepared;
+    _ZN18IOAccelDisplayPipe28destroy_framebuffer_resourceEP16IOAccelResource2(pipe, this);
+    fAbortWithoutPrepare = false;
+    return false;
+}
+void NVResource::complete()
+{
+    if (fAbortWithoutPrepare) return;
+    IOAccelResource2::complete();
+    if (fSuccessfulPrepares) --fSuccessfulPrepares;
+}
+void NVResource::releaseFramebufferBacking()
+{
+    removeFromAperture();
+    if (fFramebufferMemory) {
+        if (fMemoryPinned) fFramebufferMemory->complete();
+        fMemoryPinned = false;
+        fFramebufferMemory->release(); fFramebufferMemory = nullptr;
+    }
+    fCpuPublication = 0; fCpuPublicationKey = {};
+    fFramebufferPipe = nullptr;
+}
+void NVDisplayPipe::destroyFramebufferResource(unsigned int index, IOAccelResource2 *resource)
+{
+    (void)index;
+    NVResource *res = OSDynamicCast(NVResource, resource);
+    if (res) res->releaseFramebufferBacking();
+    if (resource == fFramebufferResource) {
+        fFramebufferResource = nullptr; fFramebufferInfo = {};
+        fFramebufferPhase = NVFramebufferPhase::Empty;
+    }
+}
+void NVDisplayPipe::displayModeWillChange()
+{
+    fFramebufferPhase = NVFramebufferPhase::Retiring;
+    nvAccelDrainPipe(this);
+    if (fTransactionLock) { IOLockLock(fTransactionLock); fTransaction.begin(nullptr, 0, 0, 0); IOLockUnlock(fTransactionLock); }
+    IOAccelLegacyDisplayPipe::displayModeWillChange();
+    if (fFramebufferResource) {
+        NVResource *res = fFramebufferResource;
+        if (res->fSuccessfulPrepares)
+            _ZN18IOAccelDisplayPipe28destroy_framebuffer_resourceEP16IOAccelResource2(this, res);
+        else destroyFramebufferResource(0, res);
+    }
 }
 
 static void nvSVForgetResource(NVResource *resource);
@@ -1620,7 +1994,8 @@ static void nvSVForgetResource(NVResource *resource);
 void NVResource::free()
 {
     nvSVForgetResource(this);
-    if (fApDesc) { fApDesc->release(); fApDesc = nullptr; }
+    if (fFramebufferPipe) fFramebufferPipe->destroyFramebufferResource(0, this);
+    else releaseFramebufferBacking();
     OSAddAtomic64(1, &gCntResFree);
     IOAccelResource2::free();
 }
@@ -1629,115 +2004,58 @@ void NVResource::free()
 static int gVmSticky = 1;
 static SInt64 gCntVmParked, gCntVmUnparked, gCntVmParkReleased;
 
+bool NVVidMemory::bindOwner(NVVramOwner *owner)
+{
+    if (fOwner || !owner || !owner->borrow()) return false;
+    fOwner = owner; return true;
+}
 bool NVVidMemory::allocPhysical()
 {
-    if (fScanout) {
-        if (!fPhys || !fBytes) { ALOG("NVVidMemory::allocPhysical(%p): scanout with no address", this); return false; }
-        *(volatile unsigned long long *)((unsigned char *)this + kNvVidMemPhysOff) = fPhys;
-        ALOG("NVVidMemory::allocPhysical(%p): SCANOUT phys 0x%llx (%llu bytes) -- already backed, nothing allocated",
-             this, fPhys, fBytes);
-        return true;
+    if (fDestroying || !fOwner || !fOwner->active() || fBacking) return false;
+    const uint64_t want = getLength();
+    if (!want) return false;
+    if (fParked && fParked->fReceipt.actualSize >= want && fParked->unpark()) {
+        fBacking = fParked; fParked = nullptr; OSAddAtomic64(1, &gCntVmUnparked);
+    } else {
+        releaseParked();
+        fBacking = fOwner->allocate(want);
+        if (!fBacking) { OSAddAtomic64(1, &gCntVmRefused); return false; }
+        OSAddAtomic64(1, &gCntVmAlloc); OSAddAtomic64((SInt64)capacity(), &gCntVmAllocBytes);
     }
-    if (fRmHandle) {
-        ALOG("NVVidMemory::allocPhysical(%p): already backed by 0x%llx (%llu bytes) -- false, as AMD's does",
-             this, fPhys, fBytes);
-        return false;
-    }
-    const unsigned long long want = *(const volatile unsigned long long *)((const unsigned char *)this + 0x40);
-    if (!want) { ALOG("NVVidMemory::allocPhysical(%p): length at +0x40 is 0 -- nothing to back", this); return false; }
-    NVAccel *const owner = NVAccel::resolve(fAccel);
-    if (!owner) { ALOG("NVVidMemory::allocPhysical(%p): no accelerator", this); return false; }
-    if (fParkHandle) {
-        if (fParkBytes >= want) {
-            fRmHandle = fParkHandle; fKva = fParkKva; fPhys = fParkPhys; fBytes = fParkBytes; fAllocationCookie = fParkCookie;
-            fParkHandle = nullptr; fParkKva = nullptr; fParkPhys = fParkBytes = fParkCookie = 0;
-            *(volatile unsigned long long *)((unsigned char *)this + kNvVidMemPhysOff) = fPhys;
-            OSAddAtomic64(1, &gCntVmUnparked);
-            return true;
-        }
-        releaseParked();   // the resource grew: its old VRAM cannot hold it
-    }
-
-    struct NVRMVramRequest r;
-    for (unsigned i = 0; i < sizeof r; i++) ((volatile unsigned char *)&r)[i] = 0;
-    r.version = NVRM_VRAM_ABI_VERSION;
-    r.size    = want;
-    IOReturn ret = owner->askFramebufferForVram(&r, true);
-    if (ret != kIOReturnSuccess || !r.handle || !r.phys) {
-        // A full BAR1 window refuses every frame (~100/s on a 256 MB BAR1, a third of everything the machine logs:
-        // #387). Same throttle as the framebuffer's nvAllocVram: the first eight, then every 256th with the count;
-        // debug.nvaccel_vm_refused keeps the exact total.
-        const SInt64 nRefused = OSAddAtomic64(1, &gCntVmRefused) + 1;
-        if (nRefused <= 8 || (nRefused & 255) == 0)
-            ALOG("NVVidMemory::allocPhysical(%p): %llu bytes REFUSED by the framebuffer (0x%x, #%lld)",
-                 this, want, (unsigned)ret, (long long)nRefused);
-        // once per boot: how much of the window this side holds as sticky parks (kept across the family's dealloc)
-        static volatile SInt32 said = 0;
-        if (OSCompareAndSwap(0, 1, &said))
-            ALOG("VRAM refused: %lld allocs (%lld bytes), %lld deallocs (%lld bytes), %lld parked now",
-                 (long long)gCntVmAlloc, (long long)gCntVmAllocBytes, (long long)gCntVmDealloc, (long long)gCntVmDeallocBytes,
-                 (long long)(gCntVmParked - gCntVmUnparked - gCntVmParkReleased));
-        return false;
-    }
-    fRmHandle = r.handle; fKva = r.kva; fPhys = r.phys; fBytes = r.actualSize; fAllocationCookie = r.allocationCookie;
-    OSAddAtomic64(1, &gCntVmAlloc); OSAddAtomic64((SInt64)fBytes, &gCntVmAllocBytes);
-    *(volatile unsigned long long *)((unsigned char *)this + kNvVidMemPhysOff) = fPhys;
-    ALOGV("NVVidMemory::allocPhysical(%p): %llu bytes of REAL VRAM -- phys 0x%llx kva %p [BAR1 %llu]",
-         this, fBytes, fPhys, fKva, r.mappedTotal);
+    *(volatile unsigned long long *)((unsigned char *)this + kNvVidMemPhysOff) = physical();
     return true;
 }
-
 void NVVidMemory::deallocPhysical()
 {
-    if (fScanout) {
-        ALOG("NVVidMemory::deallocPhysical(%p): SCANOUT -- not ours to free, only forgetting it", this);
-        fPhys = 0; fBytes = 0; fScanout = false;
-        *(volatile unsigned long long *)((unsigned char *)this + kNvVidMemPhysOff) = 0;
-        return;
-    }
-    if (!fRmHandle) return;
-    OSAddAtomic64(1, &gCntVmDealloc); OSAddAtomic64((SInt64)fBytes, &gCntVmDeallocBytes);
-    // The family frees a surface's VRAM after copying it back for the CPU, and backs the surface with new VRAM when the
-    // GPU needs it again. The Metal plugin imported the old VRAM once and keeps drawing into it, so from then on the
-    // display and every copy-back read new, never-written VRAM: black frames, and windows black until a drag made
-    // WindowServer import the surface again. Parked instead, this VRAM is what the next allocPhysical hands back, so the
-    // surface keeps the memory the plugin draws into. It is released when the resource goes away or outgrows it.
-    if (gVmSticky) {
-        releaseParked();
-        fParkHandle = fRmHandle; fParkKva = fKva; fParkPhys = fPhys; fParkBytes = fBytes; fParkCookie = fAllocationCookie;
-        OSAddAtomic64(1, &gCntVmParked);
-    } else {
-        releaseVram(fRmHandle, fKva, fBytes, fAllocationCookie);
-    }
-    fRmHandle = nullptr; fKva = nullptr; fPhys = 0; fBytes = 0; fAllocationCookie = 0;
+    if (!fBacking) return;
+    NVVramAllocation *old = fBacking; fBacking = nullptr;
+    OSAddAtomic64(1, &gCntVmDealloc); OSAddAtomic64((SInt64)old->fReceipt.actualSize, &gCntVmDeallocBytes);
+    if (!fDestroying && gVmSticky && old->park()) {
+        releaseParked(); fParked = old; OSAddAtomic64(1, &gCntVmParked);
+    } else { old->retire(); old->release(); }
     *(volatile unsigned long long *)((unsigned char *)this + kNvVidMemPhysOff) = 0;
 }
-
-void NVVidMemory::releaseVram(void *handle, void *kva, unsigned long long bytes, unsigned long long cookie)
-{
-    struct NVRMVramRequest r;
-    for (unsigned i = 0; i < sizeof r; i++) ((volatile unsigned char *)&r)[i] = 0;
-    r.version = NVRM_VRAM_ABI_VERSION;
-    r.handle = handle; r.kva = kva; r.actualSize = bytes; r.allocationCookie = cookie;
-    if (NVAccel *owner = NVAccel::resolve(fAccel)) owner->askFramebufferForVram(&r, false);
-}
-
 void NVVidMemory::releaseParked()
 {
-    if (!fParkHandle) return;
-    releaseVram(fParkHandle, fParkKva, fParkBytes, fParkCookie);
-    fParkHandle = nullptr; fParkKva = nullptr; fParkPhys = fParkBytes = fParkCookie = 0;
+    if (!fParked) return;
+    fParked->retire(); fParked->release(); fParked = nullptr;
     OSAddAtomic64(1, &gCntVmParkReleased);
 }
-
+uint64_t NVVidMemory::getPhysicalSegment(unsigned long long offset, unsigned long long *length)
+{
+    const uint64_t bytes = capacity();
+    if (!fOwner || !fOwner->active() || !physical() || offset >= bytes) { if (length) *length = 0; return 0; }
+    if (length) *length = bytes - offset;
+    return physical() + offset;
+}
 void NVVidMemory::free()
 {
-    if (fRmHandle && !fScanout) {
-        releaseVram(fRmHandle, fKva, fBytes, fAllocationCookie);
-        fRmHandle = nullptr; fKva = nullptr; fPhys = 0; fBytes = 0; fAllocationCookie = 0;
-    }
+    fDestroying = true;
     releaseParked();
+    NVVramOwner *owner = fOwner;
+    // The family unwires first and calls our deallocPhysical; it owns the live accounting.
     IOAccelVidMemory::free();
+    if (owner) owner->unborrow();
 }
 
 #if defined(NM_ERA) && NM_ERA < 1015
@@ -1770,9 +2088,9 @@ class IOAccelDisplayPipeTransaction2 {
 public:
     IOSurface *getPlaneIOSurface(unsigned int, unsigned int) const;
     OSObject  *getPlaneResource(unsigned int, unsigned int) const;
+    unsigned int getTransactionID() const;
 };
 
-static int    gNvIop = 0;
 static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
 static SInt64 gCntIopOkHead[kNvMaxFB];
 static SInt64 gCntIop30, gCntIopHalf;       // frames written to a 30-bit scanout; frames converted from half-float RGhA
@@ -1796,7 +2114,10 @@ void NVDisplayPipe::iopDropSources()
 
 void NVDisplayPipe::free()
 {
+    if (fFramebufferResource) displayModeWillChange();
     iopDropSources();
+    IOLock *lock = fTransactionLock; fTransactionLock = nullptr;
+    if (lock) IOLockFree(lock);
     IOAccelLegacyDisplayPipe::free();
 }
 
@@ -1818,167 +2139,328 @@ const void *NVDisplayPipe::iopMapSurface(unsigned id, IOMemoryDescriptor *md, un
     return (const void *)m->getVirtualAddress();
 }
 
-IOReturn NVDisplayPipe::validateTransaction(IOAccelDisplayPipeTransaction2 *)
+IOReturn NVDisplayPipe::validateTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
+    if (!txn) return kIOReturnBadArgument;
+    // 25G342 prepare@0x4af8a traverses exactly two planes, each with two images.
+    for (unsigned plane = 0; plane < 2; ++plane)
+        for (unsigned image = 0; image < 2; ++image)
+            if ((plane || image) && (txn->getPlaneIOSurface(plane, image) || txn->getPlaneResource(plane, image)))
+                return kIOReturnUnsupported;
+    IOSurface *s = txn->getPlaneIOSurface(0, 0);
+    if (s) {
+        const unsigned fmt = s->getPixelFormat();
+        if (fmt != NV_IOP_FMT_BGRA && fmt != NV_IOP_FMT_L10R && fmt != NV_IOP_FMT_RGHA) return kIOReturnUnsupported;
+        const uint64_t w = s->getWidth(), h = s->getHeight(), pitch = s->getBytesPerRow();
+        if (!w || !h || w > UINT32_MAX || h > UINT32_MAX || pitch > UINT32_MAX ||
+            pitch < w * NV_IOP_BYTES_PER_PIXEL(fmt) || (pitch & 3u)) return kIOReturnBadArgument;
+    } else if (OSObject *object = txn->getPlaneResource(0, 0)) {
+        if (!fAccel) return kIOReturnNotReady;
+        const bool owned = fAccel->familyOwned();
+        if (!owned && !nvFamLock(fAccel, true)) return kIOReturnNotReady;
+        NVResource *r = OSDynamicCast(NVResource, object);
+        NVVidMemory *m = r ? nvres_vidmem(r) : nullptr;
+        const bool published = r && m && m->fBacking && r->fCpuPublication && nvResPitch((const unsigned char *)r) <= UINT32_MAX &&
+            nvBackingKeyEqual(r->fCpuPublicationKey, m->fBacking->key());
+        if (!owned) nvFamUnlock(fAccel);
+        if (!published) return kIOReturnUnsupported;
+    }
     return kIOReturnSuccess;
 }
-
-static bool nvAccelIopAsyncBusy(const void *pipe);
-bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
+bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *txn)
 {
-    return gNvIop != 0 && !nvAccelIopAsyncBusy(this);
+    if (!txn || !fTransactionLock) return false;
+    IOLockLock(fTransactionLock);
+    bool complete = fTransaction.matches(txn, txn->getTransactionID());
+    IOLockUnlock(fTransactionLock);
+    return complete;
+}
+void NVDisplayPipe::finishTransaction(const NVTransactionState &submitted, IOReturn result)
+{
+    if (!fTransactionLock) return;
+    IOLockLock(fTransactionLock);
+    fTransaction.finish(submitted.transaction, submitted.sequence, submitted.epoch, submitted.key, (int)result, true);
+    IOLockUnlock(fTransactionLock);
 }
 
-static void nvAccelSurfScanoutSync(IOSurface *s);
 static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head);
 static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
 static bool nvSurfWaitReady(unsigned int id);
-static bool nvAccelHybridImport(IOService *fb, unsigned head, IOSurface *s, NVVidMemory *vram);
+static bool nvAccelHybridImport(IOService *fb, unsigned head, IOSurface *s, NVVramAllocation *vram);
 static bool nvAccelHybridDma(NVDisplayPipe *pipe, IOService *fb, unsigned head, IOSurface *s);
 static bool nvAccelHybridOwned(IOService *fb, unsigned head, const volatile unsigned int *src, unsigned w, unsigned h, unsigned pitch, bool from10, unsigned dpitch);
 static bool nvSVPend(unsigned id, int op, NVResource *resource);
 static bool nvAccelFlatHeld(NVDisplayPipe *pipe, unsigned head, IOSurface *s);
-static struct nmh_shadow *nvAccelHybridShadow(unsigned head, unsigned w, unsigned h);
-static void nvAccelHybridHome(IOService *fb, unsigned head);
-static void nvAccelIopHome(IOService *fb, unsigned head);
-IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+static bool nvAccelHybridHome(IOService *fb, unsigned head);
+static bool nvAccelIopHome(IOService *fb, unsigned head);
+struct NVLegacyCopy {
+    nv_frame_span source, destination;
+    bool dst30, deviceSink;
+    NVVramOwner *owner;
+};
+static IOReturn nvLegacyCopyBody(void *context)
 {
-    if (!gNvIop) return (IOReturn)0xe00002c7;
-    if (!txn) NVIOP_FAIL(kIOReturnBadArgument, "performTransaction(NULL)");
-    NVAccel *a = NVAccel::resolve(fAccel);
+    NVLegacyCopy *c = (NVLegacyCopy *)context;
+    if (c->deviceSink) {
+        NVRMKernelMapInfo q = { NVRM_OWNER_ABI_VERSION, sizeof(q), c->destination.address,
+            (uint64_t)c->destination.pitch * c->destination.height, 0, 0, 0, 0 };
+        if (c->owner->call(NVRM_KERNEL_MAP_INFO_FN, &q) != kIOReturnSuccess ||
+            q.availableBytes < c->destination.capacity ||
+            (q.cacheOptions != kIOMapInhibitCache && q.cacheOptions != kIOMapWriteCombineCache)) return kIOReturnVMError;
+    }
+    if (nv_frame_validate(&c->source) != NV_FRAME_OK || nv_frame_validate(&c->destination) != NV_FRAME_OK ||
+        c->source.width != c->destination.width || c->source.height != c->destination.height) return kIOReturnOverrun;
+    for (unsigned y = 0; y < c->source.height; ++y)
+        (void)nv_iop_convert_row((volatile unsigned *)((unsigned char *)(uintptr_t)c->destination.address + (size_t)y * c->destination.pitch),
+            (const volatile unsigned *)((const unsigned char *)c->source.address + (size_t)y * c->source.pitch),
+            c->source.width, c->source.format, c->dst30 ? 1 : 0);
+    nv_frame_store_drain();
+    return kIOReturnSuccess;
+}
+IOReturn NVDisplayPipe::performLegacyTransaction(IOAccelDisplayPipeTransaction2 *txn)
+{
+    NVAccel *a = fAccel;
     unsigned head = 0;
     IOService *fb = a ? a->pipeFramebuffer(this, &head) : nullptr;
-    if (!fb) NVIOP_FAIL(kIOReturnNotAttached, "no accelerator, or pipe %p drives a framebuffer that is none of ours", this);
-
-    IOSurface *s  = txn->getPlaneIOSurface(0, 0);
-    OSObject  *ro = txn->getPlaneResource(0, 0);
-    if (!s && !ro) { OSAddAtomic64(1, &gCntIopEmpty); return kIOReturnSuccess; }
-
-    const volatile unsigned int *src = nullptr; unsigned w = 0, h = 0, pitch = 0; bool fromRes = false, from10 = false;
-    unsigned srcFmt = NV_IOP_FMT_BGRA;   // the pixel layout of what is copied (nv_iop_pixel.h)
-    NVResource *res = OSDynamicCast(NVResource, ro);
-    NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
-    static SInt32 gIopK6Logs;
-    if (gIopK6Logs < 6) {
-        OSIncrementAtomic(&gIopK6Logs);
-        const unsigned char *kr = (const unsigned char *)res;
-        ALOG("iop: K6 plane 0: surface %s id 0x%x %ux%u row %u fmt 0x%08x | resource %s w %u h %u +0xb8 %u +0xc0 %u vidmem %llu bytes kva %d scanout %d",
-             s ? "yes" : "NO", s ? (unsigned)s->getSurfaceID() : 0u, s ? (unsigned)s->getWidth() : 0u, s ? (unsigned)s->getHeight() : 0u,
-             s ? (unsigned)s->getBytesPerRow() : 0u, s ? (unsigned)s->getPixelFormat() : 0u,
-             ro ? ro->getMetaClass()->getClassName() : "(none)",
-             res ? (unsigned)*(const volatile unsigned short *)(kr + 0xb0) : 0u, res ? (unsigned)*(const volatile unsigned short *)(kr + 0xb2) : 0u,
-             res ? *(const volatile unsigned int *)(kr + 0xb8) : 0u, res ? *(const volatile unsigned int *)(kr + 0xc0) : 0u,
-             vm ? (unsigned long long)vm->fBytes : 0ull, (vm && vm->fKva) ? 1 : 0, vm ? (int)vm->fScanout : -1);
+    IOSurface *s = txn ? txn->getPlaneIOSurface(0, 0) : nullptr;
+    if (!a || !fb || !s || fb->metaCast("NMIntelFB")) return kIOReturnUnsupported;
+    if (a->fOwner->scanoutRetiring(head)) return kIOReturnNotReady;
+    if (!nvSurfWaitReady(s->getSurfaceID())) return kIOReturnTimeout;
+    if (gNmFlatSkip && head < 5 && fb->metaCast("NVRMNVDAFramebuffer") && nvAccelFlatHeld(this, head, s)) {
+        OSAddAtomic64(1, &gCntFlatHeld); return kIOReturnNotReady;
     }
-    if (!s && vm && vm->fKva) {
-        const unsigned char *rr = (const unsigned char *)res;
-        w     = *(const volatile unsigned short *)(rr + 0xb0);
-        h     = *(const volatile unsigned short *)(rr + 0xb2);
-        pitch = *(const volatile unsigned int   *)(rr + 0xb8);
-        if ((unsigned long long)pitch < 4ull * w) NVIOP_FAIL(kIOReturnBadArgument, "resource %ux%u: +0xb8 reads %u, which is not a row pitch (need >= %u) — not a surface buffer", w, h, pitch, 4u * w);
-        if ((unsigned long long)h * pitch > vm->fBytes) NVIOP_FAIL(kIOReturnOverrun, "resource %ux%u pitch %u exceeds its %llu bytes", w, h, pitch, (unsigned long long)vm->fBytes);
-        src = (const volatile unsigned int *)vm->fKva; fromRes = true;
-    } else if (s && gNmFlatSkip && head < 5 && fb->metaCast("NVRMNVDAFramebuffer") && nvAccelFlatHeld(this, head, s)) {
-        // a frame of one flat colour, held back: the previous picture stays (nmflatskip)
-        OSAddAtomic64(1, &gCntFlatHeld);
+    if (nvAccelIopFlip(fb, head, s, this)) {
+        IOLockLock(fTransactionLock); bool queued = fTransaction.queued; IOLockUnlock(fTransactionLock);
+        if (!queued) { OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]); }
         return kIOReturnSuccess;
-    } else if (s && nvAccelIopFlip(fb, head, s, this)) {
-        OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
-        return kIOReturnSuccess;
-    } else if (s && gNmHybrid >= NMH_DMA && nvAccelHybridDma(this, fb, head, s)) {
-        // the copy engine wrote the frame into a buffer the panel driver owns, and the plane was flipped to it (nmhybrid=4)
-        OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
-        return kIOReturnSuccess;
-    } else if (s && gNmHybrid >= NMH_IMPORT && nvAccelHybridImport(fb, head, s, gNmHybridP2P ? vm : nullptr)) {
-        OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
-        return kIOReturnSuccess;
-    } else if (s) {
-        // A copied frame must come from the surface's newest pixels. Copying while they were still only in VRAM put a
-        // stale, one-colour buffer on the panel every other frame: full-screen flicker, 5 of 40 flicker recordings
-        // (1.13-1.14.1), nvaccel_iop_blank about half of every copied frame, never on machines whose frames all flip.
-        // Such a frame now keeps the previous picture on the panel instead.
-        nvSurfWaitReady(s->getSurfaceID());   // a copied frame is read here, so its GPU work must be done first
-        if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
-        const unsigned fmt = s->getPixelFormat();
-        from10 = (fmt == NV_IOP_FMT_L10R);   // nv_iop_pixel.h: narrowed to the 8-bit scanout (or swapped into a 30-bit one) while copying
-        if (fmt != NV_IOP_FMT_BGRA && !from10 && fmt != NV_IOP_FMT_RGHA) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA, l10r or RGhA", s->getSurfaceID(), fmt);
-        srcFmt = fmt;
-        const unsigned long long bpp = NV_IOP_BYTES_PER_PIXEL(fmt);
-        const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
-        if (!W || !H || P < 4 || W > 16384 || H > 16384 || P > 16384ull * 8) NVIOP_FAIL(kIOReturnBadArgument, "surface geometry %llux%llu pitch %llu", W, H, P);
-        if (P < bpp * W || (P & 3)) NVIOP_FAIL(kIOReturnBadArgument, "surface %llux%llu: row pitch %llu is under %llu*W or not word-aligned", W, H, P, bpp);
-        IOMemoryDescriptor *md = s->getMemoryDescriptor();
-        if (!md) NVIOP_FAIL(kIOReturnNoMemory, "surface 0x%x has no memory descriptor", s->getSurfaceID());
-        src = (const volatile unsigned int *)iopMapSurface(s->getSurfaceID(), md, H * P);
-        if (!src) NVIOP_FAIL(kIOReturnVMError, "surface 0x%x would not prepare/map %llu bytes", s->getSurfaceID(), H * P);
-        w = (unsigned)W; h = (unsigned)H; pitch = (unsigned)P;
+    }
+    if (gNmHybrid >= NMH_DMA && nvAccelHybridDma(this, fb, head, s)) {
+        OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]); return kIOReturnSuccess;
+    }
+    NVVramLease sourceAllocation;
+    if (gNmHybridP2P && nvFamLock(a, true)) {
+        NVResource *r = OSDynamicCast(NVResource, txn->getPlaneResource(0, 0));
+        NVVidMemory *m = r ? nvres_vidmem(r) : nullptr;
+        if (m && m->fBacking) m->fBacking->acquire(NVLeaseUse::Present, &sourceAllocation);
+        nvFamUnlock(a);
+    }
+    if (gNmHybrid >= NMH_IMPORT && nvAccelHybridImport(fb, head, s, sourceAllocation.get())) {
+        OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]); return kIOReturnSuccess;
+    }
+    if (!nvAccelSurfCopyReady(s, head)) return kIOReturnNotReady;
+    IOMemoryDescriptor *md = s->getMemoryDescriptor();
+    const uint64_t w = s->getWidth(), h = s->getHeight(), pitch = s->getBytesPerRow();
+    if (!md || !w || !h || w > UINT32_MAX || h > UINT32_MAX || pitch > UINT32_MAX) return kIOReturnBadArgument;
+    nv_frame_span source = { iopMapSurface(s->getSurfaceID(), md, h * pitch), md->getLength(),
+        (uint32_t)w, (uint32_t)h, (uint32_t)pitch, s->getPixelFormat() };
+    if (nv_frame_validate(&source) != NV_FRAME_OK) return kIOReturnOverrun;
+    NVRMVramRequest q = {}; q.version = NVRM_VRAM_ABI_VERSION;
+    if (a->askFramebufferForScanout(&q, fb) != kIOReturnSuccess) return kIOReturnNotReady;
+    NVLegacyCopy copy = { source, { q.kva, q.actualSize, q.width, q.height, q.pitch, NV_IOP_FMT_BGRA },
+        (q.flags & NVRM_VRAM_SCANOUT_30BIT) != 0, fb->metaCast("NVRMNVDAFramebuffer") != nullptr, a->fOwner };
+    if (nv_frame_validate(&copy.destination) != NV_FRAME_OK || q.width != w || q.height != h) return kIOReturnOverrun;
+    if (!nvAccelIopHome(fb, head)) return kIOReturnNotReady;
+    IOReturn result;
+    if (gNmHybrid >= NMH_OWNED && !q.phys && !copy.dst30 &&
+        (source.format == NV_IOP_FMT_BGRA || source.format == NV_IOP_FMT_L10R) &&
+        nvAccelHybridOwned(fb, head, (const volatile unsigned *)source.address, source.width, source.height,
+            source.pitch, source.format == NV_IOP_FMT_L10R, q.pitch)) {
+        OSAddAtomic64(1, &gCntHyOwned); result = kIOReturnSuccess;
     } else {
-        NVIOP_FAIL(kIOReturnUnsupported, "plane resource %p is not an NVResource with a CPU mapping, and there is no IOSurface", ro);
+        if (!fb->metaCast("NVRMNVDAFramebuffer") && !nvAccelHybridHome(fb, head)) return kIOReturnNotReady;
+        result = a->fOwner->cpuAccess(nvLegacyCopyBody, &copy);
     }
-    if (!w || !h || pitch < 4) NVIOP_FAIL(kIOReturnBadArgument, "source geometry %ux%u pitch %u", w, h, pitch);
+    if (result == kIOReturnSuccess) {
+        OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
+        if (copy.dst30) OSAddAtomic64(1, &gCntIop30);
+        if (source.format == NV_IOP_FMT_L10R) OSAddAtomic64(1, &gCntIopL10r);
+        if (source.format == NV_IOP_FMT_RGHA) OSAddAtomic64(1, &gCntIopHalf);
+    }
+    return result;
+}
 
-    struct NVRMVramRequest q;
-    for (unsigned i = 0; i < sizeof q; i++) ((volatile unsigned char *)&q)[i] = 0;
-    q.version = NVRM_VRAM_ABI_VERSION;
-    IOReturn ret = a->askFramebufferForScanout(&q, fb);
-    if (ret != kIOReturnSuccess || !q.kva || q.pitch < 4 || !q.height) NVIOP_FAIL(kIOReturnNotReady, "framebuffer would not describe its scanout (0x%x kva %p pitch %u)", (unsigned)ret, q.kva, q.pitch);
-    if (w != q.width || h != q.height) NVIOP_FAIL(kIOReturnBadArgument, "source %ux%u is not the scanout's %ux%u", w, h, q.width, q.height);
-
-    nvAccelIopHome(fb, head);
-    // The framebuffer says in the reply when its scanout is 30-bit (X2B10G10R10): a 10-bit mode set (NVRM_VRAM_SCANOUT_30BIT).
-    const int dst30 = (q.flags & NVRM_VRAM_SCANOUT_30BIT) != 0;
-    const unsigned bppSrc = NV_IOP_BYTES_PER_PIXEL(srcFmt);
-    if (q.pitch < 4u * w) NVIOP_FAIL(kIOReturnBadArgument, "scanout pitch %u is under 4*%u", q.pitch, w);
-    const unsigned spr = pitch / 4, dpr = q.pitch / 4;
-    volatile unsigned int *d = (volatile unsigned int *)q.kva;
-    // the hybrid copy takes 8-bit BGRA and l10r into an 8-bit panel; HDR sources (half float) or a 30-bit scanout use the
-    // general converter below
-    bool ownedDone = false;
-    if (gNmHybrid >= NMH_OWNED && !q.phys && !fb->metaCast("NVRMNVDAFramebuffer") && !dst30
-        && (srcFmt == NV_IOP_FMT_BGRA || srcFmt == NV_IOP_FMT_L10R))
-        ownedDone = nvAccelHybridOwned(fb, head, src, w, h, pitch, from10, q.pitch);
-    if (ownedDone) {
-        OSAddAtomic64(1, &gCntHyOwned);
-    } else if (gNmHybrid >= NMH_COPY && !q.phys && !fb->metaCast("NVRMNVDAFramebuffer") && !dst30
-        && (srcFmt == NV_IOP_FMT_BGRA || srcFmt == NV_IOP_FMT_L10R)) {
-        // another GPU's panel (nm_hybrid.h): store only the pixels that changed since the previous frame
-        struct nmh_shadow *sh = nvAccelHybridShadow(head, w, h);
-        nvAccelHybridHome(fb, head);
-        struct nmh_stats st;
-        if (nmh_present(sh, src, w, h, pitch, from10 ? 1 : 0, d, q.pitch, &st))
-            NVIOP_FAIL(kIOReturnBadArgument, "hybrid: source %ux%u pitch %u cannot be presented to a scanout of pitch %u", w, h, pitch, q.pitch);
-        const SInt64 nf = OSAddAtomic64(1, &gCntHyFrames);
-        OSAddAtomic64(st.words, &gCntHyWords);
-        OSAddAtomic64((SInt64)(w < spr ? w : spr) * h - st.words, &gCntHyWordsSkipped);
-        if (nf == 0) ALOG("hybrid: first frame presented by copy (%u rows, %u pixels, head %u)", st.rows, st.words, head);
+static SInt64 gCntPresentProducer, gCntPresentPublication, gCntPresentBounds, gCntPresentEpoch, gCntPresentCopy;
+struct NVFinalTransfer {
+    NVDisplayPipe *pipe;
+    IOService *framebuffer;
+    NVResource *resource;
+    NVVramAllocation *allocation;
+    nv_frame_span source;
+    uint64_t sequence;
+};
+static IOReturn nvPopulateAndPresentFinal(void *context)
+{
+    NVFinalTransfer *x = (NVFinalTransfer *)context;
+    const uint32_t cache = x->allocation->fCache;
+    if (cache != kIOMapInhibitCache && cache != kIOMapWriteCombineCache) return kIOReturnUnsupported;
+    int error = 0;
+    const unsigned mapOptions = cache == kIOMapWriteCombineCache ? 0x401u : 0x101u;
+    mach_vm_address_t address = _ZN16IOAccelResource216lockForCPUAccessEP4task9eLockTypejbhhPi(
+        x->resource, kernel_task, 2, mapOptions, false, 0, 0, &error);
+    if (!address) return kIOReturnVMError;
+    struct Unlock {
+        NVResource *resource;
+        ~Unlock() { _ZN16IOAccelResource218unlockForCPUAccessEP4task9eLockType(resource, kernel_task, 2); }
+    } unlock = { x->resource };
+    IOMemoryMap *map = nvRes25G342KernelCPUMap(x->resource);
+    NVVramMemoryDescriptor *descriptor = map ? OSDynamicCast(NVVramMemoryDescriptor, map->getMemoryDescriptor()) : nullptr;
+    if (!map || !descriptor || descriptor->allocation() != x->allocation ||
+        !nvBackingKeyEqual(x->allocation->key(), x->resource->fApertureKey) ||
+        map->getAddressTask() != kernel_task || map->getVirtualAddress() != address ||
+        (map->getMapOptions() & kIOMapCacheMask) != cache) return kIOReturnNotPermitted;
+    const bool intel = x->framebuffer->metaCast("NMIntelFB") != nullptr;
+    NMIntelFramebufferInfo info = x->pipe->fFramebufferInfo;
+    NVRMVramRequest scanout = {}; scanout.version = NVRM_VRAM_ABI_VERSION;
+    if (!intel) {
+        if (x->pipe->fAccel->askFramebufferForScanout(&scanout, x->framebuffer) != kIOReturnSuccess) return kIOReturnNotReady;
+        info.width = scanout.width; info.height = scanout.height; info.pitch = scanout.pitch;
+        info.actualSize = scanout.actualSize; info.format = NM_INTEL_FB_FORMAT_BGRA;
+    }
+    if (!info.actualSize || (uint64_t)info.pitch * info.height > info.actualSize ||
+        nvResPitch((const unsigned char *)x->resource) != info.pitch) return kIOReturnOverrun;
+    nv_frame_span target = { (const void *)(uintptr_t)address, map->getLength(), info.width, info.height, info.pitch, NV_IOP_FMT_BGRA };
+    if (target.capacity > x->allocation->fReceipt.actualSize) target.capacity = x->allocation->fReceipt.actualSize;
+    if (nv_frame_populate(&x->source, &target) != NV_FRAME_OK) return kIOReturnOverrun;
+    nv_frame_store_drain();
+    const NVBackingKey key = x->allocation->key();
+    x->resource->fCpuPublicationKey = key; x->resource->fCpuPublication = x->sequence;
+    if (intel) {
+        NMIntelPresentRequest q = {};
+        q.version = NM_INTEL_FB_ABI_VERSION; q.structSize = sizeof(q);
+        q.framebufferRegistryID = info.framebufferRegistryID; q.epoch = info.epoch;
+        q.sourceOwnerGeneration = key.ownerGeneration; q.sourceAllocationCookie = key.allocationGeneration;
+        q.sequence = x->sequence; q.sourceKva = target.address; q.sourceBytes = target.capacity;
+        q.width = target.width; q.height = target.height; q.pitch = target.pitch; q.format = target.format;
+        const OSSymbol *symbol = OSSymbol::withCStringNoCopy(NM_INTEL_FB_PRESENT_FN);
+        IOReturn result = symbol ? x->framebuffer->callPlatformFunction(symbol, false, &q, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
+        if (symbol) symbol->release();
+        if (result != kIOReturnSuccess) return result;
+        if (q.completedSequence != q.sequence) return kIOReturnIOError;
+        OSAddAtomic64(1, &gCntHyFrames);
     } else {
-    for (unsigned y = 0; y < h; y++) {
-        const volatile unsigned int *sp = src + (unsigned long)y * spr;
-        volatile unsigned int *dp = d + (unsigned long)y * dpr;
-        (void)nv_iop_convert_row(dp, sp, w, srcFmt, dst30);
-    }
-    }
-    (void)bppSrc;
-    if (dst30) OSAddAtomic64(1, &gCntIop30);
-    if (srcFmt == NV_IOP_FMT_RGHA) OSAddAtomic64(1, &gCntIopHalf);
-    if (from10) OSAddAtomic64(1, &gCntIopL10r);
-    OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
-    const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
-    const SInt64 nh = OSAddAtomic64(1, &gCntIopOkHead[head]);
-    unsigned nz = 0, varied = 0; const unsigned first = src[0] & 0xffffffu;
-    for (unsigned i = 0; i < 8; i++) for (unsigned j = 0; j < 8; j++) {
-        unsigned sx = (w * (2 * j + 1)) / 16; if (sx >= spr) sx = spr - 1;
-        const unsigned v = src[(unsigned long)((h * (2 * i + 1)) / 16) * spr + sx] & 0xffffffu;
-        if (v) nz++;
-        if (v != first) varied++;
-    }
-    if (!varied) OSAddAtomic64(1, &gCntIopBlank);
-    if ((n <= 3 || n == 600 || nh == 0) && gIopK6Logs < 12) {
-        OSIncrementAtomic(&gIopK6Logs);
-        ALOG("iop: K6 transaction #%lld (head %u #%lld) on the panel: %ux%u pitch %u from %s — 64 samples: nonzero %u varied %u", (long long)n, head, (long long)nh, w, h, pitch,
-             fromRes ? "our VRAM resource" : "the IOSurface's memory", nz, varied);
+        // Stock NVRMFB owns the scanout. Its mode may change between calls, but fMem is stable.
+        NVRMKernelMapInfo mi = { NVRM_OWNER_ABI_VERSION, sizeof(mi), scanout.kva, (uint64_t)scanout.pitch * scanout.height, 0, 0, 0, 0 };
+        if (x->allocation->fOwner->call(NVRM_KERNEL_MAP_INFO_FN, &mi) != kIOReturnSuccess ||
+            mi.availableBytes < scanout.actualSize ||
+            (mi.cacheOptions != kIOMapInhibitCache && mi.cacheOptions != kIOMapWriteCombineCache)) return kIOReturnVMError;
+        nv_frame_span sink = { scanout.kva, scanout.actualSize, scanout.width, scanout.height, scanout.pitch, NV_IOP_FMT_BGRA };
+        if (nv_frame_validate(&sink) != NV_FRAME_OK) return kIOReturnOverrun;
+        if (scanout.flags & NVRM_VRAM_SCANOUT_30BIT) {
+            for (unsigned y = 0; y < sink.height; ++y)
+                (void)nv_iop_convert_row((volatile unsigned *)((unsigned char *)scanout.kva + (size_t)y * sink.pitch),
+                    (const volatile unsigned *)((const unsigned char *)target.address + (size_t)y * target.pitch), sink.width, NV_IOP_FMT_BGRA, 1);
+        } else if (nv_frame_populate(&target, &sink) != NV_FRAME_OK) return kIOReturnOverrun;
+        nv_frame_store_drain();
     }
     return kIOReturnSuccess;
+}
+IOReturn NVDisplayPipe::presentFinal(IOService *fb, const nv_frame_span &source)
+{
+    if (!fAccel || fAccel->fStopping || !nvFamLock(fAccel, true)) return kIOReturnNotReady;
+    IOReturn result = kIOReturnNotReady;
+    NVVramLease lease;
+    NVResource *r = fFramebufferResource;
+    NVVidMemory *m = r ? r->fFramebufferMemory : nullptr;
+    if (fFramebufferPhase == NVFramebufferPhase::Ready && m && m->fBacking &&
+        m->fBacking->acquire(NVLeaseUse::Present, &lease)) {
+        IOLockLock(fTransactionLock); const uint64_t sequence = fTransaction.sequence; IOLockUnlock(fTransactionLock);
+        NVFinalTransfer x = { this, fb, r, lease.get(), source, sequence };
+        result = m->fOwner->cpuAccess(nvPopulateAndPresentFinal, &x);
+        IOLockLock(fTransactionLock);
+        if (fTransaction.sequence == sequence) fTransaction.key = lease.get()->key();
+        IOLockUnlock(fTransactionLock);
+    }
+    nvFamUnlock(fAccel);
+    return result;
+}
+IOReturn NVDisplayPipe::performCandidateTransaction(IOAccelDisplayPipeTransaction2 *txn, IOService *fb, unsigned head)
+{
+    IOSurface *surface = txn->getPlaneIOSurface(0, 0);
+    nv_frame_span source = {};
+    NVVramLease resourceLease;
+    if (surface) {
+        if (!nvSurfWaitReady(surface->getSurfaceID())) { OSAddAtomic64(1, &gCntPresentProducer); return kIOReturnTimeout; }
+        if (!nvAccelSurfCopyReady(surface, head)) { OSAddAtomic64(1, &gCntPresentPublication); return kIOReturnNotReady; }
+        IOMemoryDescriptor *md = surface->getMemoryDescriptor();
+        if (!md) return kIOReturnVMError;
+        source.width = (uint32_t)surface->getWidth(); source.height = (uint32_t)surface->getHeight();
+        source.pitch = (uint32_t)surface->getBytesPerRow(); source.format = surface->getPixelFormat();
+        source.capacity = md->getLength();
+        source.address = iopMapSurface(surface->getSurfaceID(), md, (uint64_t)source.pitch * source.height);
+    } else {
+        if (!nvFamLock(fAccel, true)) return kIOReturnNotReady;
+        NVResource *r = OSDynamicCast(NVResource, txn->getPlaneResource(0, 0));
+        NVVidMemory *m = r ? nvres_vidmem(r) : nullptr;
+        bool ok = m && m->fBacking && r->fCpuPublication &&
+            nvBackingKeyEqual(r->fCpuPublicationKey, m->fBacking->key()) && m->fBacking->acquire(NVLeaseUse::CpuAccess, &resourceLease);
+        if (ok) {
+            source = { m->kva(), m->capacity(), *(const uint16_t *)((const char *)r + kNvResWidth),
+                *(const uint16_t *)((const char *)r + kNvResHeight), (uint32_t)nvResPitch((const unsigned char *)r), NV_IOP_FMT_BGRA };
+        }
+        nvFamUnlock(fAccel);
+        if (!ok) return kIOReturnUnsupported;
+    }
+    if (nv_frame_validate(&source) != NV_FRAME_OK) { OSAddAtomic64(1, &gCntPresentBounds); return kIOReturnOverrun; }
+    IOReturn result = presentFinal(fb, source);
+    if (result == kIOReturnNotReady) OSAddAtomic64(1, &gCntPresentEpoch);
+    else if (result != kIOReturnSuccess) OSAddAtomic64(1, &gCntPresentCopy);
+    return result;
+}
+struct NVTransactionGate {
+    NVDisplayPipe *pipe;
+    bool admitted = false;
+    explicit NVTransactionGate(NVDisplayPipe *p) : pipe(p) {
+        if (!pipe || !pipe->fTransactionLock) return;
+        IOLockLock(pipe->fTransactionLock);
+        admitted = !pipe->fTransactionBusy;
+        if (admitted) pipe->fTransactionBusy = true;
+        IOLockUnlock(pipe->fTransactionLock);
+    }
+    ~NVTransactionGate() {
+        if (!admitted) return;
+        IOLockLock(pipe->fTransactionLock); pipe->fTransactionBusy = false; IOLockUnlock(pipe->fTransactionLock);
+    }
+};
+IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+{
+    if (!gNvIop || !fAccel || fAccel->fStopping) return kIOReturnNotReady;
+    NVVramOwner *owner = fAccel->fOwner;
+    if (!owner || !owner->enter()) return kIOReturnNotReady;
+    struct Operation { NVVramOwner *owner; ~Operation() { owner->leave(); } } operation = { owner };
+    NVTransactionGate gate(this);
+    if (!gate.admitted) return kIOReturnBusy;
+    IOReturn result = validateTransaction(txn);
+    if (result != kIOReturnSuccess) return result;
+    uint64_t sequence = 0;
+    IOLockLock(fTransactionLock);
+    bool numbered = nvNextGeneration(&fNextSequence, &sequence);
+    if (numbered) fTransaction.begin(txn, txn->getTransactionID(), sequence, fFramebufferInfo.epoch);
+    NVTransactionState submitted = fTransaction;
+    IOLockUnlock(fTransactionLock);
+    if (!numbered) return kIOReturnNoResources;
+    if (!txn->getPlaneIOSurface(0, 0) && !txn->getPlaneResource(0, 0)) {
+        IOLockLock(fTransactionLock);
+        fTransaction.finish(txn, sequence, fFramebufferInfo.epoch, {}, 0, false);
+        IOLockUnlock(fTransactionLock);
+        OSAddAtomic64(1, &gCntIopEmpty); return kIOReturnSuccess;
+    }
+    unsigned head = 0; IOService *fb = fAccel->pipeFramebuffer(this, &head);
+    if (!fb || fb->isInactive()) return kIOReturnNotReady;
+    fb->retain(); NVRetain retained(fb);
+    const bool finalPath = fAccel->fCandidate || !txn->getPlaneIOSurface(0, 0);
+    result = finalPath ? performCandidateTransaction(txn, fb, head) : performLegacyTransaction(txn);
+    IOLockLock(fTransactionLock);
+    if (fTransaction.transaction == txn && fTransaction.sequence == sequence) {
+        submitted.key = fTransaction.key; submitted.queued = fTransaction.queued;
+    }
+    IOLockUnlock(fTransactionLock);
+    if (!submitted.queued) finishTransaction(submitted, result);
+    if (finalPath && result == kIOReturnSuccess) {
+        OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
+        OSAddAtomic64(1, txn->getPlaneIOSurface(0, 0) ? &gCntIopSrcSurf : &gCntIopSrcRes);
+    }
+    if (result != kIOReturnSuccess) OSAddAtomic64(1, &gCntIopFail);
+    return result;
 }
 
 static int nvacceliop_sysctl SYSCTL_HANDLER_ARGS
@@ -1986,7 +2468,7 @@ static int nvacceliop_sysctl SYSCTL_HANDLER_ARGS
     int v = gNvIop;
     int err = sysctl_handle_int(oidp, &v, 0, req);
     if (err || req->newptr == 0) return err;
-    NVAccel *a = NVAccel::forDisplay();
+    NVAccel *a = NVAccel::forDisplay(); NVRetain retained(a);
     if (!a) return ENXIO;
     if (v) {
         OSDictionary *caps = OSDictionary::withCapacity(2);
@@ -2074,7 +2556,12 @@ NVACCEL_CNT(nmhybrid_owned,        gCntHyOwned,        "hybrid: frames written i
 NVACCEL_CNT(nmhybrid_dma,          gCntHyDma,          "hybrid: frames the copy engine wrote straight into the panel driver's buffers");
 NVACCEL_CNT(nmhybrid_dma_timeouts, gCntHyDmaTimeout,   "hybrid: copy-engine frames that timed out (buffer quarantined)");
 NVACCEL_CNT(nmflat_held,            gCntFlatHeld,       "frames of one flat colour held back from the flip (nmflatskip)");
-NVACCEL_CNT(nmhybrid_frames,        gCntHyFrames,       "hybrid: frames presented by copy to another GPU's panel");
+NVACCEL_CNT(nmhybrid_frames,        gCntHyFrames,       "completed final-target to scanout-memory publications; not physical latches");
+NVACCEL_CNT(nmhybrid_producer_errors, gCntPresentProducer, "producer completion timeouts");
+NVACCEL_CNT(nmhybrid_publication_errors, gCntPresentPublication, "unproved IOSurface publication");
+NVACCEL_CNT(nmhybrid_bounds_errors, gCntPresentBounds, "source or target span refusals");
+NVACCEL_CNT(nmhybrid_epoch_errors, gCntPresentEpoch, "closed or stale presentation epoch");
+NVACCEL_CNT(nmhybrid_copy_errors, gCntPresentCopy, "final target or sink transfer errors");
 NVACCEL_CNT(nmhybrid_words,         gCntHyWords,        "hybrid: pixels stored to the other GPU's scan-out");
 NVACCEL_CNT(nmhybrid_words_skipped, gCntHyWordsSkipped, "hybrid: pixels not stored because they had not changed");
 NVACCEL_CNT(nmhybrid_flips,         gCntHyFlips,        "hybrid: frames scanned out in place (zero copy)");
@@ -2092,9 +2579,7 @@ static inline bool nvAccelIopVramFlippable(bool vramNewest, bool pluginWrote) { 
 // A copied frame is read from system memory. When the family says that copy is stale, the resource is paged off VRAM
 // first; a VRAM copy the plugin never wrote holds nothing worth paging, and paging it would overwrite the pixels the
 // plugin copied out. Such a surface is read as it is.
-static inline bool nvAccelIopCopyNeedsPageoff(bool sysmemCurrent, bool pluginWrote) { return !sysmemCurrent && pluginWrote; }
 static inline bool nvAccelPluginWrote(unsigned long long wroteCookie, unsigned long long allocCookie) { return wroteCookie != 0 && wroteCookie == allocCookie; }
-static bool nvAccelResPluginWrote(NVResource *res) { NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr; return vm && nvAccelPluginWrote(res->fPluginWroteCookie, vm->fAllocationCookie); }
 static SInt64 gCntIopFlipHit, gCntIopFlipMiss;
 NVACCEL_CNT(nvaccel_iop_flip_hit,     gCntIopFlipHit,     "swaps resolved from the cache (no accelerator lock)");
 NVACCEL_CNT(nvaccel_iop_flip_miss,    gCntIopFlipMiss,    "swaps that resolved under the accelerator lock");
@@ -2112,7 +2597,7 @@ static int    gIopAsync = 1;
 static int gSurfGpuOn = 1;
 static SInt64 gCntSurfMarks, gCntSurfWaits, gCntSurfTimeouts;
 static int gSurfWaitMaxUs;
-static const unsigned kSurfGpuWaitMs = 100;   // a GPU that has not finished a composite in 100 ms is hung; flip anyway
+static const unsigned kSurfGpuWaitMs = 100; // timeout preserves the pending mark and refuses the frame
 struct NVSurfPending { unsigned int id; unsigned int seq; };
 static NVSurfPending gSurfPend[32];
 static unsigned int gSurfPendSeq;
@@ -2122,31 +2607,30 @@ static IOLock *nvSurfLock()
     if (!gSurfPendLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gSurfPendLock)) IOLockFree(l); }
     return gSurfPendLock;
 }
-static void nvSurfMark(unsigned int id, bool pending)
+static bool nvSurfMark(unsigned int id, bool pending)
 {
     IOLock *l = nvSurfLock();
-    if (!l || !id) return;
+    if (!l || !id) return false;
     IOLockLock(l);
-    unsigned slot = 32, oldest = 0;
+    unsigned slot = 32;
     for (unsigned i = 0; i < 32; i++) {
         if (gSurfPend[i].id == id) { slot = i; break; }
         if (slot == 32 && !gSurfPend[i].id) slot = i;
-        if (gSurfPend[i].seq < gSurfPend[oldest].seq) oldest = i;
     }
-    if (pending) {
-        if (slot == 32) slot = oldest;   // 32 surfaces in flight at once is not a compositor; the oldest mark goes
-        gSurfPend[slot].id = id; gSurfPend[slot].seq = ++gSurfPendSeq;
-    } else if (slot < 32 && gSurfPend[slot].id == id) {
-        gSurfPend[slot].id = 0;
-        IOLockWakeup(l, gSurfPend, false);
+    bool ok = slot != 32;
+    if (pending && ok) { gSurfPend[slot].id = id; gSurfPend[slot].seq = ++gSurfPendSeq; }
+    else if (!pending && ok && gSurfPend[slot].id == id) {
+        gSurfPend[slot].id = 0; IOLockWakeup(l, gSurfPend, false);
     }
     IOLockUnlock(l);
-    OSAddAtomic64(1, &gCntSurfMarks);
+    if (ok) OSAddAtomic64(1, &gCntSurfMarks);
+    return ok;
 }
 static bool nvSurfWaitReady(unsigned int id)
 {
     IOLock *l = gSurfPendLock;
-    if (!l || !id || !gSurfGpuOn) return true;   // switched off: marks left from before never hold a swap
+    if (!id) return false;
+    if (!l) return true;
     uint64_t start = mach_absolute_time(), deadline = 0;
     clock_interval_to_deadline(kSurfGpuWaitMs, kMillisecondScale, &deadline);
     bool waited = false, ready = true;
@@ -2155,7 +2639,7 @@ static bool nvSurfWaitReady(unsigned int id)
         unsigned i = 0;
         while (i < 32 && gSurfPend[i].id != id) i++;
         if (i == 32) break;
-        if (mach_absolute_time() >= deadline) { gSurfPend[i].id = 0; ready = false; break; }
+        if (mach_absolute_time() >= deadline) { ready = false; break; }
         waited = true;
         IOLockSleepDeadline(l, gSurfPend, deadline, THREAD_UNINT);
     }
@@ -2171,7 +2655,7 @@ static bool nvSurfWaitReady(unsigned int id)
 static bool nvSurfIsPending(unsigned int id)
 {
     IOLock *l = gSurfPendLock;
-    if (!l || !id || !gSurfGpuOn) return false;
+    if (!l || !id) return false;
     bool p = false;
     IOLockLock(l);
     for (unsigned i = 0; i < 32 && !p; i++) p = gSurfPend[i].id == id;
@@ -2269,6 +2753,9 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nmhybrid_p2p); sysctl_register_oid(&sysctl__debug_nmhybrid_owned); sysctl_register_oid(&sysctl__debug_nmhybrid_dma); sysctl_register_oid(&sysctl__debug_nmhybrid_dma_timeouts);
     sysctl_register_oid(&sysctl__debug_nmhybrid);
     sysctl_register_oid(&sysctl__debug_nmhybrid_frames);        sysctl_register_oid(&sysctl__debug_nmhybrid_words);
+    sysctl_register_oid(&sysctl__debug_nmhybrid_producer_errors); sysctl_register_oid(&sysctl__debug_nmhybrid_publication_errors);
+    sysctl_register_oid(&sysctl__debug_nmhybrid_bounds_errors); sysctl_register_oid(&sysctl__debug_nmhybrid_epoch_errors);
+    sysctl_register_oid(&sysctl__debug_nmhybrid_copy_errors);
     sysctl_register_oid(&sysctl__debug_nmhybrid_words_skipped); sysctl_register_oid(&sysctl__debug_nmhybrid_flips);
     sysctl_register_oid(&sysctl__debug_nmhybrid_import_fail);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h4);      sysctl_register_oid(&sysctl__debug_nvaccel_igpu);
@@ -2279,97 +2766,26 @@ static void nvaccelInstallSysctl(void)
 #endif
 }
 
-static inline void nvAccelZero(void *p, unsigned long n)
-{ volatile unsigned char *b = (volatile unsigned char *)p; while (n--) *b++ = 0; }
-
-static unsigned nvRmHandlesLogged;
-
-static bool nvAccelRmHandles(NVAccel *owner, struct NVRMRmHandles *out)
-{
-    NVAccel *a = NVAccel::resolve(owner);
-    if (a && a->fRmHandlesValid) { *out = a->fRmHandles; return true; }
-    if (!a) {
-        if (nvRmHandlesLogged < 8) { nvRmHandlesLogged++;
-            ALOG("nvAccelRmHandles: no NVAccel instance yet -- too early"); }
-        return false;
-    }
-    if (!a->fFB) {
-        if (a->hasActiveHead()) {
-            struct NVRMRmHandles h;
-            nvAccelZero(&h, sizeof h);
-            h.version = NVRM_GPUVA_ABI_VERSION;
-            if (a->ensureDirectKapiHandle(&h.kapiDevice)) {
-                a->fRmHandles = h;
-                a->fRmHandlesValid = true;
-                ALOG("RM handles (hybrid direct KAPI): kapiDevice %p *** the accelerator can now build GPU page tables ***", h.kapiDevice);
-                *out = h;
-                return true;
-            }
-        }
-        if (nvRmHandlesLogged < 8) { nvRmHandlesLogged++;
-            ALOG("nvAccelRmHandles: no framebuffer has published yet -- will retry"); }
-        return false;
-    }
-    const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVRM_GPUVA_FN_HANDLES);
-    if (!sym) {
-        if (nvRmHandlesLogged < 8) { nvRmHandlesLogged++;
-            ALOG("nvAccelRmHandles: OSSymbol allocation failed"); }
-        return false;
-    }
-    struct NVRMRmHandles h;
-    nvAccelZero(&h, sizeof h);
-    h.version = NVRM_GPUVA_ABI_VERSION;
-    IOReturn r = a->fFB->callPlatformFunction(sym, false, &h, nullptr, nullptr, nullptr);
-    sym->release();
-    if (r != kIOReturnSuccess || !h.kapiDevice) {
-        if (nvRmHandlesLogged < 8) { nvRmHandlesLogged++;
-            ALOG("nvAccelRmHandles: framebuffer gave no kapi device (ret 0x%x, kapiDevice %p)",
-                 (unsigned)r, h.kapiDevice); }
-        return false;
-    }
-    a->fRmHandles = h; a->fRmHandlesValid = true;
-    ALOG("RM handles: kapiDevice %p (hClient/hDevice resolved inside NVRM by name) "
-         "*** the accelerator can now build GPU page tables ***", h.kapiDevice);
-    *out = h;
-    return true;
-}
 
 IOService *NVAccel::locateNVRM()
 {
     if (fNVRM) return fNVRM;
-    if (nvaccelMultiGpu()) {
-        // the NVRM that attached to this accelerator's own PCI device, not whichever matches first
-        if (IOService *prov = getProvider()) {
-            if (OSIterator *it = prov->getClientIterator()) {
-                while (OSObject *o = it->getNextObject()) {
-                    IOService *c = OSDynamicCast(IOService, o);
-                    if (c && !strcmp(c->getMetaClass()->getClassName(), "NVRM")) { fNVRM = c; break; }
-                }
-                it->release();
+    if (!fPCI || fStopping) return nullptr;
+    OSIterator *it = fPCI->getClientIterator();
+    if (it) {
+        while (OSObject *object = it->getNextObject()) {
+            IOService *s = OSDynamicCast(IOService, object);
+            if (s && s->metaCast("NVRM") && s->getProvider() == fPCI && !s->isInactive()) {
+                s->retain(); fNVRM = s; break;
             }
-            if (fNVRM) return fNVRM;
         }
+        it->release();
     }
-    OSDictionary *m = IOService::serviceMatching("NVRM");
-    if (m) fNVRM = IOService::waitForMatchingService(m, 100ULL * 1000 * 1000);
     return fNVRM;
 }
 static IOService *nvAccelNVRM(NVAccel *owner)
-{
-    NVAccel *a = NVAccel::resolve(owner);
-    return a ? a->locateNVRM() : nullptr;
-}
+{ return owner && owner->fOwner ? owner->fOwner->fNvrm : nullptr; }
 
-static IOReturn nvAccelGpuVaCall(NVAccel *owner, const char *fn, struct NVRMGpuVaRequest *g)
-{
-    IOService *nvrm = nvAccelNVRM(owner);
-    if (!nvrm) return kIOReturnNotAttached;
-    const OSSymbol *sym = OSSymbol::withCStringNoCopy(fn);
-    if (!sym) return kIOReturnNoMemory;
-    IOReturn r = nvrm->callPlatformFunction(sym, false, g, nullptr, nullptr, nullptr);
-    sym->release();
-    return r;
-}
 
 #define NVRM_SS_KERNEL_ABI 1
 #include "../nvrm_surfshare_abi.h"
@@ -2416,28 +2832,32 @@ static void nvFamUnlock(NVAccel *a)
     _ZN22IOGraphicsAccelerator211unlock_busyEv(a);
     IOLockUnlock(*(IOLock *volatile *)((unsigned char *)a + 0x88));
 }
-static unsigned gNVSVLockMiss;
 enum { kNVSVPend = 512 };
 static unsigned gNVSVPendId[kNVSVPend];
 static NVResource *gNVSVPendResource[kNVSVPend];
+static NVBackingKey gNVSVPendKey[kNVSVPend];
 static IOSimpleLock *gNVSVPendLock;
 static bool nvSVPend(unsigned id, int op, NVResource *resource = nullptr)
 {
-    if (!id) return op == 1 ? false : false;
-    if (!gNVSVPendLock) return op == 1 ? false : false;
+    if (!id || !gNVSVPendLock) return false;
+    NVVidMemory *memory = resource ? nvres_vidmem(resource) : nullptr;
+    const NVBackingKey key = memory && memory->fBacking ? memory->fBacking->key() : NVBackingKey{};
+    if (op == 1 && (!resource || !key.allocationGeneration)) return false;
     bool r = false; int freeSlot = -1;
     IOSimpleLockLock(gNVSVPendLock);
     for (int i = 0; i < kNVSVPend; i++) {
         if (gNVSVPendId[i] == id) {
             r = true;
-            if (op == 0) { gNVSVPendId[i] = 0; gNVSVPendResource[i] = nullptr; }
-            else if (op == 1) gNVSVPendResource[i] = resource;
+            if (op == 0 && resource == gNVSVPendResource[i] && nvBackingKeyEqual(key, gNVSVPendKey[i])) {
+                gNVSVPendId[i] = 0; gNVSVPendResource[i] = nullptr; gNVSVPendKey[i] = {};
+            } else if (op == 1) { gNVSVPendResource[i] = resource; gNVSVPendKey[i] = key; }
             break;
         }
         if (!gNVSVPendId[i] && freeSlot < 0) freeSlot = i;
     }
-    if (op == 1 && !r) { if (freeSlot >= 0) { gNVSVPendId[freeSlot] = id; gNVSVPendResource[freeSlot] = resource; r = true; } }
-    else if (op == 1) r = true;
+    if (op == 1 && !r && freeSlot >= 0) {
+        gNVSVPendId[freeSlot] = id; gNVSVPendResource[freeSlot] = resource; gNVSVPendKey[freeSlot] = key; r = true;
+    }
     IOSimpleLockUnlock(gNVSVPendLock);
     return r;
 }
@@ -2464,17 +2884,21 @@ SYSCTL_INT(_debug, OID_AUTO, nvaccel_svdiag, CTLFLAG_RW | CTLFLAG_LOCKED, &gSVDi
 static bool nvSVDiag() { return gSVDiag > 0 && OSDecrementAtomic(&gSVDiag) > 0; }
 static unsigned nvAccelSurfDirty(void *cache, NVResource *res, unsigned plane)
 {
+    if (!res || !res->fAccel || res->fAccel->fCandidate) return NVRM_SS_OFF;
     volatile unsigned char *r = (volatile unsigned char *)res;
     unsigned char type = r[kNvResType];
     unsigned int fl = *(volatile unsigned int *)(r + kNvResFlags);
     volatile unsigned short *valid = *(unsigned short *volatile *)(r + kNvResValid);
     if (type != 0xc0 || (fl & 0x8000) || !valid || plane > 15) return NVRM_SS_NO_CACHE;
-    if (!gNVSVPendLock) gNVSVPendLock = IOSimpleLockAlloc();
+    if (!gNVSVPendLock) {
+        IOSimpleLock *l = IOSimpleLockAlloc();
+        if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gNVSVPendLock)) IOSimpleLockFree(l);
+    }
     if (!nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(*(void *volatile *)((unsigned char *)cache + 0x10)), 1, res)) return NVRM_SS_NO_CACHE;
     _ZN20IOSurfaceDeviceCache10setCurrentEv(cache);
     valid[6] |= (unsigned short)(1u << plane);
     valid[0] &= (unsigned short)~(1u << plane);
-    { NVVidMemory *vm = nvres_vidmem(res); res->fPluginWroteCookie = vm ? vm->fAllocationCookie : 0; }
+    { NVVidMemory *vm = nvres_vidmem(res); res->fPluginWroteCookie = vm ? vm->cookie() : 0; }
     return 0;
 }
 // The caller holds the accelerator family lock. The plugin can still write a
@@ -2482,23 +2906,12 @@ static unsigned nvAccelSurfDirty(void *cache, NVResource *res, unsigned plane)
 // before marking the GPU copy current. Never allocate fresh memory for this case.
 static bool nvAccelRestoreParkedForDirty(NVResource *res, NVVidMemory *vm, unsigned plane)
 {
-    if (!res || !vm || vm->fRmHandle || !vm->fParkHandle) return true;
-    const volatile unsigned char *r = (const volatile unsigned char *)res;
-    const unsigned flags = *(const volatile unsigned *)(r + kNvResFlags);
-    const volatile unsigned short *valid = *(unsigned short *volatile const *)(r + kNvResValid);
-    const unsigned long long want = *(const volatile unsigned long long *)((const unsigned char *)vm + 0x40);
-    if (vm->fScanout || r[kNvResType] != 0xc0 || (flags & 0x8000) || !valid || plane > 15 ||
-        !want || vm->fParkBytes < want || !vm->fParkPhys || !vm->fParkKva)
-        return true;  // Preserve the original refusal and CPU-copy fallback.
-    void *const handle = vm->fParkHandle;
-    void *const mapping = vm->fParkKva;
-    const unsigned long long bytes = vm->fParkBytes, phys = vm->fParkPhys, cookie = vm->fParkCookie;
-    // IOAccelVidMemory::wire calls allocPhysical and updates family accounting;
-    // it does not page CPU pixels in. The size check above selects allocPhysical's
-    // retained-allocation branch, which moves the existing backing without copying.
+    if (!res || !vm || !vm->fOwner || vm->fOwner->fDirect) return false;
+    if (vm->fBacking) return true;
+    if (!vm->fParked || plane > 15 || vm->getLength() > vm->fParked->fReceipt.actualSize) return false;
+    const NVBackingKey key = vm->fParked->key();
     _ZN16IOAccelVidMemory4wireEv(vm);
-    return vm->fRmHandle == handle && vm->fKva == mapping && vm->fPhys == phys &&
-        vm->fBytes == bytes && vm->fAllocationCookie == cookie && !vm->fParkHandle;
+    return vm->fBacking && !vm->fParked && nvBackingKeyEqual(key, vm->fBacking->key());
 }
 // The marks arrive through NVK's surface escape (NVRM_ESC_SURF_DIRTY with plane NVRM_SS_PLANE_GPU_MARK | pending): the
 // WindowServer sandbox denies sysctl writes. Only WindowServer's own marks are taken, so no other process can hold a swap.
@@ -2508,18 +2921,19 @@ static unsigned nvSurfGpuEscape(const struct NVRMSurfShareEsc *p)
     char nm[32] = { 0 };
     proc_selfname(nm, sizeof nm);
     if (strcmp(nm, "WindowServer")) return NVRM_SS_OFF;
-    if (p->surfaceID) nvSurfMark(p->surfaceID, (p->plane & 1u) != 0);
+    if (p->surfaceID && !nvSurfMark(p->surfaceID, (p->plane & 1u) != 0)) return NVRM_SS_BUSY;
     return 0;
 }
 static IOReturn nvAccelSurfVram(NVAccel *owner, struct NVRMSurfShareEsc *p, task_t task, unsigned cmd)
 {
-    if (p->version == NVRM_SURFSHARE_VERSION && cmd == NVRM_ESC_SURF_DIRTY && (p->plane & NVRM_SS_PLANE_GPU_MARK)) {
-        p->hSrcClient = p->hSrcMemory = 0;
-        p->status = nvSurfGpuEscape(p);
-        return kIOReturnSuccess;
-    }
+    if (!p) return kIOReturnBadArgument;
     p->hSrcClient = p->hSrcMemory = 0;
     if (p->version != NVRM_SURFSHARE_VERSION) { p->status = NVRM_SS_BAD_VERSION; return kIOReturnSuccess; }
+    // Refusal includes capability probes. No lookup, wire, share or dirty transition may precede it.
+    if (!owner || owner->fCandidate || owner->fStopping) { p->status = NVRM_SS_OFF; return kIOReturnSuccess; }
+    if (cmd == NVRM_ESC_SURF_DIRTY && (p->plane & NVRM_SS_PLANE_GPU_MARK)) {
+        p->status = nvSurfGpuEscape(p); return kIOReturnSuccess;
+    }
     // The plugin re-marks a surface after its last GPU write on the thread that releases the pending marks. A page-off
     // waiting for one of those marks holds the accelerator lock, so that re-mark must not wait for the lock: it is
     // dropped instead, and the mark taken at commit stands.
@@ -2530,7 +2944,7 @@ static IOReturn nvAccelSurfVram(NVAccel *owner, struct NVRMSurfShareEsc *p, task
     if (p->plane > 15) { p->status = NVRM_SS_NO_CACHE; return kIOReturnSuccess; }
     NVAccel *a = NVAccel::resolve(owner);
     struct NVRMRmHandles h; nvSVZero(&h, sizeof h);
-    if (!task || !a || !nvAccelRmHandles(a, &h)) { p->status = NVRM_SS_OFF; return kIOReturnSuccess; }
+    if (!task || !a || !a->fOwner || !a->fOwner->handles(&h)) { p->status = NVRM_SS_OFF; return kIOReturnSuccess; }
     if (!gNVSVRoot) {
         OSDictionary *m = IOService::serviceMatching("IOSurfaceRoot");
         if (m) { gNVSVRoot = IOService::waitForMatchingService(m, 5ULL * 1000 * 1000 * 1000); m->release(); }
@@ -2545,11 +2959,11 @@ static IOReturn nvAccelSurfVram(NVAccel *owner, struct NVRMSurfShareEsc *p, task
     NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
     if (cmd == NVRM_ESC_SURF_DIRTY) {
         const bool sameBacking = nvAccelRestoreParkedForDirty(res, vm, p->plane);
-        p->status = (sameBacking && cache && res && vm && vm->fRmHandle)
+        p->status = (sameBacking && cache && res && vm && vm->handle())
             ? nvAccelSurfDirty(cache, res, p->plane) : NVRM_SS_NO_CACHE;
         if (p->status == 0) gNVSVDirty++; else gNVSVDirtyRefused++;
         if (nvSVDiag()) ALOG("SVDIAG dirty surface %u plane %u -> %#x (cache %d res %d vm %d)", p->surfaceID, p->plane, p->status,
-                             cache ? 1 : 0, res ? 1 : 0, (vm && vm->fRmHandle) ? 1 : 0);
+                             cache ? 1 : 0, res ? 1 : 0, (vm && vm->handle()) ? 1 : 0);
         if (gNVSVDirty + gNVSVDirtyRefused <= 6 || ((gNVSVDirty + gNVSVDirtyRefused) & 4095) == 0)
             ALOG("surfvram dirty: surface %u plane %u type 0x%x -> %#x (dirty %u, refused %u)", p->surfaceID, p->plane,
                  res ? (unsigned)((volatile unsigned char *)res)[kNvResType] : 0u, p->status, gNVSVDirty, gNVSVDirtyRefused);
@@ -2558,24 +2972,24 @@ static IOReturn nvAccelSurfVram(NVAccel *owner, struct NVRMSurfShareEsc *p, task
         ((OSObject *)surf)->release();
         return kIOReturnSuccess;
     }
-    if (vm && !vm->fRmHandle && !vm->fScanout) _ZN16IOAccelVidMemory4wireEv(vm);
+    if (vm && !vm->handle() && !vm->fScanout) _ZN16IOAccelVidMemory4wireEv(vm);
     if (!cache || !res) p->status = NVRM_SS_NO_CACHE;
-    else if (!vm || !vm->fRmHandle || !vm->fBytes) p->status = NVRM_SS_NO_VRAM;
-    else if (p->size > vm->fBytes) p->status = NVRM_SS_TOO_SMALL;
+    else if (!vm || !vm->handle() || !vm->capacity()) p->status = NVRM_SS_NO_VRAM;
+    else if (p->size > vm->capacity()) p->status = NVRM_SS_TOO_SMALL;
     else {
         struct NVRMSurfShareRm g; nvSVZero(&g, sizeof g);
         g.version = NVRM_SS_RM_VERSION; g.op = NVRM_SS_RM_SHARE_KAPI;
-        g.kapiDevice = h.kapiDevice; g.kapiMemory = vm->fRmHandle; g.target = p->hClient; g.status = NVRM_SS_OFF;
+        g.kapiDevice = h.kapiDevice; g.kapiMemory = vm->handle(); g.target = p->hClient; g.status = NVRM_SS_OFF;
         IOService *nvrm = nvAccelNVRM(a);
         const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVRM_SS_FN_RM);
         if (nvrm && sym && nvrm->callPlatformFunction(sym, false, &g, nullptr, nullptr, nullptr) == kIOReturnSuccess) {}
         if (sym) sym->release();
-        p->status = g.status; p->hSrcClient = g.hClient; p->hSrcMemory = g.hObject; p->size = vm->fBytes;
+        p->status = g.status; p->hSrcClient = g.hClient; p->hSrcMemory = g.hObject; p->size = vm->capacity();
     }
     if (p->status == 0) gNVSVOk++; else gNVSVRefused++;
     if (gNVSVOk + gNVSVRefused <= 8 || ((gNVSVOk + gNVSVRefused) & 1023) == 0)
         ALOG("surfvram: surface %u plane %u -> cache %p res %p vidmem %p (%llu B) -> client %#x mem %#x status %#x (ok %u, refused %u)",
-             p->surfaceID, p->plane, cache, res, vm, vm ? vm->fBytes : 0ull, p->hSrcClient, p->hSrcMemory, p->status, gNVSVOk, gNVSVRefused);
+             p->surfaceID, p->plane, cache, res, vm, vm ? vm->capacity() : 0ull, p->hSrcClient, p->hSrcMemory, p->status, gNVSVOk, gNVSVRefused);
     if (cache) ((OSObject *)cache)->release();
     nvFamUnlock(a);
     ((OSObject *)surf)->release();
@@ -2622,6 +3036,20 @@ static IOBufferMemoryDescriptor *nvSVStage(unsigned long long len)
 #endif
 void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long long a3)
 {
+    if (out) *out = false;
+    if (fAccel && fAccel->fCandidate) {
+        // Private Vulkan images publish into IOSurface system memory before completion.
+        // An unexpected GPU-only dirty resource is a contract violation, never a BAR1 readback.
+        const bool needsReadback = requirePageoff();
+        if (needsReadback) {
+            if (++gNVSVPageoffFail <= 8) ALOG("private publication: GPU-only pageoff refused");
+        } else if (out) *out = true;
+        return;
+    }
+    pageoffLegacy(ev, a1, out, a3);
+}
+void NVResource::pageoffLegacy(IOAccelEvent *ev, bool a1, bool *out, unsigned long long a3)
+{
     volatile unsigned char *r = (volatile unsigned char *)this;
     void *cache = *(void *volatile *)(r + kNvResCache);
     NVVidMemory *vm = nvres_vidmem(this);
@@ -2630,9 +3058,11 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
     if (nvSVDiag()) {
         volatile unsigned short *vd = *(unsigned short *volatile *)(r + kNvResValid);
         ALOG("SVDIAG pageoff surface %u type 0x%x vm %d rm %d scanout %d valid0 %#x valid6 %#x", surf ? _ZNK9IOSurface12getSurfaceIDEv(surf) : 0u,
-             (unsigned)r[kNvResType], vm ? 1 : 0, (vm && vm->fRmHandle) ? 1 : 0, vm ? (int)vm->fScanout : -1, vd ? vd[0] : 0xffff, vd ? vd[6] : 0xffff);
+             (unsigned)r[kNvResType], vm ? 1 : 0, (vm && vm->handle()) ? 1 : 0, vm ? (int)vm->fScanout : -1, vd ? vd[0] : 0xffff, vd ? vd[6] : 0xffff);
     }
-    if (!surf || !vm || !vm->fRmHandle || vm->fScanout || !vm->fBytes || !nvAccelRmHandles(fAccel, &h)) {
+    NVVramLease allocation;
+    if (!surf || !vm || !vm->fBacking || !vm->fBacking->acquire(NVLeaseUse::CpuAccess, &allocation) ||
+        !vm->fOwner->handles(&h)) {
         NV_FAM_PAGEOFF(ev, a1, out, a3);
         return;
     }
@@ -2649,8 +3079,9 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
             retain(); holdRes.o = this;
             a->retain(); holdAccel.o = a;
             nvFamUnlock(a);
-            nvSurfWaitReady(sid);
-            nvFamLock(a, false);
+            const bool ready = nvSurfWaitReady(sid);
+            const bool locked = nvFamLock(a, false);
+            if (!ready || !locked) return;
             uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
             if ((int)(ns / 1000) > gPoUnlockedMaxUs) gPoUnlockedMaxUs = (int)(ns / 1000);
             OSAddAtomic64(1, &gCntPoUnlocked);
@@ -2658,10 +3089,11 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
             cache = *(void *volatile *)(r + kNvResCache);
             vm = nvres_vidmem(this);
             surf = (r[kNvResType] == 0xc0 && cache) ? *(void *volatile *)((unsigned char *)cache + 0x10) : nullptr;
-            if (!surf || !vm || !vm->fRmHandle || vm->fScanout || !vm->fBytes || !nvAccelRmHandles(fAccel, &h)) { NV_FAM_PAGEOFF(ev, a1, out, a3); return; }
+            if (!surf || !vm || !vm->fBacking || !nvBackingKeyEqual(vm->fBacking->key(), allocation.get()->key()) ||
+                !vm->fOwner->handles(&h)) return;
         } else {
             if (gPoUnlocked && a && nvSurfIsPending(sid)) OSAddAtomic64(1, &gCntPoNotOwner);
-            nvSurfWaitReady(sid);
+            if (!nvSurfWaitReady(sid)) return;
         }
     }
     IOMemoryDescriptor *md = (IOMemoryDescriptor *)_ZNK9IOSurface19getMemoryDescriptorEv(surf);
@@ -2673,7 +3105,7 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
     }
     bool mayUnwire = true;
     unsigned long long len = md->getLength();
-    if (len > vm->fBytes) len = vm->fBytes;
+    if (!len || len > vm->capacity() || len > UINT64_MAX - 4095) { md->complete(kIODirectionNone); return; }
     unsigned long long pages = (len + 4095) >> 12;
     bool ok = false; unsigned st = NVRM_SS_OFF; unsigned long long usec = 0, cpuUs = 0;
     bool staged = false;
@@ -2686,7 +3118,7 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
         if (spa) {
             for (unsigned long long k = 0; k < pages; k++) spa[k] = sp + k * 4096;
             struct NVRMSurfPageoff q; nvSVZero(&q, sizeof q);
-            q.version = NVRM_SS_RM_VERSION; q.status = NVRM_SS_OFF; q.kapiDevice = h.kapiDevice; q.kapiMemory = vm->fRmHandle;
+            q.version = NVRM_SS_RM_VERSION; q.status = NVRM_SS_OFF; q.kapiDevice = h.kapiDevice; q.kapiMemory = vm->handle();
             q.pages = spa; q.pageCount = pages; q.length = len;
             IOService *nvrm = nvAccelNVRM(fAccel);
             const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVRM_SS_FN_PAGEOFF);
@@ -2720,7 +3152,7 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
         }
         if (i == pages) {
             struct NVRMSurfPageoff q; nvSVZero(&q, sizeof q);
-            q.version = NVRM_SS_RM_VERSION; q.status = NVRM_SS_OFF; q.kapiDevice = h.kapiDevice; q.kapiMemory = vm->fRmHandle;
+            q.version = NVRM_SS_RM_VERSION; q.status = NVRM_SS_OFF; q.kapiDevice = h.kapiDevice; q.kapiMemory = vm->handle();
             q.pages = pa; q.pageCount = pages; q.length = len;
             IOService *nvrm = nvAccelNVRM(fAccel);
             const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVRM_SS_FN_PAGEOFF);
@@ -2734,7 +3166,7 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
     if (mayUnwire) md->complete(kIODirectionNone);
     else ALOG("surfvram pageoff: res %p CE copy TIMED OUT -- surface pages stay wired (%llu B)", this, len);
     if (ok) {
-        nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(surf), 0);
+        nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(surf), 0, this);
         volatile unsigned short *valid = *(unsigned short *volatile *)(r + kNvResValid);
         if (valid) valid[0] |= 1;
         gNVSVPageoff++;
@@ -2747,46 +3179,71 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
 
 static IOSurface *gIopFlipFront[kNvMaxFB], *gIopFlipPrev[kNvMaxFB];
 static bool gIopFlipped[kNvMaxFB];
-static unsigned gIopFlipLogs;
 static bool nvAccelIopFlipNo(int why) { OSAddAtomic64(1, &gCntIopFlipNo[why & 7]); return false; }
-struct NVIopFlipCache { IOSurface *s; NVResource *res; NVVidMemory *vm; void *kmem; unsigned long long bytes; unsigned long long use; };
+struct NVIopFlipCache { IOSurface *s; NVResource *res; NVVramAllocation *allocation; uint64_t use; };
 static NVIopFlipCache gIopFlipCache[8];
 static IOSimpleLock *gIopFlipCacheLock;
-static unsigned long long gIopFlipCacheTick;
-static bool nvAccelIopCacheGet(IOSurface *s, NVResource **res, NVVidMemory **vm, void **kmem, unsigned long long *bytes)
+static uint64_t gIopFlipCacheTick;
+struct NVFlipView {
+    NVResource *res = nullptr;
+    NVVramAllocation *allocation = nullptr;
+    ~NVFlipView() { if (res) res->release(); if (allocation) allocation->release(); }
+};
+static bool nvAccelIopCacheGet(IOSurface *surface, NVFlipView *out)
 {
     if (!gIopFlipCacheLock) return false;
-    bool hit = false;
     IOSimpleLockLock(gIopFlipCacheLock);
-    for (unsigned i = 0; i < 8; i++) if (gIopFlipCache[i].s == s) {
-        NVVidMemory *v = gIopFlipCache[i].vm;
-        if (v && v->fRmHandle == gIopFlipCache[i].kmem && v->fBytes == gIopFlipCache[i].bytes) {
-            *res = gIopFlipCache[i].res; *vm = v; *kmem = gIopFlipCache[i].kmem; *bytes = gIopFlipCache[i].bytes;
-            gIopFlipCache[i].use = ++gIopFlipCacheTick; hit = true;
-        }
+    for (unsigned i = 0; i < 8; ++i) if (gIopFlipCache[i].s == surface) {
+        out->res = gIopFlipCache[i].res; out->allocation = gIopFlipCache[i].allocation;
+        out->res->retain(); out->allocation->retain();
+        gIopFlipCache[i].use = ++gIopFlipCacheTick;
         break;
     }
     IOSimpleLockUnlock(gIopFlipCacheLock);
-    return hit;
+    return out->allocation != nullptr;
 }
-static void nvAccelIopCachePut(IOSurface *s, NVResource *res, NVVidMemory *vm, void *kmem, unsigned long long bytes)
+static void nvAccelIopCachePut(IOSurface *surface, NVResource *res, NVVramAllocation *allocation)
 {
-    if (!gIopFlipCacheLock) { IOSimpleLock *l = IOSimpleLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gIopFlipCacheLock)) IOSimpleLockFree(l); }
+    if (!gIopFlipCacheLock) {
+        IOSimpleLock *l = IOSimpleLockAlloc();
+        if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gIopFlipCacheLock)) IOSimpleLockFree(l);
+    }
     if (!gIopFlipCacheLock) return;
-    IOSurface *drop = nullptr;
-    ((OSObject *)s)->retain();
+    ((OSObject *)surface)->retain(); res->retain(); allocation->retain();
     IOSimpleLockLock(gIopFlipCacheLock);
     unsigned k = 0;
-    for (unsigned i = 0; i < 8; i++) {
-        if (gIopFlipCache[i].s == s) { k = i; break; }
-        if (!gIopFlipCache[i].s) { k = i; break; }
+    for (unsigned i = 0; i < 8; ++i) {
+        if (!gIopFlipCache[i].s || gIopFlipCache[i].s == surface) { k = i; break; }
         if (gIopFlipCache[i].use < gIopFlipCache[k].use) k = i;
     }
-    drop = gIopFlipCache[k].s;
-    gIopFlipCache[k].s = s; gIopFlipCache[k].res = res; gIopFlipCache[k].vm = vm; gIopFlipCache[k].kmem = kmem;
-    gIopFlipCache[k].bytes = bytes; gIopFlipCache[k].use = ++gIopFlipCacheTick;
+    NVIopFlipCache old = gIopFlipCache[k];
+    gIopFlipCache[k] = { surface, res, allocation, ++gIopFlipCacheTick };
     IOSimpleLockUnlock(gIopFlipCacheLock);
-    if (drop) ((OSObject *)drop)->release();
+    if (old.s) ((OSObject *)old.s)->release();
+    if (old.res) old.res->release();
+    if (old.allocation) old.allocation->release();
+}
+static NVVramAllocation *gIopFrontBacking[kNvMaxFB], *gIopPrevBacking[kNvMaxFB];
+static IOLock *gIopAsLock;
+static bool nvIopLockReady()
+{
+    if (!gIopAsLock) {
+        IOLock *lock = IOLockAlloc();
+        if (lock && !OSCompareAndSwapPtr(nullptr, lock, (void *volatile *)&gIopAsLock)) IOLockFree(lock);
+    }
+    return gIopAsLock != nullptr;
+}
+static void nvDropPresentLease(NVVramAllocation *a)
+{ if (a) { a->releaseLease(NVLeaseUse::Present); a->release(); } }
+static void nvIopAdoptFront(unsigned head, IOSurface *surface, NVVramAllocation *allocation)
+{
+    IOLockLock(gIopAsLock);
+    IOSurface *old = gIopFlipPrev[head]; NVVramAllocation *previous = gIopPrevBacking[head];
+    gIopFlipPrev[head] = gIopFlipFront[head]; gIopPrevBacking[head] = gIopFrontBacking[head];
+    gIopFlipFront[head] = surface; gIopFrontBacking[head] = allocation; gIopFlipped[head] = true;
+    IOLockUnlock(gIopAsLock);
+    if (old) ((OSObject *)old)->release();
+    nvDropPresentLease(previous);
 }
 extern "C" {
 #if defined(NM_ERA) && NM_ERA < 1015
@@ -2799,202 +3256,143 @@ void _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(void *pipe, void *ar
 struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
 int thread_call_enter(struct thread_call *call);
 }
-// next/nextF: one frame WindowServer presented while the previous flip was still in flight past the bound, taken by
-// the worker as soon as that flip lands (guarded by gIopAsLock, like busy's clearing).
-struct NVIopAsync { void *pipe; IOService *fb; IOSurface *s; struct NVRMFlipRequest f; volatile SInt32 busy; struct thread_call *call;
-                    IOSurface *next; struct NVRMFlipRequest nextF; };
+struct NVIopAsyncFrame {
+    IOSurface *surface;
+    NVVramAllocation *allocation; // one acquired Present lease, not just an OSObject reference
+    NVRMFlipRequest request;
+    NVTransactionState transaction;
+};
+struct NVIopAsync {
+    NVDisplayPipe *pipe; IOService *fb; NVVramOwner *owner;
+    NVIopAsyncFrame current, next;
+    volatile SInt32 busy;
+    struct thread_call *call;
+    bool stopping;
+};
 static NVIopAsync gIopAs[kNvMaxFB];
-static SInt32 gIopAsyncRefuseRun;
-// WindowServer's next present waits here while the previous asynchronous flip is still on its way to the panel. It
-// waited in IOSleep(1) steps, each overshooting by a millisecond or more - a large slice of a 6.9 ms frame at 144 Hz,
-// where the desktop then ran near half the panel rate. The flip's worker wakes the waiter when it finishes; the busy
-// flag is still re-read at least every 250 us. The bound is one refresh period and a quarter, published by the
-// framebuffer from its mode (NVRMFlipWaitUs): a flip in flight lands at the next vblank, so a wait past that only
-// holds WindowServer's thread; the frame is dropped instead and the next one follows the flip.
-static IOLock *gIopAsLock;
-static uint64_t nvAccelFlipWaitUs(IOService *fb)
+static void nvIopDropFrame(NVIopAsyncFrame *frame)
 {
-    // A retained copy: a mode switch republishes the property, which releases the number getProperty would return.
-    OSObject *o = fb ? fb->copyProperty("NVRMFlipWaitUs") : nullptr;
-    OSNumber *n = OSDynamicCast(OSNumber, o);
-    const uint64_t us = n ? n->unsigned64BitValue() : 0;
-    if (o) o->release();
-    return us ? us : 50000;   // before the framebuffer has a mode, the old 50 ms
-}
-// What the framebuffer's answer to a flip means for the frame: on the panel, kept (busy: the flip before it is still
-// landing, the next present follows it), or refused (copied, and three in a row turn the asynchronous swap off).
-enum { kNvFlipShown = 0, kNvFlipKept = 1, kNvFlipRefused = 2, kNvFlipAsleep = 3 };
-static int nvAccelFlipOutcome(IOReturn rr)
-{
-    // NotReady: the framebuffer's head is in display sleep or the GPU is in standby (NVKMS answers "pm running"). That is not a
-    // refusal: the frame has nowhere to go, and three of them in a row used to switch the asynchronous swap off for the rest of
-    // the boot (issue 470: the hang after display sleep followed that switch).
-    return rr == kIOReturnSuccess ? kNvFlipShown : rr == kIOReturnBusy ? kNvFlipKept : rr == kIOReturnNotReady ? kNvFlipAsleep : kNvFlipRefused;
-}
-static bool nvAccelIopAsyncBusy(const void *pipe)
-{
-    for (unsigned h = 0; h < kNvMaxFB; h++)
-        if (gIopAs[h].pipe == pipe && __atomic_load_n(&gIopAs[h].busy, __ATOMIC_ACQUIRE)) return true;
-    return false;
+    if (frame->surface) ((OSObject *)frame->surface)->release();
+    nvDropPresentLease(frame->allocation);
+    if (frame->transaction.transaction) ((OSObject *)frame->transaction.transaction)->release();
+    *frame = {};
 }
 static void nvAccelIopAsyncRun(void *p0, void *)
 {
     NVIopAsync *e = (NVIopAsync *)p0;
     const unsigned head = (unsigned)(e - gIopAs);
-    IOSurface *s = e->s; e->s = nullptr;
-  again:
-    nvSurfWaitReady(s->getSurfaceID());   // WindowServer did not wait for this composite; the flip does, off its thread
-    const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
-    IOReturn rr = sym ? e->fb->callPlatformFunction(sym, false, &e->f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
-    if (sym) sym->release();
-    const int outcome = nvAccelFlipOutcome(rr);
-    if (outcome == kNvFlipShown) {
-        gIopAsyncRefuseRun = 0;
-        if (gIopFlipPrev[head]) ((OSObject *)gIopFlipPrev[head])->release();
-        gIopFlipPrev[head] = gIopFlipFront[head]; gIopFlipFront[head] = s; gIopFlipped[head] = true;
-        const SInt64 n = OSAddAtomic64(1, &gCntIopFlip); OSAddAtomic64(1, &gCntIopAsync);
-        if (n < 4 || n == 600 || (n & 0xffff) == 0)
-            ALOG("iop: ASYNC swap #%lld head %u: surface 0x%x %ux%u pitch %u scanned out of its own VRAM (flipResult %d)",
-                 (long long)n + 1, head, s->getSurfaceID(), e->f.width, e->f.height, e->f.pitch, e->f.flipResult);
-    } else if (outcome == kNvFlipKept) {
-        OSAddAtomic64(1, &gCntIopLate);
-        ((OSObject *)s)->release();
-    } else if (outcome == kNvFlipAsleep) {
-        ((OSObject *)s)->release();   // dropped without a strike against the asynchronous swap
-    } else {
-        OSAddAtomic64(1, &gCntIopAsyncRefused); OSAddAtomic64(1, &gCntIopFlipNo[7]);
-        if (gIopFlipLogs < 8) { gIopFlipLogs++; ALOG("iop: async flip REFUSED (0x%x, flipResult %d) head %u -- that frame is not on the panel",
-                                                     (unsigned)rr, e->f.flipResult, head); }
-        if (++gIopAsyncRefuseRun >= 3 && gIopAsync) {
-            gIopAsync = 0;
-            ALOG("iop: b89k 3 async refusals in a row -- debug.nvaccel_iop_async=0 (synchronous flip, which copies on refusal)");
-        }
-        ((OSObject *)s)->release();
-    }
-    // A frame queued behind this flip follows it at once; otherwise the worker is free and the waiter is woken.
-    IOSurface *queued = nullptr;
-    if (gIopAsLock) {
+    for (;;) {
         IOLockLock(gIopAsLock);
-        queued = e->next; e->next = nullptr;
-        if (queued) { for (unsigned i = 0; i < sizeof e->f; i++) ((volatile unsigned char *)&e->f)[i] = ((const volatile unsigned char *)&e->nextF)[i]; }
-        else { __atomic_store_n(&e->busy, 0, __ATOMIC_RELEASE); IOLockWakeup(gIopAsLock, (event_t)&e->busy, false); }
+        NVIopAsyncFrame frame = e->current; e->current = {};
+        bool stopping = e->stopping;
         IOLockUnlock(gIopAsLock);
-    } else {
-        __atomic_store_n(&e->busy, 0, __ATOMIC_RELEASE);
+        IOReturn result = kIOReturnNotReady;
+        if (frame.surface && !stopping && e->owner->active()) {
+            if (!nvSurfWaitReady(frame.surface->getSurfaceID())) result = kIOReturnTimeout;
+            else {
+                const OSSymbol *s = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
+                result = s ? e->fb->callPlatformFunction(s, false, &frame.request, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
+                if (s) s->release();
+            }
+        }
+        if (result == kIOReturnSuccess) {
+            nvIopAdoptFront(head, frame.surface, frame.allocation);
+            frame.surface = nullptr; frame.allocation = nullptr;
+            OSAddAtomic64(1, &gCntIopFlip); OSAddAtomic64(1, &gCntIopAsync);
+            OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
+        } else OSAddAtomic64(1, &gCntIopAsyncRefused);
+        e->pipe->finishTransaction(frame.transaction, result);
+        nvIopDropFrame(&frame);
+        _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(e->pipe, nullptr);
+        IOLockLock(gIopAsLock);
+        if (!e->stopping && e->next.surface) {
+            e->current = e->next; e->next = {};
+            IOLockUnlock(gIopAsLock);
+        } else {
+            e->busy = 0;
+            IOLockWakeup(gIopAsLock, (event_t)&e->busy, false);
+            IOLockUnlock(gIopAsLock);
+            break;
+        }
     }
-    _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(e->pipe, nullptr);
-    if (queued) { s = queued; goto again; }
 }
-static bool nvAccelIopAsyncStart(void *pipe, IOService *fb, unsigned head, IOSurface *s, const struct NVRMFlipRequest *f)
+static bool nvAccelIopAsyncStart(NVDisplayPipe *pipe, IOService *fb, unsigned head, IOSurface *surface,
+                                const NVRMFlipRequest *request, NVVramLease *lease)
 {
+    if (!nvIopLockReady() || !pipe->fAccel || pipe->fAccel->fStopping || pipe->fFramebufferPhase != NVFramebufferPhase::Ready) return false;
     NVIopAsync *e = &gIopAs[head];
-    if (!gIopAsLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gIopAsLock)) IOLockFree(l); }
-    if (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE)) {
-        uint64_t end = 0; clock_interval_to_deadline((uint32_t)nvAccelFlipWaitUs(fb), kMicrosecondScale, &end);
-        while (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE) && mach_absolute_time() < end) {
-            if (!gIopAsLock) { IOSleep(1); continue; }
-            uint64_t next = 0; clock_interval_to_deadline(250, kMicrosecondScale, &next);
-            if (next > end) next = end;
-            IOLockLock(gIopAsLock);
-            if (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE))
-                IOLockSleepDeadline(gIopAsLock, (event_t)&e->busy, next, THREAD_UNINT);
-            IOLockUnlock(gIopAsLock);
+    NVIopAsyncFrame displaced = {};
+    IOLockLock(gIopAsLock);
+    if (e->stopping || (e->pipe && (e->pipe != pipe || e->fb != fb))) { IOLockUnlock(gIopAsLock); return false; }
+    if (!e->call) {
+        e->call = thread_call_allocate(nvAccelIopAsyncRun, e);
+        if (!e->call || !pipe->fAccel->fOwner->borrow()) {
+            if (e->call) { thread_call_free(e->call); e->call = nullptr; }
+            IOLockUnlock(gIopAsLock); return false;
         }
+        e->owner = pipe->fAccel->fOwner;
+        e->pipe = pipe; pipe->retain(); e->fb = fb; fb->retain();
     }
-    if (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE) && gIopAsLock) {
-        // Still in flight past the bound: this frame is queued for the worker instead of holding WindowServer any
-        // longer, replacing an older queued frame (that one is the dropped frame the counter names).
-        IOLockLock(gIopAsLock);
-        if (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE) && e->pipe == pipe && e->fb == fb) {
-            IOSurface *old = e->next;
-            ((OSObject *)s)->retain();
-            e->next = s;
-            for (unsigned i = 0; i < sizeof *f; i++) ((volatile unsigned char *)&e->nextF)[i] = ((const unsigned char *)f)[i];
-            IOLockUnlock(gIopAsLock);
-            if (old) { OSAddAtomic64(1, &gCntIopAsyncDrop); ((OSObject *)old)->release(); }
-            return true;
-        }
-        IOLockUnlock(gIopAsLock);
-    }
-    if (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE)) {
-        OSAddAtomic64(1, &gCntIopAsyncDrop);
-        return true;
-    }
-    if (!e->call) e->call = thread_call_allocate(nvAccelIopAsyncRun, e);
-    if (!e->call) return false;
-    ((OSObject *)s)->retain();
-    e->pipe = pipe; e->fb = fb; e->s = s;
-    for (unsigned i = 0; i < sizeof *f; i++) ((volatile unsigned char *)&e->f)[i] = ((const unsigned char *)f)[i];
-    __atomic_store_n(&e->busy, 1, __ATOMIC_RELEASE);
-    thread_call_enter(e->call);
+    NVIopAsyncFrame frame = {};
+    frame.surface = surface; ((OSObject *)surface)->retain();
+    frame.allocation = lease->take(); frame.request = *request;
+    IOLockLock(pipe->fTransactionLock); pipe->fTransaction.queued = true; frame.transaction = pipe->fTransaction; IOLockUnlock(pipe->fTransactionLock);
+    frame.transaction.key = frame.allocation->key();
+    if (frame.transaction.transaction) ((OSObject *)frame.transaction.transaction)->retain();
+    if (e->busy) { displaced = e->next; e->next = frame; }
+    else { e->current = frame; e->busy = 1; thread_call_enter(e->call); }
+    IOLockUnlock(gIopAsLock);
+    if (displaced.surface) { OSAddAtomic64(1, &gCntIopAsyncDrop); nvIopDropFrame(&displaced); }
     return true;
 }
 static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe)
 {
-    if (!gIopFlip || !fb || !s || head >= kNvMaxFB) return false;
-    // zero-copy scan-out is an NVIDIA display-engine flip; another vendor's panel (NMIntelFB) always takes the copy
-    if (!fb->metaCast("NVRMNVDAFramebuffer")) return false;
-    NVAccel *a = NVAccel::forDisplay();
-    if (!a) return nvAccelIopFlipNo(1);
-    if (s->getPixelFormat() != 0x42475241u) return nvAccelIopFlipNo(2);
-    NVResource *res = nullptr; NVVidMemory *vm = nullptr; void *kmem = nullptr; unsigned long long bytes = 0;
-    if (nvAccelIopCacheGet(s, &res, &vm, &kmem, &bytes)) {
-        OSAddAtomic64(1, &gCntIopFlipHit);
-    } else {
-        if (!nvFamLock(a, true)) return nvAccelIopFlipNo(3);
-        void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
-        OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
-        res = OSDynamicCast(NVResource, ctx);
-        vm = res ? nvres_vidmem(res) : nullptr;
-        kmem = (vm && vm->fRmHandle && vm->fBytes && !vm->fScanout) ? vm->fRmHandle : nullptr;
-        bytes = vm ? vm->fBytes : 0;
+    if (!gIopFlip || !fb || !s || head >= kNvMaxFB || !fb->metaCast("NVRMNVDAFramebuffer") || !nvIopLockReady()) return false;
+    NVAccel *a = NVAccel::forDisplay(); NVRetain retained(a);
+    if (!a || a->fCandidate || s->getPixelFormat() != NV_IOP_FMT_BGRA || !nvFamLock(a, true)) return false;
+    NVFlipView view;
+    if (nvAccelIopCacheGet(s, &view)) OSAddAtomic64(1, &gCntIopFlipHit);
+    else {
+        void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej(a, s, 0);
+        NVResource *r = cache ? OSDynamicCast(NVResource, *(OSObject **)((unsigned char *)cache + 0x20)) : nullptr;
+        NVVidMemory *m = r ? nvres_vidmem(r) : nullptr;
+        if (m && m->fBacking) {
+            view.res = r; r->retain(); view.allocation = m->fBacking; view.allocation->retain();
+            nvAccelIopCachePut(s, r, m->fBacking);
+        }
         if (cache) ((OSObject *)cache)->release();
-        nvFamUnlock(a);
         OSAddAtomic64(1, &gCntIopFlipMiss);
-        if (kmem) nvAccelIopCachePut(s, res, vm, kmem, bytes);
     }
-    volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + kNvResValid) : nullptr;
-    const bool vramNewest = valid && (valid[6] & 1u);
-    if (!kmem) return nvAccelIopFlipNo(4);
-    if (!vramNewest) return nvAccelIopFlipNo(5);
-    // Checked against the allocation this flip submits (vm, resolved above and cached), not re-resolved from the
-    // resource: this runs outside the family lock, and the record must describe the VRAM that is about to be scanned.
-    if (!nvAccelIopVramFlippable(vramNewest, nvAccelPluginWrote(res->fPluginWroteCookie, vm->fAllocationCookie))) {
-        const SInt64 n = OSAddAtomic64(1, &gCntIopUnwritten);
-        if (n < 4 || (n & 0xfff) == 0)
-            ALOG("iop: surface 0x%x: VRAM marked newest but the plugin never wrote it -- copying its system memory instead of flipping (%lld so far)",
-                 s->getSurfaceID(), (long long)n + 1);
-        return false;
-    }
-    const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
-    if (!W || !H || P < 4 * W || H * P > bytes) return nvAccelIopFlipNo(6);
-    struct NVRMFlipRequest f; nvSVZero(&f, sizeof f);
-    f.version = NVRM_FLIP_ABI_VERSION; f.kapiMemory = kmem; f.allocationCookie = vm->fAllocationCookie; f.width = (unsigned)W; f.height = (unsigned)H; f.pitch = (unsigned)P;
-    if (gIopAsync && pipe) return nvAccelIopAsyncStart(pipe, fb, head, s, &f);
-    nvSurfWaitReady(s->getSurfaceID());
-    const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
-    IOReturn rr = sym ? fb->callPlatformFunction(sym, false, &f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
-    if (sym) sym->release();
-    if (nvAccelFlipOutcome(rr) == kNvFlipKept) { OSAddAtomic64(1, &gCntIopLate); return true; }
-    if (nvAccelFlipOutcome(rr) == kNvFlipAsleep) return true;   // display asleep: nothing to show, nothing to copy   // the frame on the panel stays
-    if (rr != kIOReturnSuccess) {
-        if (gIopFlipLogs < 8) { gIopFlipLogs++; ALOG("iop: flip REFUSED (0x%x, flipResult %d) head %u %llux%llu pitch %llu -- copying",
-                                                     (unsigned)rr, f.flipResult, head, W, H, P); }
-        return nvAccelIopFlipNo(7);
-    }
-    ((OSObject *)s)->retain();
-    if (gIopFlipPrev[head]) ((OSObject *)gIopFlipPrev[head])->release();
-    gIopFlipPrev[head] = gIopFlipFront[head]; gIopFlipFront[head] = s; gIopFlipped[head] = true;
-    const SInt64 n = OSAddAtomic64(1, &gCntIopFlip);
-    if (n < 4 || n == 600 || (n & 0xffff) == 0)
-        ALOG("iop: zero-copy swap #%lld head %u: surface 0x%x %llux%llu pitch %llu scanned out of its own VRAM (flipResult %d)",
-             (long long)n + 1, head, s->getSurfaceID(), W, H, P, f.flipResult);
+    NVVidMemory *vm = view.res ? nvres_vidmem(view.res) : nullptr;
+    const volatile unsigned short *valid = view.res ? *(unsigned short **)((unsigned char *)view.res + kNvResValid) : nullptr;
+    NVVramLease lease;
+    bool ok = vm && vm->fBacking == view.allocation && !view.allocation->fOwner->fDirect &&
+        valid && nvAccelIopVramFlippable((valid[6] & 1u) != 0,
+            nvAccelPluginWrote(view.res->fPluginWroteCookie, view.allocation->fReceipt.allocationCookie)) &&
+        view.allocation->acquire(NVLeaseUse::Present, &lease);
+    nvFamUnlock(a);
+    if (!ok) return nvAccelIopFlipNo(4);
+    const uint64_t w = s->getWidth(), h = s->getHeight(), pitch = s->getBytesPerRow();
+    if (!w || !h || w > UINT32_MAX || h > UINT32_MAX || pitch > UINT32_MAX ||
+        pitch < 4 * w || h * pitch > view.allocation->fReceipt.actualSize) return nvAccelIopFlipNo(6);
+    NVRMFlipRequest request = {};
+    request.version = NVRM_FLIP_ABI_VERSION; request.kapiMemory = view.allocation->fReceipt.handle;
+    request.allocationCookie = view.allocation->fReceipt.allocationCookie;
+    request.width = (unsigned)w; request.height = (unsigned)h; request.pitch = (unsigned)pitch;
+    if (gIopAsync && pipe) return nvAccelIopAsyncStart((NVDisplayPipe *)pipe, fb, head, s, &request, &lease);
+    if (!nvSurfWaitReady(s->getSurfaceID())) return false;
+    const OSSymbol *symbol = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
+    IOReturn result = symbol ? fb->callPlatformFunction(symbol, false, &request, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
+    if (symbol) symbol->release();
+    if (result != kIOReturnSuccess) return nvAccelIopFlipNo(7);
+    ((OSObject *)s)->retain(); nvIopAdoptFront(head, s, lease.take());
+    OSAddAtomic64(1, &gCntIopFlip);
     return true;
 }
 static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS
 {
     unsigned v = 0;
-    NVAccel *a = NVAccel::forDisplay();
+    NVAccel *a = NVAccel::forDisplay(); NVRetain retained(a);
     IOService *fb = a ? a->fFB : nullptr;
     IOService *nub = fb ? fb->getProvider() : nullptr;
     struct NVRMDisplayPointers displayPtrs = {};
@@ -3005,7 +3403,11 @@ static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS
     }
     struct NvKmsKapiFunctionsTable *k = (struct NvKmsKapiFunctionsTable *)displayPtrs.kapi;
     struct NVRMRmHandles h; nvSVZero(&h, sizeof h);
-    if (k && k->getCRC32 && gCrcHead >= 0 && gCrcHead < 8 && nvAccelRmHandles(NVAccel::forDisplay(), &h) && h.kapiDevice) {
+    h.version = NVRM_GPUVA_ABI_VERSION;
+    const OSSymbol *handles = OSSymbol::withCStringNoCopy(NVRM_GPUVA_FN_HANDLES);
+    const bool displayHandles = fb && handles && fb->callPlatformFunction(handles, false, &h, nullptr, nullptr, nullptr) == kIOReturnSuccess;
+    if (handles) handles->release();
+    if (k && k->getCRC32 && gCrcHead >= 0 && gCrcHead < 8 && displayHandles && h.kapiDevice) {
         struct NvKmsKapiCrcs c; nvSVZero(&c, sizeof c);
         if (k->getCRC32((struct NvKmsKapiDevice *)h.kapiDevice, (NvU32)gCrcHead, &c))
             v = c.compositorCrc32.supported ? c.compositorCrc32.value : (c.outputCrc32.supported ? c.outputCrc32.value : 0);
@@ -3013,9 +3415,10 @@ static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS
     int out = (int)v;
     return sysctl_handle_int(oidp, &out, 0, req);
 }
-static void nvAccelIopHome(IOService *fb, unsigned head)
+static bool nvAccelIopHome(IOService *fb, unsigned head)
 {
-    if (!fb || head >= kNvMaxFB || !gIopFlipped[head] || !fb->metaCast("NVRMNVDAFramebuffer")) return;
+    if (!fb || head >= kNvMaxFB) return false;
+    if (!gIopFlipped[head] || !fb->metaCast("NVRMNVDAFramebuffer")) return true;
     struct NVRMFlipRequest f; nvSVZero(&f, sizeof f);
     f.version = NVRM_FLIP_ABI_VERSION; f.flags = 1u;
     const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
@@ -3024,61 +3427,28 @@ static void nvAccelIopHome(IOService *fb, unsigned head)
     OSAddAtomic64(1, &gCntIopFlipHome);
     // Busy: the flip before HOME is still landing and HOME was not submitted, so the panel is not home yet and the
     // next copied frame tries again. Clearing the flag here left every later copy offscreen behind that flip.
-    if (rr == kIOReturnBusy) return;
-    if (rr != kIOReturnSuccess && gIopFlipLogs < 8) { gIopFlipLogs++; ALOG("iop: HOME flip refused (0x%x) head %u", (unsigned)rr, head); }
+    if (rr != kIOReturnSuccess) return false;
     gIopFlipped[head] = false;
+    return true;
 }
-static void nvAccelSurfScanoutSync(IOSurface *s)
-{
-    if (!s || !NVAccel::forDisplay() || !nvSVPend(_ZNK9IOSurface12getSurfaceIDEv((void *)s), 2)) return;
-    NVAccel *a = NVAccel::forDisplay();
-    if (!nvFamLock(a, true)) {
-        if (++gNVSVLockMiss <= 8 || (gNVSVLockMiss & 1023) == 0)
-            ALOG("surfvram scanout: accelerator lock busy, surface %u stays pending (misses %u)",
-                 _ZNK9IOSurface12getSurfaceIDEv((void *)s), gNVSVLockMiss);
-        return;
-    }
-    void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
-    OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
-    NVResource *res = OSDynamicCast(NVResource, ctx);
-    bool out = false;
-    if (res) res->pageoff(nullptr, true, &out, 0);
-    if (!out) nvSVPend(_ZNK9IOSurface12getSurfaceIDEv((void *)s), 0);
-    if (cache) ((OSObject *)cache)->release();
-    nvFamUnlock(a);
-}
-// True when the surface's system memory holds its newest pixels, after moving them there if the GPU drew them into VRAM.
-// Unlike nvAccelSurfScanoutSync it waits a few ms for the accelerator lock and does not clear the pending mark when the
-// page-off fails. At most 4 frames in a row are held back per head: a surface that never syncs is copied as before
-// rather than freezing the panel.
-static unsigned gIopCopyHeld[kNvMaxFB];
 static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head)
 {
-    NVAccel *a = NVAccel::forDisplay();
-    if (!s || !a) return true;
-    const unsigned id = _ZNK9IOSurface12getSurfaceIDEv((void *)s);
-    bool ready = !nvSVPend(id, 2);
-    if (!ready) {
-        bool locked = false;
-        for (unsigned i = 0; i < 8 && !(locked = nvFamLock(a, true)); i++) IOSleep(1);
-        if (locked) {
-            void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
-            OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
-            NVResource *res = OSDynamicCast(NVResource, ctx);
-            volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + kNvResValid) : nullptr;
-            if (!res || !valid || (valid[0] & 1u)) ready = true;
-            else if (!nvAccelIopCopyNeedsPageoff(false, nvAccelResPluginWrote(res))) { ready = true; OSAddAtomic64(1, &gCntIopCopyUnwritten); }
-            else { bool out = false; res->pageoff(nullptr, true, &out, 0); ready = out || (valid[0] & 1u); }
-            if (ready) nvSVPend(id, 0);
-            if (cache) ((OSObject *)cache)->release();
-            nvFamUnlock(a);
-        }
+    NVAccel *a = NVAccel::forDisplay(); NVRetain retained(a);
+    if (!s || !a || head >= kNvMaxFB || !nvFamLock(a, true)) return false;
+    void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej(a, s, 0);
+    OSObject *context = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
+    NVResource *res = OSDynamicCast(NVResource, context);
+    const volatile unsigned short *valid = res ? *(unsigned short *volatile *)((unsigned char *)res + kNvResValid) : nullptr;
+    bool ready = res && valid && (valid[0] & 1u) && !res->requirePageoff();
+    if (!ready && res && !a->fCandidate) {
+        bool published = false; res->pageoff(nullptr, true, &published, 0);
+        ready = published && valid && (valid[0] & 1u);
     }
-    if (head >= kNvMaxFB) return true;
-    if (ready) { gIopCopyHeld[head] = 0; return true; }
-    if (++gIopCopyHeld[head] > 4) { gIopCopyHeld[head] = 0; return true; }
-    OSAddAtomic64(1, &gCntIopCopySkip);
-    return false;
+    if (ready) nvSVPend(s->getSurfaceID(), 0, res);
+    if (cache) ((OSObject *)cache)->release();
+    nvFamUnlock(a);
+    if (!ready) OSAddAtomic64(1, &gCntIopCopySkip);
+    return ready;
 }
 
 // nmflatskip: 64 samples of the surface's system-memory copy. Judged only when that copy is the newest one (no page-off
@@ -3105,24 +3475,9 @@ static bool nvAccelFlatHeld(NVDisplayPipe *pipe, unsigned head, IOSurface *s)
 // Shadow of the previous frame sent to another GPU's panel, one per head: ordinary cached memory, so finding what changed
 // costs reads, and the write-combined scan-out gets stores only for those pixels.
 static struct { struct nmh_shadow sh; unsigned long long bytes; } gHyShadow[kNvMaxFB];
-static struct nmh_shadow *nvAccelHybridShadow(unsigned head, unsigned w, unsigned h)
-{
-    if (head >= kNvMaxFB) return nullptr;
-    const unsigned long long need = (unsigned long long)w * h * 4;
-    if (gHyShadow[head].sh.buf && gHyShadow[head].bytes != need) {
-        IOFree(gHyShadow[head].sh.buf, gHyShadow[head].bytes); gHyShadow[head].sh.buf = nullptr; gHyShadow[head].bytes = 0;
-    }
-    if (!gHyShadow[head].sh.buf) {
-        gHyShadow[head].sh.buf = (uint32_t *)IOMalloc(need);
-        if (!gHyShadow[head].sh.buf) return nullptr;     // no shadow: every frame is a full copy, as before
-        gHyShadow[head].bytes = need; gHyShadow[head].sh.valid = 0;
-    }
-    gHyShadow[head].sh.w = w; gHyShadow[head].sh.h = h;
-    return &gHyShadow[head].sh;
-}
-
 // import slots: the memory descriptor behind each slot is held (wired, retained) while the other GPU's table maps its pages
 static IOMemoryDescriptor *gHyMd[kNvMaxFB][NMH_SLOTS];
+static NVVramAllocation *gHyBacking[kNvMaxFB][NMH_SLOTS];
 static unsigned gHyMdId[kNvMaxFB][NMH_SLOTS];
 static bool gHyOnSlot[kNvMaxFB];      // the panel's plane is on an imported surface, not the boot surface
 static unsigned gHyFailLogs;
@@ -3131,20 +3486,23 @@ static void nvAccelHybridRelease(unsigned head, int slot)
 {
     if (gHyMd[head][slot]) { gHyMd[head][slot]->complete(); gHyMd[head][slot]->release(); gHyMd[head][slot] = nullptr; }
     gHyMdId[head][slot] = 0;
+    nvDropPresentLease(gHyBacking[head][slot]); gHyBacking[head][slot] = nullptr;
 }
 
 // The copy path writes into the boot surface, so the plane has to be there first, and the shadow no longer describes it.
-static void nvAccelHybridHome(IOService *fb, unsigned head)
+static bool nvAccelHybridHome(IOService *fb, unsigned head)
 {
-    if (head >= kNvMaxFB || !gHyOnSlot[head]) return;
+    if (!fb || fb->metaCast("NMIntelFB") || head >= kNvMaxFB) return false;
+    if (!gHyOnSlot[head]) return true;
     NMHybridReq q; nvSVZero(&q, sizeof q);
     q.version = NMH_ABI_VERSION; q.op = NMH_OP_HOME;
     const OSSymbol *sym = OSSymbol::withCStringNoCopy(NMH_FN_IMPORT);
     IOReturn rr = sym ? fb->callPlatformFunction(sym, false, &q, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
     if (sym) sym->release();
-    gHyOnSlot[head] = false;
+    if (rr == kIOReturnSuccess) gHyOnSlot[head] = false;
     nmh_shadow_invalidate(&gHyShadow[head].sh);
     if (rr != kIOReturnSuccess && gHyFailLogs < 8) { gHyFailLogs++; ALOG("hybrid: HOME refused (0x%x) head %u", (unsigned)rr, head); }
+    return rr == kIOReturnSuccess;
 }
 
 // Level 4: the copy engine writes the frame, which is still only in the GPU's memory, into a buffer the panel driver owns. The
@@ -3157,7 +3515,7 @@ struct NVHyDmaCtx {
     NVDisplayPipe *pipe; IOService *fb; IOSurface *s; const OSSymbol *sym; NVResource *res; NVVidMemory *vm; NVRMRmHandles h;
     NMHybridReq q; unsigned long long len; unsigned id; void *cache; NVAccel *accel;
 };
-static int hyDmaRender(void *c) { NVHyDmaCtx *x = (NVHyDmaCtx *)c; nvSurfWaitReady(x->id); return 0; }
+static int hyDmaRender(void *c) { NVHyDmaCtx *x = (NVHyDmaCtx *)c; return nvSurfWaitReady(x->id) ? 0 : -1; }
 static int hyDmaLockLookup(void *c)
 {
     NVHyDmaCtx *x = (NVHyDmaCtx *)c;
@@ -3169,9 +3527,9 @@ static int hyDmaLockLookup(void *c)
     struct NVRMVramRequest sq; nvSVZero(&sq, sizeof sq); sq.version = NVRM_VRAM_ABI_VERSION;
     const IOReturn sr = x->accel->askFramebufferForScanout(&sq, x->fb);
     // the copy is of what is still only in the GPU's memory; nvSVPend was true when the frame was chosen
-    const int why = (x->vm && x->vm->fRmHandle && !x->vm->fScanout && sr == kIOReturnSuccess && nvAccelRmHandles(x->pipe->fAccel, &x->h))
+    const int why = (x->vm && x->vm->handle() && !x->vm->fScanout && sr == kIOReturnSuccess && x->vm->fOwner->handles(&x->h))
         ? nmh_dma_eligible(gNmHybrid, 1, x->s->getPixelFormat(), (unsigned)x->s->getWidth(), (unsigned)x->s->getHeight(), (unsigned)x->s->getBytesPerRow(),
-                           sq.width, sq.height, sq.pitch, x->vm->fBytes, (unsigned long long)sq.pitch * sq.height)
+                           sq.width, sq.height, sq.pitch, x->vm->capacity(), sq.actualSize)
         : NMH_E_NOTVRAM;
     if (why == NMH_OK) return 0;
     if (x->cache) { ((OSObject *)x->cache)->release(); x->cache = nullptr; }
@@ -3198,7 +3556,7 @@ static int hyDmaCopy(void *c, int idx)
 {
     NVHyDmaCtx *x = (NVHyDmaCtx *)c; (void)idx;
     struct NVRMSurfPageoff p; nvSVZero(&p, sizeof p);
-    p.version = NVRM_SS_RM_VERSION; p.status = NVRM_SS_OFF; p.kapiDevice = x->h.kapiDevice; p.kapiMemory = x->vm->fRmHandle;
+    p.version = NVRM_SS_RM_VERSION; p.status = NVRM_SS_OFF; p.kapiDevice = x->h.kapiDevice; p.kapiMemory = x->vm->handle();
     p.pages = x->q.pages; p.pageCount = (x->len + 4095) >> 12; p.length = x->len;
     IOService *nvrm = nvAccelNVRM(x->pipe->fAccel);
     const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVRM_SS_FN_PAGEOFF);
@@ -3226,7 +3584,8 @@ static void hyDmaQuarantine(void *c, int idx)
 }
 static bool nvAccelHybridDma(NVDisplayPipe *pipe, IOService *fb, unsigned head, IOSurface *s)
 {
-    if (!pipe || !fb || !s || head >= kNvMaxFB || fb->metaCast("NVRMNVDAFramebuffer")) return false;
+    if (!pipe || !fb || !s || head >= kNvMaxFB || fb->metaCast("NVRMNVDAFramebuffer") || fb->metaCast("NMIntelFB") ||
+        !pipe->fAccel || pipe->fAccel->fCandidate) return false;
     NVHyDmaCtx x; nvSVZero(&x, sizeof x);
     x.pipe = pipe; x.fb = fb; x.s = s; x.id = s->getSurfaceID();
     x.len = (unsigned long long)s->getBytesPerRow() * s->getHeight();
@@ -3252,7 +3611,7 @@ static bool nvAccelHybridDma(NVDisplayPipe *pipe, IOService *fb, unsigned head, 
 static bool nvAccelHybridOwned(IOService *fb, unsigned head, const volatile unsigned int *src, unsigned w, unsigned h,
                                unsigned pitch, bool from10, unsigned dpitch)
 {
-    if (!fb || head >= kNvMaxFB) return false;
+    if (!fb || head >= kNvMaxFB || fb->metaCast("NMIntelFB")) return false;
     const OSSymbol *sym = OSSymbol::withCStringNoCopy(NMH_FN_IMPORT);
     if (!sym) return false;
     struct Guard { const OSSymbol *s; ~Guard() { s->release(); } } guard = { sym };
@@ -3302,7 +3661,7 @@ static bool nvAccelP2pAllowed(IOService *fb, unsigned head, unsigned long long f
                 it->release();
             }
         }
-        NVAccel *a = NVAccel::forDisplay();
+        NVAccel *a = NVAccel::forDisplay(); NVRetain retained(a);
         if (a && a->fPCI) {
             const uint32_t b1 = a->fPCI->configRead32(0x14);          // BAR1: the framebuffer window; bit 3 prefetchable, bits 2:1 == 2 for 64-bit
             t.dgpu_reachable = 1;
@@ -3317,9 +3676,9 @@ static bool nvAccelP2pAllowed(IOService *fb, unsigned head, unsigned long long f
     return nmp_allowed(verdict[head]);
 }
 
-static bool nvAccelHybridImport(IOService *fb, unsigned head, IOSurface *s, NVVidMemory *vram)
+static bool nvAccelHybridImport(IOService *fb, unsigned head, IOSurface *s, NVVramAllocation *vram)
 {
-    if (!fb || !s || head >= kNvMaxFB || fb->metaCast("NVRMNVDAFramebuffer")) return false;
+    if (!fb || !s || head >= kNvMaxFB || fb->metaCast("NVRMNVDAFramebuffer") || fb->metaCast("NMIntelFB")) return false;
     const OSSymbol *sym = OSSymbol::withCStringNoCopy(NMH_FN_IMPORT);
     if (!sym) return false;
     struct Guard { const OSSymbol *s; ~Guard() { s->release(); } } guard = { sym };
@@ -3334,14 +3693,17 @@ static bool nvAccelHybridImport(IOService *fb, unsigned head, IOSurface *s, NVVi
     if (rr != kIOReturnSuccess) HYFAIL(q.result ? q.result : NMH_E_PROVIDER);
     const int slot = q.slot;
     if (slot < 0 || slot >= NMH_SLOTS) HYFAIL(NMH_E_BUSY);
-    if (q.evictedId) for (int i = 0; i < NMH_SLOTS; i++) if (gHyMd[head][i] && gHyMdId[head][i] == q.evictedId) nvAccelHybridRelease(head, i);
+    if (q.evictedId) for (int i = 0; i < NMH_SLOTS; i++) if ((gHyMd[head][i] || gHyBacking[head][i]) && gHyMdId[head][i] == q.evictedId) nvAccelHybridRelease(head, i);
     // the surface's pixels must be final: the GPU done with them, and in system memory where the other GPU reads them
-    nvSurfWaitReady(id);
+    if (!nvSurfWaitReady(id)) HYFAIL(NMH_E_STUCK);
     const unsigned long long len = (unsigned long long)q.pitch * q.height;
     // zero copy: the frame stays in the NVIDIA GPU's memory and the table entries point at its BAR1 window. The GPU's memory is the newest
     // copy, so there is nothing to page out or flush; a frame that does not fit the window or sits off a page boundary takes the paths below.
-    const bool p2p = vram && vram->fPhys && !(vram->fPhys & 4095ull) && len <= vram->fBytes && nvAccelP2pAllowed(fb, head, len);
-    if (!p2p && !nvAccelSurfCopyReady(s, head)) return true;       // keep the previous picture, as the copy path does
+    NVVramLease imported;
+    const bool p2p = vram && !vram->fOwner->fDirect && vram->fReceipt.phys &&
+        !(vram->fReceipt.phys & 4095ull) && len <= vram->fReceipt.actualSize && nvAccelP2pAllowed(fb, head, len) &&
+        vram->acquire(NVLeaseUse::Present, &imported);
+    if (!p2p && !nvAccelSurfCopyReady(s, head)) return false;
     IOMemoryDescriptor *md = p2p ? nullptr : s->getMemoryDescriptor();
     if (!p2p && (!md || md->getLength() < len)) HYFAIL(NMH_E_PAGES);
     if (q.needMap) {
@@ -3352,7 +3714,7 @@ static bool nvAccelHybridImport(IOService *fb, unsigned head, IOSurface *s, NVVi
         if (!p2p && md->prepare() != kIOReturnSuccess) { IOFree(pa, (size_t)npages * sizeof *pa); HYFAIL(NMH_E_PAGES); }
         bool ok = true;
         for (unsigned i = 0; i < npages && ok; i++) {
-            if (p2p) { if (i == 0 && !nmp_pages(vram->fPhys, vram->fBytes, len, pa, npages)) ok = false; continue; }
+            if (p2p) { if (i == 0 && !nmp_pages(vram->fReceipt.phys, vram->fReceipt.actualSize, len, pa, npages)) ok = false; continue; }
             IOByteCount seg = 0;
             addr64_t a = md->getPhysicalSegment((IOByteCount)i * 4096, &seg, kIOMemoryMapperNone);
             if (!a || seg < 4096 || (a & 4095)) ok = false; else pa[i] = a;
@@ -3362,6 +3724,7 @@ static bool nvAccelHybridImport(IOService *fb, unsigned head, IOSurface *s, NVVi
         if (!ok) { if (md) md->complete(); HYFAIL(q.result ? q.result : NMH_E_PAGES); }
         if (md) { md->retain(); gHyMd[head][slot] = md; } else gHyMd[head][slot] = nullptr;
         gHyMdId[head][slot] = id;
+        if (p2p) gHyBacking[head][slot] = imported.take();
     }
     // the plugin wrote these pixels with the CPU; the other GPU reads memory, so they have to have left the CPU's caches (not needed for VRAM)
     if (md) md->performOperation(kIOMemoryIncoherentIOFlush, 0, (IOByteCount)len);
@@ -3375,187 +3738,211 @@ static bool nvAccelHybridImport(IOService *fb, unsigned head, IOSurface *s, NVVi
 #undef HYFAIL
 }
 
-static unsigned nvVaAllocLogged;
-
-static unsigned long long nvAccelGpuVaAlloc(IOAccelMemoryMap *map,
-                                            unsigned long long len, unsigned long long align)
+static void nvAccelDrainPipe(NVDisplayPipe *pipe)
 {
-    NVMemoryMap *mm = OSDynamicCast(NVMemoryMap, map);
-    if (!mm || !len) return 0;
-    if (mm->fGpuVa) return mm->fGpuVa;
-
-    struct NVRMRmHandles h;
-    if (!nvAccelRmHandles(mm->fAccel, &h)) return 0;
-
-    struct NVRMGpuVaRequest g;
-    nvAccelZero(&g, sizeof g);
-    g.version = NVRM_GPUVA_ABI_VERSION;
-    g.kapiDevice = h.kapiDevice;
-    g.size = len; g.align = align;
-    if (nvAccelGpuVaCall(mm->fAccel, NVRM_GPUVA_FN_ALLOC, &g) != kIOReturnSuccess || !g.gpuva) {
-        if (nvVaAllocLogged < 8) { nvVaAllocLogged++;
-            ALOG("gpuVaAlloc: RM refused %llu bytes (align %llu) -> status 0x%x", len, align, g.status); }
-        return 0;
+    if (!pipe || !gIopAsLock) return;
+    for (unsigned head = 0; head < kNvMaxFB; ++head) {
+        NVIopAsync *e = &gIopAs[head];
+        IOLockLock(gIopAsLock);
+        bool ours = e->pipe == pipe;
+        if (ours) e->stopping = true;
+        struct thread_call *call = ours ? e->call : nullptr;
+        IOLockUnlock(gIopAsLock);
+        if (!ours) continue;
+        if (call) thread_call_cancel_wait(call);
+        NVIopAsyncFrame current, next;
+        IOLockLock(gIopAsLock);
+        current = e->current; next = e->next; e->current = {}; e->next = {}; e->busy = 0;
+        IOService *fb = e->fb; NVVramOwner *owner = e->owner;
+        e->fb = nullptr; e->pipe = nullptr; e->owner = nullptr; e->call = nullptr;
+        e->stopping = false;
+        IOLockUnlock(gIopAsLock);
+        nvIopDropFrame(&current); nvIopDropFrame(&next);
+        if (call) thread_call_free(call);
+        if (fb && owner) {
+            IOLockLock(gIopAsLock);
+            if (owner->retireScanout(head, fb, (OSObject *)gIopFlipFront[head], (OSObject *)gIopFlipPrev[head],
+                    gIopFrontBacking[head], gIopPrevBacking[head])) {
+                gIopFlipFront[head] = gIopFlipPrev[head] = nullptr;
+                gIopFrontBacking[head] = gIopPrevBacking[head] = nullptr; gIopFlipped[head] = false;
+            }
+            IOLockUnlock(gIopAsLock);
+            fb->release();
+        }
+        if (owner) owner->unborrow();
+        pipe->release();
     }
-    mm->fHVirt = g.hVirt; mm->fGpuVa = g.gpuva; mm->fVaLen = len;
-    if (nvVaAllocLogged < 8) { nvVaAllocLogged++;
-        ALOG("gpuVaAlloc: %llu bytes -> gpuVA 0x%llx (hVirt 0x%x)", len, g.gpuva, g.hVirt); }
-    return g.gpuva;
+}
+static void nvAccelDrainPresent(NVAccel *accel)
+{
+    if (gIopAsLock) for (unsigned h = 0; h < kNvMaxFB; ++h) {
+        IOLockLock(gIopAsLock);
+        NVDisplayPipe *pipe = gIopAs[h].owner == accel->fOwner ? gIopAs[h].pipe : nullptr;
+        if (pipe) pipe->retain();
+        IOLockUnlock(gIopAsLock);
+        if (pipe) { nvAccelDrainPipe(pipe); pipe->release(); }
+    }
+    if (gIopAsLock && accel->fOwner) for (unsigned h = 0; h < kNvMaxFB; ++h) {
+        IOLockLock(gIopAsLock);
+        if (gIopFrontBacking[h] && gIopFrontBacking[h]->fOwner == accel->fOwner && accel->fFBs[h] &&
+            accel->fOwner->retireScanout(h, accel->fFBs[h], (OSObject *)gIopFlipFront[h], (OSObject *)gIopFlipPrev[h],
+                gIopFrontBacking[h], gIopPrevBacking[h])) {
+            gIopFlipFront[h] = gIopFlipPrev[h] = nullptr; gIopFrontBacking[h] = gIopPrevBacking[h] = nullptr; gIopFlipped[h] = false;
+        }
+        IOLockUnlock(gIopAsLock);
+    }
+    if (gIopFlipCacheLock) for (unsigned i = 0; i < 8; ++i) {
+        NVIopFlipCache old = {};
+        IOSimpleLockLock(gIopFlipCacheLock);
+        if (gIopFlipCache[i].allocation && gIopFlipCache[i].allocation->fOwner == accel->fOwner) {
+            old = gIopFlipCache[i]; gIopFlipCache[i] = {};
+        }
+        IOSimpleLockUnlock(gIopFlipCacheLock);
+        if (old.s) ((OSObject *)old.s)->release();
+        if (old.res) old.res->release();
+        if (old.allocation) old.allocation->release();
+    }
+    if (accel->fDM) {
+        const unsigned count = accel->fDM->getFramebufferCount();
+        for (unsigned i = 0; i < count && i < 16; ++i) {
+            NVDisplayPipe *pipe = OSDynamicCast(NVDisplayPipe, *(OSObject **)((unsigned char *)accel->fDM + 0x88 + i * 8));
+            if (pipe) { pipe->displayModeWillChange(); pipe->iopDropSources(); }
+        }
+    }
 }
 
+bool NVMemoryMap::init(IOGraphicsAccelerator2 *a, IOAccelTask *t, IOAccelMemory *m, unsigned int options)
+{
+    NVVidMemory *vm = OSDynamicCast(NVVidMemory, m);
+    NVAccel *accel = OSDynamicCast(NVAccel, a);
+    NVVramOwner *owner = vm ? vm->fOwner : accel ? accel->fOwner : nullptr;
+    if (!owner || !owner->borrow()) return false;
+    fOwner = owner; fMem = m;
+    // The owner is bound before base init can reserve VA, even if no physical backing exists yet.
+    return IOAccelMemoryMap::init(a, t, m, options);
+}
+bool NVGpuVaRecord::unmap(bool releaseVa)
+{
+    IOLockLock(fOwner->fLock);
+    if (!fRequest.hVirt) { IOLockUnlock(fOwner->fLock); return true; }
+    NVRMGpuVaRequest q = fRequest;
+    q.hMemory = fMapped ? fRequest.hMemory : 0;
+    q.flags = releaseVa ? 0 : NVRM_GPUVA_FLAG_UNMAP_ONLY;
+    bool ok = fOwner->call(NVRM_GPUVA_FN_FREE, &q) == kIOReturnSuccess && q.status == 0;
+    const bool unmapped = !q.hMemory;
+    if (unmapped) { fMapped = false; fRequest.hMemory = 0; }
+    if (ok && releaseVa) { fRequest.hVirt = 0; fRequest.gpuva = 0; }
+    IOLockUnlock(fOwner->fLock);
+    if (unmapped) { fLease.reset(); fKey = {}; }
+    return ok;
+}
+void NVGpuVaRecord::free() { fLease.reset(); if (fOwner) fOwner->release(); OSObject::free(); }
+static unsigned long long nvAccelGpuVaAlloc(IOAccelMemoryMap *map, unsigned long long len, unsigned long long align)
+{
+    NVMemoryMap *mm = OSDynamicCast(NVMemoryMap, map);
+    if (!mm || !mm->fOwner || !len) return 0;
+    if (mm->fRecord) return mm->fRecord->fRequest.gpuva;
+    NVVramOwner *owner = mm->fOwner;
+    if (!owner->enter()) return 0;
+    NVGpuVaRecord *r = OSTypeAlloc(NVGpuVaRecord);
+    bool ok = r && r->init();
+    IOLockLock(owner->fLock);
+    ok = ok && owner->fState.phase == NVOwnerPhase::Active && owner->ensureDeviceLocked() &&
+         owner->fState.reservations != UINT32_MAX;
+    if (ok) {
+        r->fRequest.version = NVRM_GPUVA_ABI_VERSION; r->fRequest.kapiDevice = owner->fDevice;
+        r->fRequest.size = len; r->fRequest.align = align;
+        ok = owner->call(NVRM_GPUVA_FN_ALLOC, &r->fRequest) == kIOReturnSuccess &&
+             r->fRequest.status == 0 && r->fRequest.hVirt && r->fRequest.gpuva;
+    }
+    if (ok) {
+        r->fOwner = owner; owner->retain();
+        r->fNext = owner->fReservations; owner->fReservations = r; r->retain();
+        ++owner->fState.reservations; mm->fRecord = r;
+    }
+    IOLockUnlock(owner->fLock); owner->leave();
+    if (!ok) { if (r) r->release(); return 0; }
+    return r->fRequest.gpuva;
+}
 static void nvAccelGpuVaFree(IOAccelMemoryMap *map)
 {
     NVMemoryMap *mm = OSDynamicCast(NVMemoryMap, map);
-    if (!mm || !mm->fHVirt) return;
-    struct NVRMRmHandles h;
-    if (!nvAccelRmHandles(mm->fAccel, &h)) return;
-    struct NVRMGpuVaRequest g;
-    nvAccelZero(&g, sizeof g);
-    g.version = NVRM_GPUVA_ABI_VERSION;
-    g.kapiDevice = h.kapiDevice;
-    g.hVirt = mm->fHVirt; g.hMemory = mm->fMapped ? mm->fHRmMemory : 0; g.size = mm->fVaLen;
-    g.gpuva = mm->fGpuVa;
-    nvAccelGpuVaCall(mm->fAccel, NVRM_GPUVA_FN_FREE, &g);
+    if (!mm || !mm->fRecord) return;
+    NVGpuVaRecord *r = mm->fRecord;
+    NVVramOwner *owner = r->fOwner;
+    // Failed cleanup remains on the owner's retirement list with the original GPU-mapping lease.
+    IOLockLock(owner->fLock); r->fRetiring = true; owner->fRetirementPending = true; IOLockUnlock(owner->fLock);
+    mm->fRecord = nullptr;
+    owner->scheduleReap(); r->release();
     OSAddAtomic64(1, &gCntMapFree);
-    mm->fHVirt = 0; mm->fGpuVa = 0; mm->fVaLen = 0; mm->fMapped = false;
 }
-
 bool NVMemoryMap::commitIntoGPUPageTable()
 {
-    if (fMapped) return true;
     NVVidMemory *vm = OSDynamicCast(NVVidMemory, fMem);
-    void *kapiMem = vm ? vm->fRmHandle : nullptr;
-    unsigned long long len = fVaLen ? fVaLen : getLength();
-    if (!fHVirt || !kapiMem || !len) {
-        if (fCommits < 8) { fCommits++;
-            ALOG("MM commit: NOT MAPPED -- hVirt 0x%x kapiMem %p len %llu (mem %p%s)",
-                 fHVirt, kapiMem, len, fMem, vm ? "" : ", not an NVVidMemory"); }
-        return false;
-    }
-    struct NVRMRmHandles h;
-    if (!nvAccelRmHandles(fAccel, &h)) return false;
-    struct NVRMGpuVaRequest g;
-    nvAccelZero(&g, sizeof g);
-    g.version = NVRM_GPUVA_ABI_VERSION;
-    g.kapiDevice = h.kapiDevice; g.kapiMemory = kapiMem;
-    g.hVirt = fHVirt; g.size = len;
-    g.isVidmem = 1;
-    if (nvAccelGpuVaCall(fAccel, NVRM_GPUVA_FN_MAP, &g) != kIOReturnSuccess) {
-        if (fCommits < 8) { fCommits++;
-            ALOG("MM commit: MAP_MEMORY_DMA refused gpuVA 0x%llx len %llu -> status 0x%x",
-                 fGpuVa, len, g.status); }
-        return false;
-    }
-    fHRmMemory = g.hMemory; fMapped = true;
-    OSAddAtomic64(1, &gCntMapCommit);
-    if (g.gpuva) fGpuVa = g.gpuva;
-    if (fCommits < 8) { fCommits++;
-        ALOG("MM commit: MAPPED gpuVA 0x%llx len %llu <- hMem 0x%x  *** the GPU can reach these bytes ***",
-             fGpuVa, len, g.hMemory); }
-    return true;
+    if (!vm || vm->fOwner != fOwner || !vm->fBacking || !fRecord || fRecord->fOwner != fOwner) return false;
+    NVGpuVaRecord *r = fRecord;
+    if (r->fMapped) return nvBackingKeyEqual(r->fKey, vm->fBacking->key());
+    if (!r->fRequest.hVirt || r->fRequest.size > vm->capacity() ||
+        !vm->fBacking->acquire(NVLeaseUse::GpuMapping, &r->fLease)) return false;
+    IOLockLock(fOwner->fLock);
+    NVRMGpuVaRequest q = r->fRequest; q.kapiMemory = vm->handle(); q.isVidmem = 1;
+    bool ok = fOwner->fState.phase == NVOwnerPhase::Active &&
+        fOwner->call(NVRM_GPUVA_FN_MAP, &q) == kIOReturnSuccess && q.status == 0;
+    if (ok) { r->fRequest = q; r->fMapped = true; r->fKey = vm->fBacking->key(); }
+    IOLockUnlock(fOwner->fLock);
+    if (!ok) r->fLease.reset(); else OSAddAtomic64(1, &gCntMapCommit);
+    return ok;
 }
-
 void NVMemoryMap::releaseFromGPUPageTable()
 {
-    if (!fMapped || !fHVirt) return;
-    struct NVRMRmHandles h;
-    if (!nvAccelRmHandles(fAccel, &h)) return;
-    struct NVRMGpuVaRequest g;
-    nvAccelZero(&g, sizeof g);
-    g.version = NVRM_GPUVA_ABI_VERSION;
-    g.kapiDevice = h.kapiDevice;
-    g.hVirt = fHVirt; g.hMemory = fHRmMemory; g.size = fVaLen;
-    g.gpuva = fGpuVa;
-    g.flags = NVRM_GPUVA_FLAG_UNMAP_ONLY;
-    nvAccelGpuVaCall(fAccel, NVRM_GPUVA_FN_FREE, &g);
-    fMapped = false;
-    OSAddAtomic64(1, &gCntMapRelease);
+    if (fRecord && fRecord->fMapped && fRecord->unmap(false)) OSAddAtomic64(1, &gCntMapRelease);
+}
+bool NVMemoryMap::redirect(IOAccelMemory *memory)
+{
+    NVVidMemory *vm = OSDynamicCast(NVVidMemory, memory);
+    if (!vm || !vm->fOwner || !vm->fOwner->borrow()) return false;
+    if (fRecord && !fRecord->unmap(true)) { vm->fOwner->unborrow(); return false; }
+    nvAccelGpuVaFree(this);
+    if (!IOAccelMemoryMap::redirect(memory)) { vm->fOwner->unborrow(); return false; }
+    NVVramOwner *old = fOwner; fOwner = vm->fOwner; fMem = memory;
+    if (old) old->unborrow();
+    return true;
+}
+void NVMemoryMap::free()
+{
+    nvAccelGpuVaFree(this);
+    NVVramOwner *owner = fOwner;
+    IOAccelMemoryMap::free();
+    if (owner) owner->unborrow();
 }
 
 static void nvAccelWriteStamp(int index, unsigned int value)
 {
-    NVAccel *a = NVAccel::forDisplay();
+    NVAccel *a = NVAccel::forDisplay(); NVRetain retained(a);
     if (!a || !a->fStamps || index < 0 || index >= 4096) return;
     volatile unsigned int *base = (volatile unsigned int *)a->fStamps->getBytesNoCopy();
     if (!base) return;
     base[index] = value;
 }
 
-static unsigned nvFrontSamples, nvFrontFlips;
-static unsigned nvFrontLastSum;
-static void nvAccelSampleFront(NVVidMemory *vm, unsigned w, unsigned h, unsigned pitch)
-{
-    if (!vm || !vm->fKva || !pitch || !w || !h) return;
-#define NVFRONT_EVERY 10u
-    if (++nvFrontFlips % NVFRONT_EVERY) return;
-    if (nvFrontSamples >= 40) return;
-    nvFrontSamples++;
-    const volatile unsigned int *px = (const volatile unsigned int *)vm->fKva;
-    const unsigned ppr = pitch / 4;
-    unsigned n = 0, nonzero = 0, sum = 0;
-    for (unsigned y = 0; y < h; y += 8)
-        for (unsigned x = 0; x < w; x += 8) {
-            unsigned v = px[y * ppr + x];
-            sum = sum * 33u + v; if (v) nonzero++; n++;
-        }
-    const unsigned p1 = (w > 100  && h > 100)  ? px[100  * ppr + 100]  : 0u;
-    const unsigned p2 = (w > 960  && h > 540)  ? px[540  * ppr + 960]  : 0u;
-    const unsigned p3 = (w > 1800 && h > 1000) ? px[1000 * ppr + 1800] : 0u;
-    const bool moved = (nvFrontSamples > 1) && (sum != nvFrontLastSum);
-    ALOG("FRONT SURFACE sample %u: sum 0x%08x %s nonzero %u/%u "
-         "px(100,100)=0x%08x px(960,540)=0x%08x px(1800,1000)=0x%08x %ux%u pitch %u",
-         nvFrontSamples, sum,
-         moved ? "*** MOVED -- A LIVE WRITER IS PAINTING THE SCANNED-OUT SURFACE ***"
-               : (nvFrontSamples > 1 ? "(UNCHANGED since last sample -- frozen, not proof of a picture)"
-                                     : "(first sample -- motion is the proof, wait for the next)"),
-         nonzero, n, p1, p2, p3, w, h, pitch);
-    nvFrontLastSum = sum;
-}
-
 static unsigned nvSwapProbes;
-static void nvAccelResStats(IOAccelResource2 *res, const char *tag)
+static void nvAccelResStats(IOAccelResource2 *resource, const char *tag)
 {
-    if (!res) { ALOG("  swap %s: (null)", tag); return; }
-    NVVidMemory *vm = nvres_vidmem(res);
-    const unsigned char *r = (const unsigned char *)res;
-    const unsigned w     = *(const volatile unsigned short *)(r + kNvResWidth);
-    const unsigned h     = *(const volatile unsigned short *)(r + kNvResHeight);
-    const unsigned pitch = *(const volatile unsigned int   *)(r + 0xb8);
-    if (!vm || !vm->fKva || !pitch || !w || !h) {
-        ALOG("  swap %s: %ux%u pitch %u vm %p kva %p scanout %d -- NOT SAMPLEABLE",
-             tag, w, h, pitch, vm, vm ? vm->fKva : nullptr, vm ? (int)vm->fScanout : -1);
-        return;
-    }
-    const volatile unsigned int *px = (const volatile unsigned int *)vm->fKva;
-    const unsigned ppr = pitch / 4;
-    unsigned n = 0, nonzero = 0, sum = 0;
-    for (unsigned y = 0; y < h; y += 8)
-        for (unsigned x = 0; x < w; x += 8) {
-            unsigned v = px[y * ppr + x];
-            sum = sum * 33u + v; if (v) nonzero++; n++;
-        }
-    ALOG("  swap %s: %ux%u pitch %u scanout %d  sum 0x%08x  nonzero %u/%u  %s",
-         tag, w, h, pitch, (int)vm->fScanout, sum, nonzero, n,
-         nonzero ? "*** HAS CONTENT -- THIS IS THE SOURCE ***" : "(empty)");
+    NVResource *r = OSDynamicCast(NVResource, resource);
+    NVVidMemory *m = r ? nvres_vidmem(r) : nullptr;
+    ALOGV("swap %s: resource %p allocation generation %llu CPU publication %llu", tag, r,
+          m && m->fBacking ? (unsigned long long)m->fBacking->key().allocationGeneration : 0ull,
+          r ? (unsigned long long)r->fCpuPublication : 0ull);
 }
-bool nvAccelResHasContent(IOAccelResource2 *res)
+bool nvAccelResHasContent(IOAccelResource2 *resource)
 {
-    if (!res) return false;
-    NVVidMemory *vm = nvres_vidmem(res);
-    if (!vm || !vm->fKva) return false;
-    const unsigned char *r = (const unsigned char *)res;
-    const unsigned w     = *(const volatile unsigned short *)(r + kNvResWidth);
-    const unsigned h     = *(const volatile unsigned short *)(r + kNvResHeight);
-    const unsigned pitch = *(const volatile unsigned int   *)(r + 0xb8);
-    if (!w || !h || pitch < 4) return false;
-    const volatile unsigned int *px = (const volatile unsigned int *)vm->fKva;
-    const unsigned ppr = pitch / 4;
-    for (unsigned iy = 1; iy <= 4; iy++)
-        for (unsigned ix = 1; ix <= 4; ix++) {
-            const unsigned x = (w * ix) / 5, y = (h * iy) / 5;
-            if (x < w && y < h && px[y * ppr + x]) return true;
-        }
-    return false;
+    NVResource *r = OSDynamicCast(NVResource, resource);
+    if (!r) return false;
+    NVVidMemory *m = nvres_vidmem(r);
+    if (m && m->fBacking && r->fCpuPublication && nvBackingKeyEqual(r->fCpuPublicationKey, m->fBacking->key())) return true;
+    // A black completed IOSurface is just as valid as a nonzero one.
+    const volatile unsigned short *valid = *(unsigned short *const *)((const unsigned char *)r + kNvResValid);
+    return valid && (valid[0] & 1u) && !r->requirePageoff();
 }
 
 void nvAccelSwapProbe(IOAccelResource2 *a1, IOAccelResource2 *a2)
@@ -3567,104 +3954,71 @@ void nvAccelSwapProbe(IOAccelResource2 *a1, IOAccelResource2 *a2)
     nvAccelResStats(a2, "a2");
 }
 
-static unsigned nvFlipWhy = 0;
-#define NVFLIPWHY(...) do { if (nvFlipWhy < 20) { nvFlipWhy++; ALOG(__VA_ARGS__); } } while (0)
-
-#define NVSCANOUT_COPY_MAX 120
-static unsigned nvScanoutCopies = 0;
-static bool nvAccelCopyToScanout(IOAccelResource2 *res)
+static IOSurface *nvResourceSurface(NVResource *resource)
 {
-    if (nvScanoutCopies >= NVSCANOUT_COPY_MAX) return false;
-    if (!res) return false;
-    NVAccel *a = NVAccel::forDisplay();
-    if (!a || !a->fFB) { NVFLIPWHY("copyToScanout: no accelerator/framebuffer"); return false; }
-    if (gNvHeadsPiped & (gNvHeadsPiped - 1)) { NVFLIPWHY("copyToScanout: refused -- heads piped 0x%x, no way to tell whose frame this is", gNvHeadsPiped); return false; }
-    NVVidMemory *vm = nvres_vidmem(res);
-    if (!vm || !vm->fKva) { NVFLIPWHY("copyToScanout: source has no kva"); return false; }
-
-    const unsigned char *rr = (const unsigned char *)res;
-    const unsigned w     = *(const volatile unsigned short *)(rr + 0xb0);
-    const unsigned h     = *(const volatile unsigned short *)(rr + 0xb2);
-    const unsigned pitch = *(const volatile unsigned int   *)(rr + 0xb8);
-    if (!w || !h || pitch < 4) { NVFLIPWHY("copyToScanout: source geometry %ux%u pitch %u", w, h, pitch); return false; }
-
-    struct NVRMVramRequest q;
-    for (unsigned i = 0; i < sizeof q; i++) ((volatile unsigned char *)&q)[i] = 0;
-    q.version = NVRM_VRAM_ABI_VERSION;
-    IOReturn ret = a->askFramebufferForScanout(&q);
-    if (ret != kIOReturnSuccess || !q.kva || !q.pitch) {
-        NVFLIPWHY("copyToScanout: framebuffer would not describe its scanout (0x%x kva %p pitch %u)",
-                  (unsigned)ret, q.kva, q.pitch);
-        return false;
-    }
-
-    const unsigned rows = (h < q.height) ? h : q.height;
-    const unsigned rowb = ((pitch < q.pitch) ? pitch : q.pitch) & ~3u;
-    const unsigned words = rowb / 4;
-    const unsigned spr = pitch / 4, dpr = q.pitch / 4;
-    const volatile unsigned int *s = (const volatile unsigned int *)vm->fKva;
-    volatile unsigned int *d = (volatile unsigned int *)q.kva;
-    for (unsigned y = 0; y < rows; y++) {
-        const volatile unsigned int *sp = s + (unsigned long)y * spr;
-        volatile unsigned int *dp = d + (unsigned long)y * dpr;
-        for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
-    }
-    nvScanoutCopies++;
-    if (nvScanoutCopies <= 3 || nvScanoutCopies == NVSCANOUT_COPY_MAX)
-        ALOG("*** COPIED THE COMPOSITED FRAME ONTO THE PANEL *** #%u: %ux%u, %u rows x %u bytes, "
-             "src kva %p pitch %u -> scanout kva %p phys 0x%llx pitch %u%s",
-             nvScanoutCopies, w, h, rows, rowb, vm->fKva, pitch, q.kva,
-             (unsigned long long)q.phys, q.pitch,
-             nvScanoutCopies == NVSCANOUT_COPY_MAX ? "  [CAP REACHED -- stopping, panel keeps this frame]" : "");
-    return true;
+    void *cache = *(void **)((unsigned char *)resource + kNvResCache);
+    IOSurface *s = cache ? *(IOSurface **)((unsigned char *)cache + 0x10) : nullptr;
+    if (s) ((OSObject *)s)->retain();
+    return s;
 }
-
-static bool nvAccelFlipTo(IOAccelResource2 *res)
+static bool nvAccelCopyToScanout(IOAccelResource2 *resource)
 {
-    if (!res) { NVFLIPWHY("nvAccelFlipTo: no resource"); return false; }
-    NVAccel *a = NVAccel::forDisplay();
-    if (!a || !a->fFB) { NVFLIPWHY("nvAccelFlipTo: accel %p fFB %p", a, a ? a->fFB : nullptr); return false; }
-    if (gNvHeadsPiped & (gNvHeadsPiped - 1)) { NVFLIPWHY("nvAccelFlipTo: refused -- heads piped 0x%x, no way to tell whose surface this is", gNvHeadsPiped); return false; }
-    NVVidMemory *vm = nvres_vidmem(res);
-    if (!vm || !vm->fRmHandle) {
-        NVFLIPWHY("nvAccelFlipTo: vm %p fRmHandle %p -- the composited surface has no RM memory to flip to",
-                  vm, vm ? vm->fRmHandle : nullptr);
-        return false;
+    NVAccel *a = NVAccel::forDisplay(); NVRetain retained(a);
+    NVResource *r = OSDynamicCast(NVResource, resource);
+    if (!a || !r || r->fAccel != a || !a->fDM || a->fDM->getFramebufferCount() != 1) return false;
+    NVDisplayPipe *pipe = OSDynamicCast(NVDisplayPipe, *(OSObject **)((unsigned char *)a->fDM + 0x88));
+    unsigned head = 0; IOService *fb = pipe ? a->pipeFramebuffer(pipe, &head) : nullptr;
+    NVTransactionGate gate(pipe);
+    if (!fb || !gate.admitted || !nvFamLock(a, true)) return false;
+    IOSurface *surface = nvResourceSurface(r);
+    NVVramLease lease; nv_frame_span source = {};
+    NVVidMemory *m = nvres_vidmem(r);
+    if (!surface && m && m->fBacking && r->fCpuPublication &&
+        nvBackingKeyEqual(r->fCpuPublicationKey, m->fBacking->key()) &&
+        m->fBacking->acquire(NVLeaseUse::CpuAccess, &lease)) {
+        const uint64_t pitch = nvResPitch((const unsigned char *)r);
+        if (pitch <= UINT32_MAX) source = { m->kva(), m->capacity(),
+            *(uint16_t *)((char *)r + kNvResWidth), *(uint16_t *)((char *)r + kNvResHeight), (uint32_t)pitch, NV_IOP_FMT_BGRA };
     }
-    if (vm->fScanout) { NVFLIPWHY("nvAccelFlipTo: already the scanout"); return false; }
-
-    const unsigned char *r = (const unsigned char *)res;
-    const unsigned w     = *(const volatile unsigned short *)(r + kNvResWidth);
-    const unsigned h     = *(const volatile unsigned short *)(r + kNvResHeight);
-    const unsigned pitch = *(const volatile unsigned int   *)(r + 0xb8);
-    if (!w || !h || !pitch) { NVFLIPWHY("nvAccelFlipTo: geometry %ux%u pitch %u", w, h, pitch); return false; }
-
-    struct NVRMFlipRequest f;
-    volatile unsigned char *z = (volatile unsigned char *)&f;
-    for (unsigned i = 0; i < sizeof f; i++) z[i] = 0;
-    f.version = NVRM_FLIP_ABI_VERSION;
-    f.kapiMemory = vm->fRmHandle; f.allocationCookie = vm->fAllocationCookie;
-    f.width = w; f.height = h; f.pitch = pitch;
-
-    const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVRM_FLIP_FN);
-    if (!sym) { NVFLIPWHY("nvAccelFlipTo: OSSymbol allocation failed"); return false; }
-    IOReturn rr = a->fFB->callPlatformFunction(sym, false, &f, nullptr, nullptr, nullptr);
-    sym->release();
-    if (rr != kIOReturnSuccess) {
-        NVFLIPWHY("nvAccelFlipTo: framebuffer refused the flip (0x%x, flipResult %d) for %ux%u pitch %u kapiMemory %p",
-                  (unsigned)rr, f.flipResult, w, h, pitch, vm->fRmHandle);
-        return false;
+    nvFamUnlock(a);
+    NVRetain holdSurface((OSObject *)surface);
+    if (surface) {
+        if (!nvSurfWaitReady(surface->getSurfaceID()) || !nvAccelSurfCopyReady(surface, head)) return false;
+        const uint64_t w = surface->getWidth(), h = surface->getHeight(), pitch = surface->getBytesPerRow();
+        IOMemoryDescriptor *md = surface->getMemoryDescriptor();
+        if (!md || w > UINT32_MAX || h > UINT32_MAX || pitch > UINT32_MAX) return false;
+        source = { pipe->iopMapSurface(surface->getSurfaceID(), md, pitch * h), md->getLength(),
+            (uint32_t)w, (uint32_t)h, (uint32_t)pitch, surface->getPixelFormat() };
     }
-    NVFLIPWHY("nvAccelFlipTo: *** FLIPPED *** to %ux%u pitch %u kapiMemory %p (flipResult %d)",
-              w, h, pitch, vm->fRmHandle, f.flipResult);
-    nvAccelSampleFront(vm, w, h, pitch);
-    return true;
+    if (nv_frame_validate(&source) != NV_FRAME_OK) return false;
+    IOLockLock(pipe->fTransactionLock);
+    uint64_t sequence = 0;
+    const bool numbered = nvNextGeneration(&pipe->fNextSequence, &sequence);
+    if (numbered) pipe->fTransaction.begin(nullptr, 0, sequence, pipe->fFramebufferInfo.epoch);
+    IOLockUnlock(pipe->fTransactionLock);
+    return numbered && pipe->presentFinal(fb, source) == kIOReturnSuccess;
+}
+static bool nvAccelFlipTo(IOAccelResource2 *resource)
+{
+    NVAccel *a = NVAccel::forDisplay(); NVRetain retained(a);
+    NVResource *r = OSDynamicCast(NVResource, resource);
+    if (!a || a->fCandidate || !r || r->fAccel != a || !a->fFB ||
+        !a->fDM || a->fDM->getFramebufferCount() != 1 || !nvFamLock(a, true)) return false;
+    IOSurface *s = nvResourceSurface(r);
+    nvFamUnlock(a);
+    NVRetain holdSurface((OSObject *)s);
+    return s && nvAccelIopFlip(a->fFB, 0, s, nullptr);
 }
 
 IOReturn NVAccel::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4)
 {
-    if (fn && p1 && fn->isEqualTo(NVACCEL_SS_FN))
-        return nvAccelSurfVram(this, (struct NVRMSurfShareEsc *)p1, (task_t)p2, (unsigned)(uintptr_t)p3);
+    if (fn && p1 && fn->isEqualTo(NVACCEL_SS_FN)) {
+        if (fCandidate) return nvAccelSurfVram(this, (NVRMSurfShareEsc *)p1, (task_t)p2, (unsigned)(uintptr_t)p3);
+        NVVramOwner *owner = fOwner;
+        if (!owner || !owner->enter()) return kIOReturnNotReady;
+        IOReturn result = nvAccelSurfVram(this, (struct NVRMSurfShareEsc *)p1, (task_t)p2, (unsigned)(uintptr_t)p3);
+        owner->leave(); return result;
+    }
     return IOService::callPlatformFunction(fn, wait, p1, p2, p3, p4);
 }
 
