@@ -281,9 +281,23 @@ static inline enum NMIntelPresentResult nm_intelfb_present_check(
     return NMIntelPresentOK;
 }
 /* All spans are checked before the first store. One load feeds BOTH destinations. */
-static inline int nm_intelfb_copy_final(const void *source, uint64_t sourceBytes, uint32_t sourcePitch,
-                                      void *shadow, uint64_t shadowBytes, void *sink, uint64_t sinkBytes,
-                                      uint32_t width, uint32_t height, uint32_t pitch)
+#if defined(__clang__) || defined(__GNUC__)
+typedef uint64_t __attribute__((__may_alias__)) nm_intelfb_u64_a;
+typedef uint32_t __attribute__((__may_alias__)) nm_intelfb_u32_a;
+#else
+typedef uint64_t nm_intelfb_u64_a;
+typedef uint32_t nm_intelfb_u32_a;
+#endif
+
+static inline int nm_intelfb_ranges_overlap(uintptr_t aLo, uintptr_t aHi, uintptr_t bLo, uintptr_t bHi)
+{
+    return aLo < bHi && bLo < aHi;
+}
+
+static inline int nm_intelfb_copy_final_diff(const void *source, uint64_t sourceBytes, uint32_t sourcePitch,
+                                             void *shadow, uint64_t shadowBytes, void *sink, uint64_t sinkBytes,
+                                             void *mirror, uint64_t mirrorBytes, int *mirrorValid,
+                                             uint32_t width, uint32_t height, uint32_t pitch)
 {
     uint64_t sourceFull, targetFull;
     if (!source || !shadow || ((uintptr_t)source & 3) || ((uintptr_t)shadow & 3) ||
@@ -294,18 +308,144 @@ static inline int nm_intelfb_copy_final(const void *source, uint64_t sourceBytes
         sourceFull > UINTPTR_MAX - (uintptr_t)source ||
         targetFull > UINTPTR_MAX - (uintptr_t)shadow ||
         (sink && targetFull > UINTPTR_MAX - (uintptr_t)sink)) return 0;
-    const int updateShadow = source != shadow || sourcePitch != pitch;
-    for (uint32_t y = 0; y < height; ++y) {
-        const volatile uint32_t *src = (const volatile uint32_t *)((const uint8_t *)source + (uint64_t)y * sourcePitch);
-        volatile uint32_t *dst = (volatile uint32_t *)((uint8_t *)shadow + (uint64_t)y * pitch);
-        volatile uint32_t *out = sink ? (volatile uint32_t *)((uint8_t *)sink + (uint64_t)y * pitch) : 0;
-        for (uint32_t x = 0; x < width; ++x) {
-            const uint32_t pixel = src[x];
-            if (updateShadow) dst[x] = pixel;
-            if (out) out[x] = pixel;
+    if (mirror) {
+        if (!mirrorValid || ((uintptr_t)mirror & 3) ||
+            !nm_intelfb_span(width, height, pitch, mirrorBytes, 0, 0) ||
+            targetFull > UINTPTR_MAX - (uintptr_t)mirror) return 0;
+        const uintptr_t mLo = (uintptr_t)mirror, mHi = mLo + (size_t)targetFull;
+        const uintptr_t sLo = (uintptr_t)source, sHi = sLo + (size_t)sourceFull;
+        const uintptr_t dLo = (uintptr_t)shadow, dHi = dLo + (size_t)targetFull;
+        if (nm_intelfb_ranges_overlap(mLo, mHi, sLo, sHi) ||
+            nm_intelfb_ranges_overlap(mLo, mHi, dLo, dHi)) return 0;
+        if (sink) {
+            const uintptr_t oLo = (uintptr_t)sink, oHi = oLo + (size_t)targetFull;
+            if (nm_intelfb_ranges_overlap(mLo, mHi, oLo, oHi)) return 0;
         }
     }
+    const int updateShadow = source != shadow || sourcePitch != pitch;
+    const int useMirror = mirror != 0;
+    const int valid = useMirror && (*mirrorValid != 0);
+    const int aligned8 = (((uintptr_t)source | sourcePitch | (uintptr_t)shadow | pitch |
+                           (uintptr_t)sink | (uintptr_t)mirror) & 7u) == 0;
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t *sRow = (const uint8_t *)source + (uint64_t)y * sourcePitch;
+        uint8_t *dRow = (uint8_t *)shadow + (uint64_t)y * pitch;
+        uint8_t *oRow = sink ? (uint8_t *)sink + (uint64_t)y * pitch : 0;
+        uint8_t *mRow = mirror ? (uint8_t *)mirror + (uint64_t)y * pitch : 0;
+        uint32_t x = 0;
+        if (aligned8 && width >= 2u) {
+            const uint32_t pairs = width >> 1;
+            const volatile nm_intelfb_u64_a *src64 = (const volatile nm_intelfb_u64_a *)sRow;
+            volatile nm_intelfb_u64_a *dst64 = (volatile nm_intelfb_u64_a *)dRow;
+            volatile nm_intelfb_u64_a *out64 = oRow ? (volatile nm_intelfb_u64_a *)oRow : 0;
+            nm_intelfb_u64_a *mir64 = mRow ? (nm_intelfb_u64_a *)mRow : 0;
+            for (uint32_t i = 0; i < pairs; ++i) {
+                const uint64_t w = src64[i];
+                if (updateShadow) dst64[i] = w;
+                if (mir64) {
+                    if (!valid || mir64[i] != w) {
+                        mir64[i] = w;
+                        if (out64) out64[i] = w;
+                    }
+                } else if (out64) {
+                    out64[i] = w;
+                }
+            }
+            x = pairs << 1;
+        }
+        {
+            const volatile nm_intelfb_u32_a *src = (const volatile nm_intelfb_u32_a *)sRow;
+            volatile nm_intelfb_u32_a *dst = (volatile nm_intelfb_u32_a *)dRow;
+            volatile nm_intelfb_u32_a *out = oRow ? (volatile nm_intelfb_u32_a *)oRow : 0;
+            nm_intelfb_u32_a *mir = mRow ? (nm_intelfb_u32_a *)mRow : 0;
+            for (; x < width; ++x) {
+                const uint32_t pixel = src[x];
+                if (updateShadow) dst[x] = pixel;
+                if (mir) {
+                    if (!valid || mir[x] != pixel) {
+                        mir[x] = pixel;
+                        if (out) out[x] = pixel;
+                    }
+                } else if (out) {
+                    out[x] = pixel;
+                }
+            }
+        }
+    }
+    if (mirrorValid) *mirrorValid = useMirror ? 1 : 0;
     return 1;
+}
+
+static inline int nm_intelfb_copy_final(const void *source, uint64_t sourceBytes, uint32_t sourcePitch,
+                                      void *shadow, uint64_t shadowBytes, void *sink, uint64_t sinkBytes,
+                                      uint32_t width, uint32_t height, uint32_t pitch)
+{
+    return nm_intelfb_copy_final_diff(source, sourceBytes, sourcePitch,
+                                      shadow, shadowBytes,
+                                      sink, sinkBytes,
+                                      0, 0, 0,
+                                      width, height, pitch);
+}
+
+#define NM_INTEL_NVRMTIMING_TAG   0x4b350001u
+#define NM_INTEL_NVRMTIMING_WORDS 13u
+
+static inline int nm_intelfb_build_nvrm_timing(
+    uint32_t width, uint32_t height,
+    uint32_t hss, uint32_t hse, uint32_t htot,
+    uint32_t vss, uint32_t vse, uint32_t vtot,
+    uint64_t pclkHz, uint32_t refreshMilliHz,
+    uint32_t hSyncPos, uint32_t vSyncPos,
+    uint32_t out[NM_INTEL_NVRMTIMING_WORDS])
+{
+    if (!out || !width || !height) return 0;
+    if (htot <= width) htot = width + 160u;
+    if (!(width <= hss && hss < hse && hse <= htot)) {
+        const uint32_t blank = htot - width;
+        hss = width + blank / 4u;
+        hse = hss + (blank >= 4u ? blank / 2u : 1u);
+        if (hse > htot) { hss = width; hse = width + 1u; if (hse > htot) htot = hse; }
+    }
+    if (vtot <= height) vtot = height + 45u;
+    if (!(height <= vss && vss < vse && vse <= vtot)) {
+        const uint32_t blank = vtot - height;
+        vss = height + blank / 4u;
+        vse = vss + (blank >= 4u ? blank / 2u : 1u);
+        if (vse > vtot) { vss = height; vse = height + 1u; if (vse > vtot) vtot = vse; }
+    }
+    if (!refreshMilliHz) refreshMilliHz = 60000u;
+    if (!pclkHz || pclkHz > UINT32_MAX) {
+        const uint64_t hz = refreshMilliHz >= 1000u ? (refreshMilliHz / 1000u) : 60u;
+        pclkHz = (uint64_t)htot * (uint64_t)vtot * hz;
+        if (pclkHz > UINT32_MAX) pclkHz = UINT32_MAX;
+        if (!pclkHz) pclkHz = 1u;
+    }
+    out[0]  = NM_INTEL_NVRMTIMING_TAG;
+    out[1]  = (uint32_t)pclkHz;
+    out[2]  = width;
+    out[3]  = hss;
+    out[4]  = hse;
+    out[5]  = htot;
+    out[6]  = height;
+    out[7]  = vss;
+    out[8]  = vse;
+    out[9]  = vtot;
+    out[10] = refreshMilliHz;
+    out[11] = hSyncPos ? 1u : 0u;
+    out[12] = vSyncPos ? 1u : 0u;
+    return 1;
+}
+
+static inline uint64_t nm_intelfb_refresh_gap(uint64_t copyDuration, uint64_t minInterval)
+{
+    if (copyDuration > UINT64_MAX / 4u) return UINT64_MAX;
+    const uint64_t adaptive = copyDuration * 4u;
+    return adaptive > minInterval ? adaptive : minInterval;
+}
+
+static inline int nm_intelfb_should_refresh(uint64_t accelSequence, uint64_t now, uint64_t nextRefresh)
+{
+    return accelSequence == 0 && now >= nextRefresh;
 }
 static inline void nm_intelfb_store_drain(void)
 {

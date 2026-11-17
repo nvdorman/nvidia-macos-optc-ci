@@ -224,6 +224,10 @@ class NMIntelFB : public IOFramebuffer {
     bool fPowered = true, fOpened = false, fBaseStarted = false, fSetupInFlight = false;
     thread_call_t fRefreshCall = nullptr;
     volatile UInt32 fRefreshPending = 0;
+    uint8_t *fSinkMirror = nullptr;
+    uint64_t fSinkMirrorEpoch = 0;
+    uint64_t fRefreshMinAbs = 0;
+    uint64_t fRefreshNextAbs = 0;
     bool captureBootAuthority();
     bool prepareAperture();
     bool revalidateAuthorityLocked(bool walk);
@@ -251,17 +255,23 @@ class NMIntelFB : public IOFramebuffer {
         NMIntelFB *me = (NMIntelFB *)p0;
         if (me->fStopping) return;
         if (me->fVbl.proc) { me->fVbl.proc(me->fVbl.target, me->fVbl.ref); me->fVblCalls++; }
-        if (me->fRefreshCall && OSCompareAndSwap(0, 1, &me->fRefreshPending))
+        const uint64_t now = mach_absolute_time();
+        const uint64_t seq = __atomic_load_n(&me->fPresentState.sequence, __ATOMIC_RELAXED);
+        if (me->fRefreshCall && nm_intelfb_should_refresh(seq, now, me->fRefreshNextAbs) &&
+            OSCompareAndSwap(0, 1, &me->fRefreshPending))
             thread_call_enter(me->fRefreshCall);
         uint64_t period; nanoseconds_to_absolutetime(me->fFrameNs, &period);
-        uint64_t now = mach_absolute_time();
         me->fVblNext = (me->fVblNext && me->fVblNext + period > now) ? me->fVblNext + period : now + period;
         thread_call_enter_delayed(me->fVblTimer, me->fVblNext);
     }
     void armVbl() {
         fVblTimer = thread_call_allocate(vblFire, this);
         if (fVblTimer) { uint64_t d; clock_interval_to_deadline((uint32_t)(fFrameNs / 1000), kMicrosecondScale, &d); fVblNext = d; thread_call_enter_delayed(fVblTimer, d); }
-        IFBLOG("vbl timer %s", fVblTimer ? "armed (60 Hz)" : "ALLOCATE FAILED");
+        const uint64_t mHz = fFrameNs ? (1000000000000ull / fFrameNs) : 60000ull;
+        IFBLOG("vbl timer %s (%llu.%03llu Hz, period %llu us)",
+               fVblTimer ? "armed" : "ALLOCATE FAILED",
+               (unsigned long long)(mHz / 1000), (unsigned long long)(mHz % 1000),
+               (unsigned long long)(fFrameNs / 1000));
     }
 #ifdef NMINTELFB_VIRTUAL
     // Virtual builds use the identical shadow/info/present contract, without a physical sink.
@@ -287,7 +297,7 @@ private:
     volatile uint8_t *fRegs = nullptr;
     IOPhysicalAddress fApertureBase = 0;
     IOPhysicalLength fApertureLen = 0;
-    uint32_t fWidth = 0, fHeight = 0, fRowBytes = 0, fSurf = 0, fRefresh16 = 60 << 16;
+    uint32_t fWidth = 0, fHeight = 0, fRowBytes = 0, fSurf = 0, fRefresh16 = 60 << 16, fRefreshMilliHz = 60000;
     uint64_t fFrameNs = 16666667ull;   // vblank period; measured from the pipe's frame counter on real hardware
     // transcoder timing (active, total, sync start/end) for getTimingInfoForDisplayMode
     uint32_t fHT = 0, fVT = 0, fHSS = 0, fHSE = 0, fVSS = 0, fVSE = 0;
@@ -379,6 +389,25 @@ private:
             IFBLOG("failed to publish independent Intel controller identity");
             return false;
         }
+        return true;
+    }
+    __attribute__((noinline)) bool publishTimingProperty() {
+        uint32_t k5[NM_INTEL_NVRMTIMING_WORDS] = {};
+        if (!nm_intelfb_build_nvrm_timing(fWidth, fHeight, fHSS, fHSE, fHT, fVSS, fVSE, fVT,
+                                          fPclk, fRefreshMilliHz, 1u, 1u, k5)) {
+            IFBLOG("K5: invalid raster %ux%u — NVRMTiming NOT published", fWidth, fHeight);
+            return false;
+        }
+        OSData *d = OSData::withBytes(k5, sizeof k5);
+        if (!d || !setProperty("NVRMTiming", d)) {
+            OSSafeReleaseNULL(d);
+            removeProperty("NVRMTiming");
+            IFBLOG("K5: NVRMTiming NOT published (failed to set property)");
+            return false;
+        }
+        d->release();
+        IFBLOG("K5: NVRMTiming %ux%u (total %ux%u hsync %u..%u vsync %u..%u) pclk=%u refresh=%u mHz",
+               k5[2], k5[6], k5[5], k5[9], k5[3], k5[4], k5[7], k5[8], k5[1], k5[10]);
         return true;
     }
 public:
@@ -707,12 +736,20 @@ void NMIntelFB::measureFirmwareTiming()
     const uint32_t frames = rd(FRMCOUNT(fPipe)) - first;
     uint64_t ns = 0;
     absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
-    if (frames >= 5 && frames <= 100 && ns) {
+    if (frames >= 5 && frames <= 150 && ns) {
         fFrameNs = ns / frames;
         const uint64_t milliHz = static_cast<uint64_t>(frames) * 1000000000000ull / ns;
+        fRefreshMilliHz = static_cast<uint32_t>(milliHz <= UINT32_MAX ? milliHz : UINT32_MAX);
         fRefresh16 = static_cast<uint32_t>((milliHz << 16) / 1000);
         fPclk = static_cast<uint64_t>(fHT) * fVT * milliHz / 1000;
-    } else fPclk = static_cast<uint64_t>(fHT) * fVT * 60;
+    } else {
+        fRefreshMilliHz = 60000;
+        fPclk = static_cast<uint64_t>(fHT) * fVT * 60;
+    }
+    IFBLOG("pipe %d timing %ux%u total %ux%u hsync %u..%u vsync %u..%u (%u frames/%llu ns -> %u.%03u Hz, pclk %llu)",
+           fPipe, fWidth, fHeight, fHT, fVT, fHSS, fHSE, fVSS, fVSE, frames,
+           (unsigned long long)ns, fRefreshMilliHz / 1000, fRefreshMilliHz % 1000,
+           (unsigned long long)fPclk);
 }
 
 bool NMIntelFB::adoptLegacyFirmwareMode()
@@ -765,10 +802,20 @@ bool NMIntelFB::prepareAperture()
     fShadowMemory = OSTypeAlloc(NMIntelShadowMemory);
     if (!fShadowMemory || !fShadowMemory->initSubRange(fShadowBuffer, 0, fFrameBytes, kIODirectionInOut))
         return false;
+    fSinkMirror = static_cast<uint8_t *>(IOMallocData(fFrameBytes));
+    fSinkMirrorEpoch = 0;
+    if (fSinkMirror) bzero(fSinkMirror, fFrameBytes);
+    nanoseconds_to_absolutetime(50000000ull, &fRefreshMinAbs);
+    fRefreshNextAbs = mach_absolute_time() + fRefreshMinAbs;
     if (!revalidateAuthorityLocked(true)) return false;
-    if (fSurfMap && !nm_intelfb_copy_final(reinterpret_cast<const void *>(fSurfMap->getVirtualAddress()),
-            fFrameBytes, fRowBytes, fShadowBuffer->getBytesNoCopy(), fFrameBytes, nullptr, fFrameBytes,
-            fWidth, fHeight, fRowBytes)) return false;
+    {
+        int mv = 0;
+        if (fSurfMap && !nm_intelfb_copy_final_diff(reinterpret_cast<const void *>(fSurfMap->getVirtualAddress()),
+                fFrameBytes, fRowBytes, fShadowBuffer->getBytesNoCopy(), fFrameBytes, nullptr, fFrameBytes,
+                fSinkMirror, fFrameBytes, fSinkMirror ? &mv : nullptr, fWidth, fHeight, fRowBytes))
+            return false;
+        if (mv) fSinkMirrorEpoch = fPresentState.epoch;
+    }
     nm_intelfb_store_drain();
     fRefreshCall = thread_call_allocate(refreshFire, this);
     return fRefreshCall != nullptr;
@@ -819,7 +866,7 @@ bool NMIntelFB::start(IOService *provider)
 #endif
     // Both mappings exist before IOFramebuffer publishes an independent Intel
     // controller/local0, or a notifier/worker can observe this framebuffer.
-    if ((fConsoleScanout && !prepareAperture()) || !publishDependentIdentity()) { startUnwind(); return false; }
+    if ((fConsoleScanout && !prepareAperture()) || !publishDependentIdentity() || !publishTimingProperty()) { startUnwind(); return false; }
 #ifndef NMINTELFB_VIRTUAL
     if (!fConsoleScanout) {
         resumeCapture();
@@ -942,21 +989,36 @@ bool NMIntelFB::copyShadowLocked()
 #endif
     // This path is not a coherent snapshot of concurrent arbitrary user writes.
     // It only serializes driver transfers, and never acknowledges a Metal frame.
-    const bool ok = nm_intelfb_copy_final(fShadowBuffer->getBytesNoCopy(), fFrameBytes, fRowBytes,
-        fShadowBuffer->getBytesNoCopy(), fFrameBytes, sink, fFrameBytes, fWidth, fHeight, fRowBytes);
-    if (ok) nm_intelfb_store_drain();
+    int mv = (fSinkMirror && fSinkMirrorEpoch == fPresentState.epoch) ? 1 : 0;
+    const bool ok = nm_intelfb_copy_final_diff(fShadowBuffer->getBytesNoCopy(), fFrameBytes, fRowBytes,
+        fShadowBuffer->getBytesNoCopy(), fFrameBytes, sink, fFrameBytes,
+        fSinkMirror, fFrameBytes, fSinkMirror ? &mv : nullptr, fWidth, fHeight, fRowBytes);
+    if (ok) {
+        fSinkMirrorEpoch = mv ? fPresentState.epoch : 0;
+        nm_intelfb_store_drain();
+    } else {
+        fSinkMirrorEpoch = 0;
+    }
     return ok;
 }
 
 void NMIntelFB::refreshFire(thread_call_param_t context, thread_call_param_t)
 {
     NMIntelFB *me = static_cast<NMIntelFB *>(context);
+    const uint64_t t0 = mach_absolute_time();
+    bool ran = false;
     if (me->fPresentLock && IOLockTryLock(me->fPresentLock)) {
-        if (!me->fStopping && me->fPresentState.phase == NMIntelApertureActive &&
-            !me->copyShadowLocked())
-            nm_intelfb_revoke(&me->fPresentState, NMIntelRecovery);
+        if (!me->fStopping && !me->fPresentState.sequence &&
+            me->fPresentState.phase == NMIntelApertureActive) {
+            ran = true;
+            if (!me->copyShadowLocked())
+                nm_intelfb_revoke(&me->fPresentState, NMIntelRecovery);
+        }
         IOLockUnlock(me->fPresentLock);
     }
+    const uint64_t now = mach_absolute_time();
+    const uint64_t gap = nm_intelfb_refresh_gap(ran && now >= t0 ? (now - t0) : 0, me->fRefreshMinAbs);
+    me->fRefreshNextAbs = now + gap;
     // A missed timer tick is coalesced, never queued behind a present.
     OSCompareAndSwap(1, 0, &me->fRefreshPending);
 }
@@ -989,7 +1051,10 @@ bool NMIntelFB::restoreConsole()
     const NMIntelVideo current = nmIntelConsoleVideo(pe);
     const bool ours = pe.v_baseAddr == own &&
         nm_intelfb_console_matches(&fBootVideo, &current, own);
-    if (ours && fPowered && revalidateAuthorityLocked(true)) (void)copyShadowLocked();
+    if (ours && fPowered && revalidateAuthorityLocked(true)) {
+        fSinkMirrorEpoch = 0;
+        (void)copyShadowLocked();
+    }
     PE_Video saved = fSavedConsole;
     IOLockUnlock(fPresentLock);
     if (!ours) return pe.v_baseAddr != own;
@@ -1215,10 +1280,15 @@ IOReturn NMIntelFB::present(NMIntelPresentRequest *q)
         result = kIOReturnVMError;
 #endif
     if (result == kIOReturnSuccess) {
-        if (!nm_intelfb_copy_final(request.sourceKva, request.sourceBytes, request.pitch,
+        int mv = (fSinkMirror && fSinkMirrorEpoch == fPresentState.epoch) ? 1 : 0;
+        if (!nm_intelfb_copy_final_diff(request.sourceKva, request.sourceBytes, request.pitch,
                 fShadowBuffer->getBytesNoCopy(), fFrameBytes, sink, fFrameBytes,
-                fWidth, fHeight, fRowBytes)) result = kIOReturnOverrun;
-        else {
+                fSinkMirror, fFrameBytes, fSinkMirror ? &mv : nullptr,
+                fWidth, fHeight, fRowBytes)) {
+            fSinkMirrorEpoch = 0;
+            result = kIOReturnOverrun;
+        } else {
+            fSinkMirrorEpoch = mv ? fPresentState.epoch : 0;
             nm_intelfb_present_complete(&fPresentState, &request);
             q->completedSequence = request.completedSequence;
         }
@@ -1256,7 +1326,13 @@ void NMIntelFB::startUnwind()
     if (fBacklight) { fBacklight->terminate(kIOServiceSynchronous); fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); }
     fPwmPeriod = 0;
     const bool consoleReleased = restoreConsole();
+    uint8_t *mirror = nullptr;
+    uint64_t mirrorBytes = 0;
     if (fPresentLock) IOLockLock(fPresentLock);
+    mirror = fSinkMirror;
+    mirrorBytes = fFrameBytes;
+    fSinkMirror = nullptr;
+    fSinkMirrorEpoch = 0;
     if (consoleReleased) {
         OSSafeReleaseNULL(fShadowMemory);
         OSSafeReleaseNULL(fShadowBuffer);
@@ -1268,8 +1344,10 @@ void NMIntelFB::startUnwind()
     fRegs = nullptr;
     if (fEfiBytes) { IOFreeData(fEfiBytes, fEfiMap.bytes); fEfiBytes = nullptr; }
     if (fPresentLock) IOLockUnlock(fPresentLock);
+    if (mirror && mirrorBytes) IOFreeData(mirror, mirrorBytes);
     removeProperty("IOFBDependentID");
     removeProperty("IOFBDependentIndex");
+    removeProperty("NVRMTiming");
 }
 
 void NMIntelFB::stop(IOService *provider)

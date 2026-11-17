@@ -131,12 +131,15 @@ jobs:
             | tee "$RUNNER_TEMP/nvaccel_build.log" || rc=1
           NVRM_PRISTINE_OGKM="$OGKM_PRISTINE" bash build/build_nvrm.sh kexts/NVRM "$OGKM_DIR" "$RUNNER_TEMP/out/nvrm" 2>&1 \
             | tee "$RUNNER_TEMP/nvrm_build.log" || rc=1
+          bash build/build_agdc.sh kexts/NVRMAGDC "$RUNNER_TEMP/out/agdc" 2>&1 \
+            | tee "$RUNNER_TEMP/nvrmagdc_build.log" || rc=1
           test "$rc" -eq 0
           test -f "$RUNNER_TEMP/out/intelfb/NMIntelFB.kext/Contents/MacOS/NMIntelFB"
           test -f "$RUNNER_TEMP/out/intelfb/NMIntelFBVirtual.kext/Contents/MacOS/NMIntelFBVirtual"
           test -f "$RUNNER_TEMP/out/accel/15/NVAccel.kext/Contents/MacOS/NVAccel"
           test -f "$RUNNER_TEMP/out/accel/26/NVAccel.kext/Contents/MacOS/NVAccel"
           test -f "$RUNNER_TEMP/out/nvrm/NVRM.kext/Contents/MacOS/NVRM"
+          test -f "$RUNNER_TEMP/out/agdc/NVRMAGDC.kext/Contents/MacOS/NVRMAGDC"
 
       - name: Verify libraries, Info.plists, Mach-O UUIDs, ABI & instruction contracts
         run: |
@@ -146,10 +149,11 @@ jobs:
           ACC15="$RUNNER_TEMP/out/accel/15/NVAccel.kext"
           ACC26="$RUNNER_TEMP/out/accel/26/NVAccel.kext"
           NVRM="$RUNNER_TEMP/out/nvrm/NVRM.kext"
+          AGDC="$RUNNER_TEMP/out/agdc/NVRMAGDC.kext"
 
-          bash build/check_kext_libraries.sh "$INT" "$ACC15" "$ACC26" "$NVRM" | tee "$RUNNER_TEMP/check_kext_libraries.txt"
+          bash build/check_kext_libraries.sh "$INT" "$ACC15" "$ACC26" "$NVRM" "$AGDC" | tee "$RUNNER_TEMP/check_kext_libraries.txt"
 
-          for PAIR in "NMIntelFB:$INT" "NVAccel15:$ACC15" "NVAccel26:$ACC26" "NVRM:$NVRM"; do
+          for PAIR in "NMIntelFB:$INT" "NVAccel15:$ACC15" "NVAccel26:$ACC26" "NVRM:$NVRM" "NVRMAGDC:$AGDC"; do
             label="${PAIR%%:*}"
             K="${PAIR#*:}"
             n=$(basename "$K" .kext)
@@ -182,7 +186,7 @@ jobs:
             grep -q "^#define NVRM_FLIP_ABI_VERSION 2u" kexts/NVRM/nvrm_gpuva_abi.h
             grep -q "^#define NVRM_SURFSHARE_VERSION 2u" kexts/NVRM/nvrm_surfshare_abi.h
             grep -q "^#define NVRM_SS_RM_VERSION 2u" kexts/NVRM/nvrm_surfshare_abi.h
-            echo "OK: ABI headers and version pins match stock v3.0 NVRMFB/NVRMAGDC"
+            echo "OK: ABI headers and version pins match stock v3.0 NVRMFB"
 
             echo "=== NMIntelFB instruction contract ==="
             python3 - \
@@ -203,7 +207,7 @@ jobs:
               assert INTEL_BYTES in obj_raw, f"{label}: missing Intel controller ID bytes in .o"
               assert NVIDIA_BYTES not in raw, f"{label}: stale NVIDIA shared ID bytes present"
               strs = subprocess.check_output(["strings", "-a", bin_p], text=True, errors="replace")
-              assert "IOFBDependentID" in strs and "IOFBDependentIndex" in strs
+              assert "IOFBDependentID" in strs and "IOFBDependentIndex" in strs and "NVRMTiming" in strs
               # Check instruction order on the linked kext binary (and fallback to object relocations if register-indirect 0x5d0 is folded)
               dis_b = subprocess.check_output(["xcrun", "otool", "-tV", bin_p], text=True)
               s_idx = dis_b.index("__ZN9NMIntelFB5startEP9IOService:")
@@ -229,7 +233,24 @@ jobs:
               else:
                   raise AssertionError(f"{label}: could not locate Intel identity write in NMIntelFB::start:\n{start_dis}")
               assert id_pos < fb_start_pos, f"{label}: identity set after IOFramebuffer::start ({id_pos} >= {fb_start_pos})"
-              print(f"OK {label}: Intel ID 0x4e4d494e00000001 + local 0 before IOFramebuffer::start, no stale NVIDIA ID")
+              if "publishtimingproperty" in start_low:
+                  t_pos = start_low.index("publishtimingproperty")
+              elif "nvrmtiming" in start_low:
+                  t_pos = start_low.index("nvrmtiming")
+              else:
+                  raise AssertionError(f"{label}: could not locate NVRMTiming publish before IOFramebuffer::start:\n{start_dis}")
+              assert t_pos < fb_start_pos, f"{label}: NVRMTiming set after IOFramebuffer::start ({t_pos} >= {fb_start_pos})"
+              print(f"OK {label}: Intel ID 0x4e4d494e00000001 + local 0 + NVRMTiming before IOFramebuffer::start, no stale NVIDIA ID")
+          PY
+
+            echo "=== NVRMAGDC hybrid contract ==="
+            python3 - "$AGDC/Contents/MacOS/NVRMAGDC" <<'PY'
+          import subprocess, sys
+          agdc_bin = sys.argv[1]
+          strs = subprocess.check_output(["strings", "-a", agdc_bin], text=True, errors="replace")
+          for need in ("NVRMNVDAFramebuffer", "NMIntelFB", "NMGopFB", "NVAccel", "NVAccelHead4RegistryID", "NVRMTiming"):
+              assert need in strs, f"NVRMAGDC missing string {need}"
+          print("OK NVRMAGDC: hybrid NMIntelFB/NMGopFB + NVAccel discovery and NVRMTiming K5 strings verified")
           PY
 
             echo "=== NVAccel 15 & 26 contract ==="
@@ -319,6 +340,12 @@ jobs:
             echo "=== [static-host] tools/test_gopfb_wiring.py ==="
             python3 tools/test_gopfb_wiring.py
 
+            echo "=== [static-host] tools/test_agdc_maxfb.py ==="
+            python3 tools/test_agdc_maxfb.py
+
+            echo "=== [static-host] tools/test_agdc_hybrid.py ==="
+            python3 tools/test_agdc_hybrid.py
+
             echo "=== [static-fixture] tools/test_hybrid_scripts.sh ==="
             bash tools/test_hybrid_scripts.sh
 
@@ -341,6 +368,7 @@ jobs:
           cp -R "$RUNNER_TEMP/out/accel/26/NVAccel.kext" "$STAGE/26/NVAccel.kext"
           cp -R "$RUNNER_TEMP/out/accel/15/NVAccel.kext" "$STAGE/15/NVAccel.kext"
           cp -R "$RUNNER_TEMP/out/nvrm/NVRM.kext" "$STAGE/NVRM.kext"
+          cp -R "$RUNNER_TEMP/out/agdc/NVRMAGDC.kext" "$STAGE/NVRMAGDC.kext"
 
           cp "$RUNNER_TEMP/out/intelfb/NMIntelFB.err" "$STAGE/logs/NMIntelFB.err" 2>/dev/null || true
           cp "$RUNNER_TEMP/out/intelfb/NMIntelFB.link.err" "$STAGE/logs/NMIntelFB.link.err" 2>/dev/null || true
@@ -351,10 +379,13 @@ jobs:
           cp "$RUNNER_TEMP/out/nvrm/link.err" "$STAGE/logs/nvrm_link.err"
           cp "$RUNNER_TEMP/out/nvrm/symbols.txt" "$STAGE/logs/NVRM_unstripped_symbols.txt"
           cp "$RUNNER_TEMP/out/nvrm/patch-chain.txt" "$STAGE/logs/nvrm_patch_chain.txt"
+          cp "$RUNNER_TEMP/out/agdc/cc.err" "$STAGE/logs/nvrmagdc_cc.err" 2>/dev/null || true
+          cp "$RUNNER_TEMP/out/agdc/ld.err" "$STAGE/logs/nvrmagdc_ld.err" 2>/dev/null || true
 
           cp "$RUNNER_TEMP"/toolchain.txt "$RUNNER_TEMP"/patch_chain.txt \
              "$RUNNER_TEMP"/nmintelfb_build.log "$RUNNER_TEMP"/nvaccel_build.log \
              "$RUNNER_TEMP"/nvrm_rm620.log "$RUNNER_TEMP"/nvrm_kms620.log "$RUNNER_TEMP"/nvrm_build.log \
+             "$RUNNER_TEMP"/nvrmagdc_build.log \
              "$RUNNER_TEMP"/check_kext_libraries.txt "$RUNNER_TEMP"/contract_checks.txt "$RUNNER_TEMP"/tests.txt \
              "$RUNNER_TEMP"/*_imports.txt "$RUNNER_TEMP"/*_symbols.txt "$RUNNER_TEMP"/*_uuid.txt \
              "$STAGE/logs/"
@@ -369,6 +400,8 @@ jobs:
             15/NVAccel.kext/Contents/Info.plist \
             NVRM.kext/Contents/MacOS/NVRM \
             NVRM.kext/Contents/Info.plist \
+            NVRMAGDC.kext/Contents/MacOS/NVRMAGDC \
+            NVRMAGDC.kext/Contents/Info.plist \
             > SHA256SUMS.txt && cat SHA256SUMS.txt )
 
           python3 - "$STAGE" <<'PY'
@@ -393,6 +426,7 @@ jobs:
               ("NVAccel26", "26/NVAccel.kext"),
               ("NVAccel15", "15/NVAccel.kext"),
               ("NVRM", "NVRM.kext"),
+              ("NVRMAGDC", "NVRMAGDC.kext"),
           ]:
               kdir = stage / rel
               name = kdir.stem

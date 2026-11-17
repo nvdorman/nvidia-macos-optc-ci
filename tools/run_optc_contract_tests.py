@@ -14,6 +14,7 @@ production = [
     'kexts/NVRM/NVRM.cpp', 'kexts/NVRM/os-xnu.cpp', 'kexts/NVRM/nvrm_gpuva.cpp',
     'kexts/NVRM/nvrm_owner_abi.h', 'kexts/NVRM/nvrm_devtab.h',
     'kexts/NMIntelFB/intelfb.cpp', 'kexts/NMIntelFB/intelfb_console.h',
+    'kexts/NVRMAGDC/nvrm-agdc.cpp', 'kexts/NVRMAGDC/nvrm-agdc-k5.h', 'kexts/NVRMAGDC/nvrm-agdc-hybrid.h',
     'plugin/NVMTLDevice.m', 'plugin/NVMTLObjects.m', 'plugin/NVMTLEventSync.m',
     'plugin/nvmtl_vk.c', 'nvk/nvk-macos.patch',
 ]
@@ -23,6 +24,7 @@ python_tests = [
     'test_optc_lifetime.py', 'test_optc_console.py', 'test_optc_gpuva.py',
     'test_optc_backend.py', 'test_surface_pending_lifetime.py',
     'test_surface_publication.py', 'test_surface_queue.py', 'test_optc_publication.py',
+    'test_agdc_hybrid.py',
 ]
 c_tests = [('test_optc_frame_transfer.c', 'cc', 'c11'), ('test_nvrm_devtab.cpp', 'c++', 'c++17')]
 paths = sorted(set(production + ['tools/' + n for n in python_tests] + ['tools/' + n for n, _, _ in c_tests] + ['tools/run_optc_contract_tests.py']))

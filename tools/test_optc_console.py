@@ -59,6 +59,10 @@ PRELUDE = r'''
 #include <thread>
 #include <vector>
 #include "intelfb_console.h"
+#include "nvrm-agdc-k5.h"
+
+static uint64_t gFakeMachTimeNs = 1000000000ull;
+static uint64_t mach_absolute_time(void) { return gFakeMachTimeNs; }
 
 using IOOptionBits = uint32_t;
 using IOByteCount = uint64_t;
@@ -213,6 +217,10 @@ struct NMIntelFB : IOFramebuffer {
     volatile unsigned char *fFrameBuffer = nullptr;
     uint64_t fVramMapOffset = 0;
     volatile UInt32 fRefreshPending = 1;
+    uint8_t *fSinkMirror = nullptr;
+    uint64_t fSinkMirrorEpoch = 0;
+    uint64_t fRefreshMinAbs = 50000000ull;
+    uint64_t fRefreshNextAbs = 0;
     unsigned copies = 0;
     NMIntelFB() { fixtureLock = &lock; fixtureWorkLoop = &workLoop; platform.lock = &lock; }
     IOPlatformExpert *getPlatform() { return &platform; }
@@ -578,8 +586,120 @@ static void openAndModeset() {
     fb.fShadowMemory->release(); fb.fShadowBuffer->release(); fb.fSurfMap->release();
     casePass("open_unwind_and_setup_sync");
 }
+static void diffMirrorAnd64Bit() {
+    constexpr uint32_t W = 17, H = 4, P = W * 4;
+    alignas(16) std::vector<uint32_t> src(W * H, 0x11223344u);
+    alignas(16) std::vector<uint32_t> shadow(W * H, 0u);
+    alignas(16) std::vector<uint32_t> sink(W * H, 0xdeadbeefu);
+    alignas(16) std::vector<uint32_t> mirror(W * H, 0u);
+    int mv = 0;
+    // Also test 8-byte aligned even width + pitch first:
+    constexpr uint32_t W8 = 16, P8 = W8 * 4;
+    assert(nm_intelfb_copy_final_diff(src.data(), W8 * H * 4, P8,
+        shadow.data(), W8 * H * 4, sink.data(), W8 * H * 4,
+        mirror.data(), W8 * H * 4, &mv, W8, H, P8) == 1 && mv == 1);
+    assert(sink[0] == 0x11223344u && sink[W8 * H - 1] == 0x11223344u);
+    // Sentinel in sink proves identical pixels do NOT issue stores to UC- sink when mv == 1:
+    std::fill(sink.begin(), sink.end(), 0xface0000u);
+    assert(nm_intelfb_copy_final_diff(src.data(), W8 * H * 4, P8,
+        shadow.data(), W8 * H * 4, sink.data(), W8 * H * 4,
+        mirror.data(), W8 * H * 4, &mv, W8, H, P8) == 1 && mv == 1);
+    assert(sink[0] == 0xface0000u && sink[5] == 0xface0000u);
+    // Changing one pixel updates only its aligned 64-bit pair:
+    src[5] = 0x55667788u;
+    assert(nm_intelfb_copy_final_diff(src.data(), W8 * H * 4, P8,
+        shadow.data(), W8 * H * 4, sink.data(), W8 * H * 4,
+        mirror.data(), W8 * H * 4, &mv, W8, H, P8) == 1 && mv == 1);
+    assert(sink[5] == 0x55667788u && sink[4] == 0x11223344u && sink[0] == 0xface0000u && sink[10] == 0xface0000u);
+    // Epoch reset (mv = 0) resyncs all pixels cleanly:
+    mv = 0;
+    assert(nm_intelfb_copy_final_diff(src.data(), W8 * H * 4, P8,
+        shadow.data(), W8 * H * 4, sink.data(), W8 * H * 4,
+        mirror.data(), W8 * H * 4, &mv, W8, H, P8) == 1 && mv == 1);
+    assert(sink[0] == 0x11223344u && sink[5] == 0x55667788u);
+    // Odd width fallback (17 px, trailing pixel + 4-byte pitch):
+    mv = 0;
+    std::fill(sink.begin(), sink.end(), 0u);
+    src[W * H - 1] = 0x99aabbccu;
+    assert(nm_intelfb_copy_final_diff(src.data(), W * H * 4, P,
+        shadow.data(), W * H * 4, sink.data(), W * H * 4,
+        mirror.data(), W * H * 4, &mv, W, H, P) == 1 && mv == 1);
+    assert(sink[W * H - 1] == 0x99aabbccu);
+    // Overlap between mirror and shadow/sink/source is rejected safely:
+    assert(nm_intelfb_copy_final_diff(src.data(), W8 * H * 4, P8,
+        shadow.data(), W8 * H * 4, sink.data(), W8 * H * 4,
+        sink.data(), W8 * H * 4, &mv, W8, H, P8) == 0);
+    assert(nm_intelfb_copy_final_diff(src.data(), W8 * H * 4, P8,
+        shadow.data(), W8 * H * 4, sink.data(), W8 * H * 4,
+        mirror.data(), W8 * H * 4, nullptr, W8, H, P8) == 0);
+    casePass("diff_mirror_and_64bit_transfer");
+}
+static void refreshCadenceAndLockFairness() {
+    // 240 Hz VBL = 4.167 ms; minInterval = 50 ms must hold off console refreshes between ticks.
+    assert(nm_intelfb_should_refresh(0, 1040000000ull, 1050000000ull) == 0);
+    assert(nm_intelfb_should_refresh(0, 1050000000ull, 1050000000ull) == 1);
+    // Once accelerated present() runs (sequence > 0), VBL NEVER queues console refreshFire.
+    assert(nm_intelfb_should_refresh(1, 2000000000ull, 1050000000ull) == 0);
+    // Adaptive backoff >= 4x copy duration and >= minInterval:
+    assert(nm_intelfb_refresh_gap(1000000ull, 50000000ull) == 50000000ull);
+    assert(nm_intelfb_refresh_gap(30000000ull, 50000000ull) == 120000000ull);
+
+    NMIntelFB fb;
+    fb.fShadowBuffer = new Backing(fb.fFrameBytes);
+    std::vector<uint32_t> sink(fb.fWidth * fb.fHeight, 0u);
+    std::vector<uint8_t> mirror(fb.fFrameBytes, 0u);
+    fb.fSinkMirror = mirror.data();
+    IOMemoryMap sinkMap;
+    sinkMap.address = reinterpret_cast<uintptr_t>(sink.data());
+    sinkMap.length = fb.fFrameBytes;
+    fb.fSurfMap = &sinkMap;
+    gFakeMachTimeNs = 2000000000ull;
+
+    // With sequence == 0, refreshFire copies once and advances fRefreshNextAbs by >= 50 ms.
+    fb.fRefreshPending = 1;
+    NMIntelFB::refreshFire(&fb, nullptr);
+    assert(fb.fRefreshPending == 0 && fb.fSinkMirrorEpoch == fb.fPresentState.epoch);
+    assert(fb.fRefreshNextAbs >= gFakeMachTimeNs + fb.fRefreshMinAbs);
+
+    // Once present() has activated (sequence > 0), refreshFire leaves console/sink untouched.
+    fb.fPresentState.sequence = 42;
+    static_cast<uint32_t *>(fb.fShadowBuffer->getBytesNoCopy())[0] = 0x12345678u;
+    fb.fRefreshPending = 1;
+    NMIntelFB::refreshFire(&fb, nullptr);
+    assert(fb.fRefreshPending == 0 && sink[0] == 0u);
+
+    fb.fSurfMap = nullptr;
+    sinkMap.descriptor = nullptr;
+    fb.fShadowBuffer->release();
+    casePass("refresh_cadence_and_lock_fairness");
+}
+static void nvrmTimingK5() {
+    uint32_t k5[NM_INTEL_NVRMTIMING_WORDS] = {};
+    // Predator PHN16S-71 panel: 2560x1600 @ 240 Hz
+    assert(nm_intelfb_build_nvrm_timing(2560, 1600, 2608, 2640, 2720, 1603, 1609, 1650,
+                                        1077120000ull, 240000u, 1u, 1u, k5) == 1);
+    assert(sizeof(k5) == 52 && nvk5_timing_bad(k5, sizeof k5) == 0);
+    // Broken/zeroed firmware sync registers must sanitize cleanly and still satisfy AGDC K5.
+    assert(nm_intelfb_build_nvrm_timing(2560, 1600, 0, 0, 0, 0, 0, 0, 0, 0, 1u, 1u, k5) == 1);
+    assert(nvk5_timing_bad(k5, sizeof k5) == 0);
+    // Reject zero raster.
+    assert(nm_intelfb_build_nvrm_timing(0, 1600, 0, 0, 0, 0, 0, 0, 0, 0, 1u, 1u, k5) == 0);
+    // Verify K5 consumer (nvk5_answer) accepts NMIntelFB timing for 0x921 and 0x711.
+    assert(nm_intelfb_build_nvrm_timing(2560, 1600, 2608, 2640, 2720, 1603, 1609, 1650,
+                                        1077120000ull, 240000u, 1u, 1u, k5) == 1);
+    struct NVAGDCLinkConfig link{};
+    int why = -1;
+    assert(nvk5_answer(NVK5_CMD_LINKCONFIG, &link, sizeof link, &link, sizeof link, k5, sizeof k5, &why) == NVK5_R_LINK);
+    assert(link.timing.hActive == 2560 && link.timing.vActive == 1600 && link.state == 1);
+    struct NVAGDCFBExtCap cap{};
+    cap.type = NVK5_CAP_PLANESCALER;
+    assert(nvk5_answer(NVK5_CMD_FBCAPEX, &cap, sizeof cap, &cap, sizeof cap, k5, sizeof k5, &why) == NVK5_R_CAPS);
+    assert(cap.count == 1);
+    casePass("nvrm_timing_k5_contract");
+}
 int main() {
     reservation(); translation(); mapping(); transfer(); lifecycle(); openAndModeset();
+    diffMirrorAnd64Bit(); refreshCadenceAndLockFairness(); nvrmTimingK5();
     puts("PASS: production console authority/mapping/transfer/lifecycle; host fixtures only");
 }
 '''
@@ -595,7 +715,7 @@ with tempfile.TemporaryDirectory(prefix="optc-console-") as directory:
         os.environ.get("CXX", "clang++"), "-std=c++17", "-O1", "-g", "-pthread",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
-        "-I", str(ROOT / "kexts/NMIntelFB"), str(source), "-o", str(executable),
+        "-I", str(ROOT / "kexts/NMIntelFB"), "-I", str(ROOT / "kexts/NVRMAGDC"), str(source), "-o", str(executable),
     ], check=True)
     # Apple ASan rejects detect_leaks=1; retain each toolchain's default leak support.
     subprocess.run([str(executable)], check=True,

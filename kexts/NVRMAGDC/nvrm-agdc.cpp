@@ -19,6 +19,7 @@ extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS;
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
 #include "AppleGraphicsDeviceControl_re.h"
 #include "nvrm-agdc-k5.h"
+#include "nvrm-agdc-hybrid.h"
 #pragma pack(push, 1)
 struct NVAGDCVendorInfo {
     uint32_t version;
@@ -49,7 +50,9 @@ static int    gAgdcLogged = 0;
 // Slot-table rescans done while answering 0x980 (see nvdaAgdcRescanForReply).
 static SInt64 gAgdcRescans = 0;
 
-enum { kAgdcMaxFB = 4 };
+enum { kAgdcMaxFB = NVRM_AGDC_MAX_SLOTS };
+static_assert(kAgdcMaxFB == 5, "keep in sync with NVRM_FB_MAX_HEADS (4 NVIDIA + 1 hybrid)");
+static IOLock    *gAgdcLock = nullptr;
 static IOService *gAgdcFB[kAgdcMaxFB];
 static unsigned  gAgdcNFB = 0;
 enum { kAgdcFBMapBytes = 3 + kAgdcMaxFB * 25 + 52 + 1 };
@@ -78,8 +81,22 @@ OSDefineMetaClassAndStructors(NVDADeviceControl, AppleGraphicsDeviceControl)
 
 static IOReturn nvdaK5Answer(IOService *fb, unsigned int cmd, unsigned long *in, unsigned long inSize, unsigned long *out, unsigned long *outSize)
 {
-    IOService *slot[kAgdcMaxFB]; unsigned nh = gAgdcNFB;
-    if (nh == 0 || nh > kAgdcMaxFB) { slot[0] = fb; nh = 1; } else for (unsigned i = 0; i < nh; i++) slot[i] = gAgdcFB[i];
+    IOService *slot[kAgdcMaxFB] = {};
+    unsigned nh = 0;
+    if (gAgdcLock) IOLockLock(gAgdcLock);
+    nh = gAgdcNFB;
+    if (nh == 0 || nh > kAgdcMaxFB) {
+        slot[0] = fb;
+        nh = 1;
+        if (slot[0]) slot[0]->retain();
+    } else {
+        for (unsigned i = 0; i < nh; i++) {
+            slot[i] = gAgdcFB[i];
+            if (slot[i]) slot[i]->retain();
+        }
+    }
+    if (gAgdcLock) IOLockUnlock(gAgdcLock);
+
     uint32_t t[kAgdcMaxFB][NVK5_TIMING_WORDS]; struct nvk5_head h[kAgdcMaxFB];
     for (unsigned i = 0; i < nh; i++) {
         unsigned long tBytes = 0; bool have = false;
@@ -92,13 +109,23 @@ static IOReturn nvdaK5Answer(IOService *fb, unsigned int cmd, unsigned long *in,
     int r = nvk5_answer_heads(cmd, in, inSize, out, outSize ? *outSize : 0, h, nh, &why, &idx);
     const UInt32 bit = (idx >= 0 && idx < 32) ? (1u << idx) : 0;
     if (bit) OSBitOrAtomic(bit, (volatile UInt32 *)&gAgdcK5Asked);
-    if (r == NVK5_R_LINK) { OSAddAtomic64(1, &gAgdcK5Link); OSBitOrAtomic(bit, (volatile UInt32 *)&gAgdcK5LinkMask); return kIOReturnSuccess; }
-    if (r == NVK5_R_CAPS) { OSAddAtomic64(1, &gAgdcK5Caps); OSBitOrAtomic(bit, (volatile UInt32 *)&gAgdcK5CapsMask); return kIOReturnSuccess; }
-    if (r == NVK5_R_UNSUPPORTED) return kIOReturnUnsupported;
-    if (r == NVK5_R_NOTFOUND && idx >= 0 && (unsigned)idx < nh && !slot[idx]) why = 0x30;
-    gAgdcK5Why = why; gAgdcK5LastRefusedIdx = idx;
-    if (gAgdcLogged < 40) { gAgdcLogged++; FBLOG("AGDC K5: command %#x index %d NOT answered (why %#x, %u slot(s)) [%d/40]", cmd, idx, why, nh, gAgdcLogged); }
-    return r == NVK5_R_BADARG ? kIOReturnBadArgument : kIOReturnNotFound;
+    IOReturn ret;
+    if (r == NVK5_R_LINK) {
+        OSAddAtomic64(1, &gAgdcK5Link); OSBitOrAtomic(bit, (volatile UInt32 *)&gAgdcK5LinkMask);
+        ret = kIOReturnSuccess;
+    } else if (r == NVK5_R_CAPS) {
+        OSAddAtomic64(1, &gAgdcK5Caps); OSBitOrAtomic(bit, (volatile UInt32 *)&gAgdcK5CapsMask);
+        ret = kIOReturnSuccess;
+    } else if (r == NVK5_R_UNSUPPORTED) {
+        ret = kIOReturnUnsupported;
+    } else {
+        if (r == NVK5_R_NOTFOUND && idx >= 0 && (unsigned)idx < nh && !slot[idx]) why = 0x30;
+        gAgdcK5Why = why; gAgdcK5LastRefusedIdx = idx;
+        if (gAgdcLogged < 40) { gAgdcLogged++; FBLOG("AGDC K5: command %#x index %d NOT answered (why %#x, %u slot(s)) [%d/40]", cmd, idx, why, nh, gAgdcLogged); }
+        ret = r == NVK5_R_BADARG ? kIOReturnBadArgument : kIOReturnNotFound;
+    }
+    for (unsigned i = 0; i < nh; i++) OSSafeReleaseNULL(slot[i]);
+    return ret;
 }
 
 static void nvdaAgdcScan(IOService *pci);
@@ -115,13 +142,19 @@ static void nvdaAgdcRescanForReply(IOService *pci)
     static uint64_t last = 0;
     uint64_t now = 0; clock_get_uptime(&now);
     uint64_t per = 0; nanoseconds_to_absolutetime(1000000000ull, &per);
-    if (last && now - last < per) return;
-    last = now;
+    if (gAgdcLock) IOLockLock(gAgdcLock);
+    const bool skip = (last && now - last < per);
+    if (!skip) last = now;
     const unsigned before = gAgdcNFB;
+    if (gAgdcLock) IOLockUnlock(gAgdcLock);
+    if (skip) return;
     nvdaAgdcScan(pci);
     OSAddAtomic64(1, &gAgdcRescans);
-    if (gAgdcNFB != before)
-        FBLOG("AGDC: 0x980 rescan -> %u framebuffer slot(s) (was %u)", gAgdcNFB, before);
+    if (gAgdcLock) IOLockLock(gAgdcLock);
+    const unsigned after = gAgdcNFB;
+    if (gAgdcLock) IOLockUnlock(gAgdcLock);
+    if (after != before)
+        FBLOG("AGDC: 0x980 rescan -> %u framebuffer slot(s) (was %u)", after, before);
 }
 
 IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned long *in, unsigned long inSize,
@@ -138,6 +171,7 @@ IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned 
         if (!out || !outSize || *outSize != sizeof(NVAGDCGPUCapability)) return kIOReturnBadArgument;
         nvdaAgdcRescanForReply(fPci);   // a framebuffer that started after boot has to be in this reply
         NVAGDCGPUCapability *c = (NVAGDCGPUCapability *)out; bzero(c, sizeof *c);
+        if (gAgdcLock) IOLockLock(gAgdcLock);
         unsigned n = gAgdcNFB;
         if (n == 0 || n > kAgdcMaxFB) {
             c->portMask = 1ull << 1;
@@ -148,6 +182,7 @@ IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned 
             c->countA = c->countB = c->countC = c->countD = n;
             c->maxFramebuffers = n; c->pciDevice = fPci;
         }
+        if (gAgdcLock) IOLockUnlock(gAgdcLock);
         // Boot-arg nvagdcheads=1: report the framebuffer slots that CAN exist (nvfbheads) as the maximum, not only the ones
         // started now. With one display at boot the reply said 1, and macOS then refused the framebuffer a later hot-plug
         // starts (1401 issue 146, "AGDC maxfb=1"). The framebuffer[] list and port mask still name only the started ones.
@@ -171,63 +206,235 @@ IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned 
 
 static int gAgdcState = 0; static NVDADeviceControl *gAgdc = nullptr; static thread_call_t gAgdcCall = nullptr; static int gAgdcWant = 0;
 static IOService *gAgdcFBRef = nullptr;
+static IOService *gAgdcPciRef = nullptr;
+
+static IOService *nvdaFindPciAncestor(IOService *svc)
+{
+    IOService *p = svc ? svc->getProvider() : nullptr;
+    int hops = 0;
+    while (p && !p->metaCast("IOPCIDevice") && hops++ < 8) p = p->getProvider();
+    return (p && p->metaCast("IOPCIDevice")) ? p : nullptr;
+}
+
+static bool nvdaReadU64Prop(IOService *s, const char *key, uint64_t *out)
+{
+    if (!s || !key || !out) return false;
+    OSObject *o = s->copyProperty(key);
+    OSNumber *n = OSDynamicCast(OSNumber, o);
+    const bool ok = (n != nullptr);
+    if (ok) *out = (uint64_t)n->unsigned64BitValue();
+    OSSafeReleaseNULL(o);
+    return ok;
+}
+
+static bool nvdaReadU32Prop(IOService *s, const char *key, uint32_t *out)
+{
+    if (!s || !key || !out) return false;
+    OSObject *o = s->copyProperty(key);
+    OSNumber *n = OSDynamicCast(OSNumber, o);
+    const bool ok = (n != nullptr);
+    if (ok) *out = (uint32_t)n->unsigned32BitValue();
+    OSSafeReleaseNULL(o);
+    return ok;
+}
+
+static IOService *nvdaFindNvAccelOnPci(IOService *pci, IOService **outPci)
+{
+    if (outPci) *outPci = nullptr;
+    OSDictionary *m = IOService::serviceMatching("NVAccel");
+    OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr;
+    OSSafeReleaseNULL(m);
+    if (!it) return nullptr;
+    IOService *found = nullptr;
+    OSObject *o;
+    while (!found && (o = it->getNextObject())) {
+        IOService *a = OSDynamicCast(IOService, o);
+        if (!a || a->isInactive()) continue;
+        IOService *p = nvdaFindPciAncestor(a);
+        if (!p) continue;
+        if (pci && p != pci) continue;
+        a->retain();
+        found = a;
+        if (outPci) *outPci = p;
+    }
+    it->release();
+    return found;
+}
+
 static void nvdaAgdcDropTable(void)
 {
-    unsigned n = gAgdcNFB; gAgdcNFB = 0;
-    __asm__ __volatile__("" ::: "memory");
-    for (unsigned i = 0; i < kAgdcMaxFB; i++) { IOService *f = gAgdcFB[i]; gAgdcFB[i] = nullptr; if (f) f->release(); }
+    IOService *old[kAgdcMaxFB] = {};
+    unsigned n = 0;
+    if (gAgdcLock) IOLockLock(gAgdcLock);
+    n = gAgdcNFB;
+    gAgdcNFB = 0;
+    for (unsigned i = 0; i < kAgdcMaxFB; i++) { old[i] = gAgdcFB[i]; gAgdcFB[i] = nullptr; }
     if (n) snprintf(gAgdcFBMap, sizeof gAgdcFBMap, "released (the last table had %u slot(s))", n);
+    if (gAgdcLock) IOLockUnlock(gAgdcLock);
+    for (unsigned i = 0; i < kAgdcMaxFB; i++) OSSafeReleaseNULL(old[i]);
 }
-static void nvdaAgdcDropFB(void) { if (gAgdcFBRef) { gAgdcFBRef->release(); gAgdcFBRef = nullptr; } nvdaAgdcDropTable(); }
+static void nvdaAgdcDropFB(void)
+{
+    if (gAgdcFBRef) { gAgdcFBRef->release(); gAgdcFBRef = nullptr; }
+    if (gAgdcPciRef) { gAgdcPciRef->release(); gAgdcPciRef = nullptr; }
+    nvdaAgdcDropTable();
+}
+
 static void nvdaAgdcTargets(IOService **pci, IOService **fb)
 {
     *pci = nullptr; *fb = nullptr;
-    OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer"); if (!m) return;
-    IOService *f = IOService::copyMatchingService(m); m->release(); if (!f) return;
-    IOService *p = f->getProvider(); int hops = 0;
-    while (p && !p->metaCast("IOPCIDevice") && hops++ < 8) p = p->getProvider();
-    if (!p || !p->metaCast("IOPCIDevice")) { f->release(); return; }
-    gAgdcFBRef = f; *fb = f; *pci = p;
+    if (gAgdcFBRef) { gAgdcFBRef->release(); gAgdcFBRef = nullptr; }
+    if (gAgdcPciRef) { gAgdcPciRef->release(); gAgdcPciRef = nullptr; }
+    OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer");
+    if (m) {
+        IOService *f = IOService::copyMatchingService(m);
+        m->release();
+        if (f) {
+            IOService *p = nvdaFindPciAncestor(f);
+            if (p) {
+                p->retain();
+                gAgdcPciRef = p; gAgdcFBRef = f; *fb = f; *pci = p;
+                return;
+            }
+            f->release();
+        }
+    }
+    IOService *p = nullptr;
+    IOService *accel = nvdaFindNvAccelOnPci(nullptr, &p);
+    if (!accel || !p) { OSSafeReleaseNULL(accel); return; }
+    uint64_t head4RegId = 0;
+    (void)nvdaReadU64Prop(accel, "NVAccelHead4RegistryID", &head4RegId);
+    IOService *winner = nullptr;
+    const char *classes[] = { "NMIntelFB", "NMGopFB" };
+    for (unsigned ci = 0; ci < 2 && !winner; ci++) {
+        OSDictionary *hm = IOService::serviceMatching(classes[ci]);
+        OSIterator *it = hm ? IOService::getMatchingServices(hm) : nullptr;
+        OSSafeReleaseNULL(hm);
+        if (!it) continue;
+        OSObject *o;
+        while ((o = it->getNextObject())) {
+            IOService *f = OSDynamicCast(IOService, o);
+            if (!f || f->isInactive()) continue;
+            const uint64_t rid = f->getRegistryEntryID();
+            uint32_t tmp = 0;
+            const int hasAccelIdx = nvdaReadU32Prop(f, "IOAccelIndex", &tmp) ? 1 : 0;
+            const int hasHybridProp = (nvdaReadU32Prop(f, "NMIntelFBHybridLevel", &tmp) || ci == 1) ? 1 : 0;
+            if (!nvrm_agdc_should_enroll_hybrid(1, head4RegId, rid, hasAccelIdx, hasHybridProp)) continue;
+            f->retain();
+            winner = f;
+            break;
+        }
+        it->release();
+    }
+    if (winner) {
+        p->retain();
+        gAgdcPciRef = p; gAgdcFBRef = winner;
+        *fb = winner; *pci = p;
+        FBLOG("AGDC: hybrid target %s (%#llx) paired with %s (%s)",
+              winner->getName(), (unsigned long long)winner->getRegistryEntryID(),
+              p->getName(), head4RegId ? "head4" : "accel");
+    }
+    accel->release();
 }
 
 static int gAgdcScanLogged = 0;
 #define SCANLOG(fmt, ...) do { if (gAgdcScanLogged < 8) { gAgdcScanLogged++; FBLOG("AGDC scan: " fmt " [%d/8]", ##__VA_ARGS__, gAgdcScanLogged); } } while (0)
 static void nvdaAgdcScan(IOService *pci)
 {
-    nvdaAgdcDropTable(); gAgdcScanLogged = 0;
-    IOService *tab[kAgdcMaxFB] = {}; unsigned seen = 0, noidx = 0, range = 0, dup = 0, other = 0, hole = 0;
-    OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer");
-    OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr; OSSafeReleaseNULL(m);
-    if (!it) { snprintf(gAgdcFBMap, sizeof gAgdcFBMap, "n=0 (no iterator: the earlier one-head reply)"); FBLOG("AGDC: slot table %s", gAgdcFBMap); return; }
-    OSObject *o;
-    while (seen < 16 && (o = it->getNextObject())) {
-        seen++;
-        IOService *f = OSDynamicCast(IOService, o); if (!f) continue;
-        unsigned long long rid = f->getRegistryEntryID();
-        IOService *p = f->getProvider(); int hops = 0;
-        while (p && !p->metaCast("IOPCIDevice") && hops++ < 8) p = p->getProvider();
-        if (p != pci) { other++; SCANLOG("framebuffer id %#llx is under another PCI device: not ours to report", rid); continue; }
-        OSObject *io = f->copyProperty("IOFBDependentIndex"); OSNumber *num = OSDynamicCast(OSNumber, io);
-        long long ix = num ? (long long)num->unsigned32BitValue() : -1; OSSafeReleaseNULL(io);
-        if (ix < 0) { noidx++; SCANLOG("framebuffer id %#llx has no IOFBDependentIndex number: left out", rid); continue; }
-        if (ix >= kAgdcMaxFB) { range++; SCANLOG("framebuffer id %#llx IOFBDependentIndex %lld >= %d: left out", rid, ix, (int)kAgdcMaxFB); continue; }
-        if (tab[ix]) { dup++; SCANLOG("IOFBDependentIndex %lld claimed twice: id %#llx kept, id %#llx left out", ix, (unsigned long long)tab[ix]->getRegistryEntryID(), rid); continue; }
-        f->retain(); tab[ix] = f;
+    gAgdcScanLogged = 0;
+    IOService *accel = nvdaFindNvAccelOnPci(pci, nullptr);
+    uint64_t head4RegId = 0; uint32_t head4Dense = 0;
+    int hasHead4Dense = 0;
+    if (accel) {
+        (void)nvdaReadU64Prop(accel, "NVAccelHead4RegistryID", &head4RegId);
+        hasHead4Dense = nvdaReadU32Prop(accel, "NVAccelHead4DensePipeIndex", &head4Dense) ? 1 : 0;
     }
-    it->release();
-    unsigned n = 0; while (n < kAgdcMaxFB && tab[n]) n++;
-    for (unsigned i = n; i < kAgdcMaxFB; i++) if (tab[i]) {
-        hole++; SCANLOG("slot %u (id %#llx) sits beyond a hole at slot %u: left out", i, (unsigned long long)tab[i]->getRegistryEntryID(), n);
-        tab[i]->release(); tab[i] = nullptr;
+
+    struct nvrm_agdc_candidate cands[NVRM_AGDC_MAX_CANDIDATES];
+    bzero(cands, sizeof cands);
+    IOService *refs[NVRM_AGDC_MAX_CANDIDATES] = {};
+    unsigned ncands = 0, seen = 0, other = 0;
+
+    const char *classes[3] = { "NVRMNVDAFramebuffer", "NMIntelFB", "NMGopFB" };
+    const unsigned nclasses = accel ? 3u : 1u;
+    for (unsigned ci = 0; ci < nclasses && seen < NVRM_AGDC_MAX_CANDIDATES; ci++) {
+        OSDictionary *m = IOService::serviceMatching(classes[ci]);
+        OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr;
+        OSSafeReleaseNULL(m);
+        if (!it) continue;
+        OSObject *o;
+        while (seen < NVRM_AGDC_MAX_CANDIDATES && (o = it->getNextObject())) {
+            seen++;
+            IOService *f = OSDynamicCast(IOService, o);
+            if (!f || f->isInactive()) continue;
+            const uint64_t rid = f->getRegistryEntryID();
+            uint32_t accelIdx = 0, depIdx = 0, hyLv = 0;
+            const int hasAccelIdx = nvdaReadU32Prop(f, "IOAccelIndex", &accelIdx) ? 1 : 0;
+            const int hasDepIdx = nvdaReadU32Prop(f, "IOFBDependentIndex", &depIdx) ? 1 : 0;
+            if (ci == 0) {
+                if (nvdaFindPciAncestor(f) != pci) {
+                    other++;
+                    SCANLOG("framebuffer id %#llx is under another PCI device: not ours to report", (unsigned long long)rid);
+                    continue;
+                }
+                cands[ncands].kind = NVRM_AGDC_FB_NATIVE;
+            } else {
+                const int hasHybridProp = (nvdaReadU32Prop(f, "NMIntelFBHybridLevel", &hyLv) || ci == 2) ? 1 : 0;
+                if (!nvrm_agdc_should_enroll_hybrid(1, head4RegId, rid, hasAccelIdx, hasHybridProp)) {
+                    other++;
+                    SCANLOG("hybrid framebuffer id %#llx does not match PCI %s: left out", (unsigned long long)rid, pci ? pci->getName() : "(null)");
+                    continue;
+                }
+                cands[ncands].kind = NVRM_AGDC_FB_HYBRID;
+                cands[ncands].matches_head4 = (head4RegId && rid == head4RegId) ? 1 : 0;
+                cands[ncands].has_head4_dense = (cands[ncands].matches_head4 && hasHead4Dense) ? 1 : 0;
+                cands[ncands].head4_dense = head4Dense;
+            }
+            cands[ncands].registry_id = rid;
+            cands[ncands].has_accel_index = hasAccelIdx;
+            cands[ncands].accel_index = accelIdx;
+            cands[ncands].has_dep_index = hasDepIdx;
+            cands[ncands].dep_index = depIdx;
+            f->retain();
+            refs[ncands] = f;
+            ncands++;
+        }
+        it->release();
     }
-    for (unsigned i = 0; i < n; i++) gAgdcFB[i] = tab[i];
-    gAgdcNFB = n;
-    int w = snprintf(gAgdcFBMap, sizeof gAgdcFBMap, "n=%u", n);
-    for (unsigned i = 0; i < n && w > 0 && (unsigned)w < sizeof gAgdcFBMap; i++)
-        w += snprintf(gAgdcFBMap + w, sizeof gAgdcFBMap - (size_t)w, " [%u]id %#llx", i, (unsigned long long)gAgdcFB[i]->getRegistryEntryID());
-    if (w > 0 && (unsigned)w < sizeof gAgdcFBMap && (noidx | range | dup | other | hole))
-        snprintf(gAgdcFBMap + w, sizeof gAgdcFBMap - (size_t)w, " (left out: noidx %u range %u dup %u gpu %u hole %u)", noidx, range, dup, other, hole);
-    FBLOG("AGDC: slot table %s (%u framebuffer node(s) seen)", gAgdcFBMap, seen);
+    OSSafeReleaseNULL(accel);
+
+    struct nvrm_agdc_plan plan;
+    nvrm_agdc_plan_slots(cands, ncands, kAgdcMaxFB, &plan);
+    IOService *tab[kAgdcMaxFB] = {};
+    for (unsigned i = 0; i < plan.count; i++) {
+        const int ci = plan.slot_candidate[i];
+        tab[i] = refs[ci];
+        tab[i]->retain();
+    }
+    for (unsigned i = 0; i < ncands; i++) OSSafeReleaseNULL(refs[i]);
+
+    char mapBuf[kAgdcFBMapBytes];
+    int w = snprintf(mapBuf, sizeof mapBuf, "n=%u", plan.count);
+    for (unsigned i = 0; i < plan.count && w > 0 && (unsigned)w < sizeof mapBuf; i++)
+        w += snprintf(mapBuf + w, sizeof mapBuf - (size_t)w, " [%u]id %#llx", i, (unsigned long long)tab[i]->getRegistryEntryID());
+    if (w > 0 && (unsigned)w < sizeof mapBuf &&
+        (plan.left_out_noidx | plan.left_out_range | plan.left_out_dup | other | plan.left_out_hole)) {
+        snprintf(mapBuf + w, sizeof mapBuf - (size_t)w,
+                 " (left out: noidx %u range %u dup %u gpu %u hole %u)",
+                 plan.left_out_noidx, plan.left_out_range, plan.left_out_dup, other, plan.left_out_hole);
+    }
+
+    IOService *old[kAgdcMaxFB] = {};
+    if (gAgdcLock) IOLockLock(gAgdcLock);
+    for (unsigned i = 0; i < kAgdcMaxFB; i++) {
+        old[i] = gAgdcFB[i];
+        gAgdcFB[i] = (i < plan.count) ? tab[i] : nullptr;
+    }
+    gAgdcNFB = plan.count;
+    strlcpy(gAgdcFBMap, mapBuf, sizeof gAgdcFBMap);
+    if (gAgdcLock) IOLockUnlock(gAgdcLock);
+    for (unsigned i = 0; i < kAgdcMaxFB; i++) OSSafeReleaseNULL(old[i]);
+    FBLOG("AGDC: slot table %s (%u framebuffer node(s) seen)", mapBuf, seen);
 }
 
 static SInt32 gAgdcBusy = 0;
@@ -316,6 +523,10 @@ bool NVDAGDCLoader::start(IOService *provider)
 {
     { if (nvrm_driver_off()) return false; }
     if (!IOService::start(provider)) return false;
+    if (!gAgdcLock) {
+        gAgdcLock = IOLockAlloc();
+        if (!gAgdcLock) { IOService::stop(provider); return false; }
+    }
     nvdaAgdcInstallSysctl(); FBLOG("loaded; idle until `sysctl debug.nvrmfb_agdc=1`"); return true;
 }
 void NVDAGDCLoader::stop(IOService *provider)
@@ -328,5 +539,6 @@ void NVDAGDCLoader::stop(IOService *provider)
         else { thread_call_free(gAgdcCall); gAgdcCall = nullptr; }
     }
     if (gAgdc && !gAgdcBusy) { gAgdcWant = 0; nvdaAgdcWorkBody(); }
+    if (!gAgdcBusy && gAgdcLock) { IOLockFree(gAgdcLock); gAgdcLock = nullptr; }
     IOService::stop(provider);
 }
