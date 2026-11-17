@@ -2064,6 +2064,7 @@ void NVDisplayPipe::destroyFramebufferResource(unsigned int index, IOAccelResour
     if (resource == fFramebufferResource) {
         fFramebufferResource = nullptr; fFramebufferInfo = {};
         fFramebufferPhase = NVFramebufferPhase::Empty;
+        dropHostFrameBuffer();
     }
 }
 void NVDisplayPipe::displayModeWillChange()
@@ -2203,30 +2204,63 @@ void NVDisplayPipe::iopDropSources()
     }
 }
 
+void NVDisplayPipe::dropHostFrameBuffer()
+{
+    fHostFrameKva = nullptr;
+    fHostFrameBytes = 0;
+    if (fHostFrameBuffer) { fHostFrameBuffer->release(); fHostFrameBuffer = nullptr; }
+}
+
+bool NVDisplayPipe::ensureHostFrameBuffer(uint64_t bytes)
+{
+    if (!bytes) return false;
+    if (fHostFrameBuffer && fHostFrameBytes >= bytes && fHostFrameKva) return true;
+    dropHostFrameBuffer();
+    IOBufferMemoryDescriptor *buf = IOBufferMemoryDescriptor::inTaskWithOptions(
+        kernel_task, kIODirectionInOut, (mach_vm_size_t)bytes, PAGE_SIZE);
+    if (!buf) return false;
+    void *kva = buf->getBytesNoCopy();
+    if (!kva || buf->getLength() < bytes) { buf->release(); return false; }
+    fHostFrameBuffer = buf;
+    fHostFrameKva = kva;
+    fHostFrameBytes = buf->getLength();
+    return true;
+}
+
 void NVDisplayPipe::free()
 {
     if (fFramebufferResource) displayModeWillChange();
     iopDropSources();
+    dropHostFrameBuffer();
     IOLock *lock = fTransactionLock; fTransactionLock = nullptr;
     if (lock) IOLockFree(lock);
     IOAccelLegacyDisplayPipe::free();
 }
 
-const void *NVDisplayPipe::iopMapSurface(unsigned id, IOMemoryDescriptor *md, unsigned long long need)
+const void *NVDisplayPipe::iopMapSurface(unsigned id, IOMemoryDescriptor *md, unsigned long long need, bool *cached)
 {
+    if (cached) *cached = false;
     for (unsigned i = 0; i < kIopSrcSlots; i++)
-        if (fIopSrc[i].md == md && fIopSrc[i].id == id && fIopSrc[i].map)
-            return (fIopSrc[i].map->getLength() >= need) ? (const void *)fIopSrc[i].map->getVirtualAddress() : nullptr;
+        if (fIopSrc[i].md == md && fIopSrc[i].id == id && fIopSrc[i].map) {
+            if (fIopSrc[i].map->getLength() < need) return nullptr;
+            if (cached) *cached = fIopSrc[i].cached;
+            return (const void *)fIopSrc[i].map->getVirtualAddress();
+        }
     if (md->getLength() < need) return nullptr;
     NVIopSrc *e = &fIopSrc[fIopNext % kIopSrcSlots]; fIopNext++;
     if (e->map) { e->map->release(); e->map = nullptr; }
     if (e->md)  { e->md->complete(); e->md->release(); e->md = nullptr; }
-    e->id = 0;
+    e->id = 0; e->cached = false;
     if (md->prepare() != kIOReturnSuccess) return nullptr;
     IOMemoryMap *m = md->map(kIOMapReadOnly);
     if (!m) { md->complete(); return nullptr; }
     md->retain(); e->md = md; e->map = m; e->id = id;
-    NVIOPLOG("mapped source surface 0x%x (%llu bytes) into slot %u", id, (unsigned long long)m->getLength(), (fIopNext - 1) % kIopSrcSlots);
+    const uint32_t c = (uint32_t)(m->getMapOptions() & kIOMapCacheMask);
+    e->cached = (c != kIOMapInhibitCache && c != kIOMapWriteCombineCache);
+    if (cached) *cached = e->cached;
+    NVIOPLOG("mapped source surface 0x%x (%llu bytes) into slot %u (cached=%d opts=0x%x)",
+             id, (unsigned long long)m->getLength(), (fIopNext - 1) % kIopSrcSlots,
+             e->cached ? 1 : 0, (unsigned)m->getMapOptions());
     return (const void *)m->getVirtualAddress();
 }
 
@@ -2377,7 +2411,9 @@ struct NVFinalTransfer {
     NVResource *resource;
     NVVramAllocation *allocation;
     nv_frame_span source;
+    nv_frame_span hostStage;
     uint64_t sequence;
+    bool sourceCached;
 };
 static IOReturn nvPopulateAndPresentFinal(void *context)
 {
@@ -2411,7 +2447,12 @@ static IOReturn nvPopulateAndPresentFinal(void *context)
         nvResPitch((const unsigned char *)x->resource) != info.pitch) return kIOReturnOverrun;
     nv_frame_span target = { (const void *)(uintptr_t)address, map->getLength(), info.width, info.height, info.pitch, NV_IOP_FMT_BGRA };
     if (target.capacity > x->allocation->fReceipt.actualSize) target.capacity = x->allocation->fReceipt.actualSize;
-    if (nv_frame_populate(&x->source, &target) != NV_FRAME_OK) return kIOReturnOverrun;
+    nv_frame_span presentSource = x->source;
+    if (!x->sourceCached || x->source.format != NV_IOP_FMT_BGRA) {
+        if (!x->hostStage.address || nv_frame_populate(&x->source, &x->hostStage) != NV_FRAME_OK) return kIOReturnOverrun;
+        presentSource = x->hostStage;
+    }
+    if (nv_frame_populate(&presentSource, &target) != NV_FRAME_OK) return kIOReturnOverrun;
     nv_frame_store_drain();
     const NVBackingKey key = x->allocation->key();
     x->resource->fCpuPublicationKey = key; x->resource->fCpuPublication = x->sequence;
@@ -2420,8 +2461,8 @@ static IOReturn nvPopulateAndPresentFinal(void *context)
         q.version = NM_INTEL_FB_ABI_VERSION; q.structSize = sizeof(q);
         q.framebufferRegistryID = info.framebufferRegistryID; q.epoch = info.epoch;
         q.sourceOwnerGeneration = key.ownerGeneration; q.sourceAllocationCookie = key.allocationGeneration;
-        q.sequence = x->sequence; q.sourceKva = target.address; q.sourceBytes = target.capacity;
-        q.width = target.width; q.height = target.height; q.pitch = target.pitch; q.format = target.format;
+        q.sequence = x->sequence; q.sourceKva = presentSource.address; q.sourceBytes = presentSource.capacity;
+        q.width = presentSource.width; q.height = presentSource.height; q.pitch = presentSource.pitch; q.format = presentSource.format;
         const OSSymbol *symbol = OSSymbol::withCStringNoCopy(NM_INTEL_FB_PRESENT_FN);
         IOReturn result = symbol ? x->framebuffer->callPlatformFunction(symbol, false, &q, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
         if (symbol) symbol->release();
@@ -2439,15 +2480,25 @@ static IOReturn nvPopulateAndPresentFinal(void *context)
         if (scanout.flags & NVRM_VRAM_SCANOUT_30BIT) {
             for (unsigned y = 0; y < sink.height; ++y)
                 (void)nv_iop_convert_row((volatile unsigned *)((unsigned char *)scanout.kva + (size_t)y * sink.pitch),
-                    (const volatile unsigned *)((const unsigned char *)target.address + (size_t)y * target.pitch), sink.width, NV_IOP_FMT_BGRA, 1);
-        } else if (nv_frame_populate(&target, &sink) != NV_FRAME_OK) return kIOReturnOverrun;
+                    (const volatile unsigned *)((const unsigned char *)presentSource.address + (size_t)y * presentSource.pitch), sink.width, NV_IOP_FMT_BGRA, 1);
+        } else if (nv_frame_populate(&presentSource, &sink) != NV_FRAME_OK) return kIOReturnOverrun;
         nv_frame_store_drain();
     }
     return kIOReturnSuccess;
 }
-IOReturn NVDisplayPipe::presentFinal(IOService *fb, const nv_frame_span &source)
+IOReturn NVDisplayPipe::presentFinal(IOService *fb, const nv_frame_span &source, bool sourceCached)
 {
-    if (!fAccel || fAccel->fStopping || !nvFamLock(fAccel, true)) return kIOReturnNotReady;
+    if (!fAccel || fAccel->fStopping) return kIOReturnNotReady;
+    nv_frame_span hostStage = {};
+    if (!sourceCached || source.format != NV_IOP_FMT_BGRA) {
+        if (!source.width || !source.height || source.width > 16384u || source.height > 16384u) return kIOReturnOverrun;
+        const uint64_t hostPitch = ((uint64_t)source.width * 4u + 7ull) & ~7ull;
+        if (hostPitch > UINT32_MAX || hostPitch > UINT64_MAX / source.height) return kIOReturnOverrun;
+        const uint64_t hostBytes = hostPitch * source.height;
+        if (!ensureHostFrameBuffer(hostBytes)) return kIOReturnNoMemory;
+        hostStage = { fHostFrameKva, hostBytes, source.width, source.height, (uint32_t)hostPitch, NV_IOP_FMT_BGRA };
+    }
+    if (!nvFamLock(fAccel, true)) return kIOReturnNotReady;
     IOReturn result = kIOReturnNotReady;
     NVVramLease lease;
     NVResource *r = fFramebufferResource;
@@ -2455,7 +2506,7 @@ IOReturn NVDisplayPipe::presentFinal(IOService *fb, const nv_frame_span &source)
     if (fFramebufferPhase == NVFramebufferPhase::Ready && m && m->fBacking &&
         m->fBacking->acquire(NVLeaseUse::Present, &lease)) {
         IOLockLock(fTransactionLock); const uint64_t sequence = fTransaction.sequence; IOLockUnlock(fTransactionLock);
-        NVFinalTransfer x = { this, fb, r, lease.get(), source, sequence };
+        NVFinalTransfer x = { this, fb, r, lease.get(), source, hostStage, sequence, sourceCached };
         result = m->fOwner->cpuAccess(nvPopulateAndPresentFinal, &x);
         IOLockLock(fTransactionLock);
         if (fTransaction.sequence == sequence) fTransaction.key = lease.get()->key();
@@ -2469,6 +2520,7 @@ IOReturn NVDisplayPipe::performCandidateTransaction(IOAccelDisplayPipeTransactio
     IOSurface *surface = txn->getPlaneIOSurface(0, 0);
     nv_frame_span source = {};
     NVVramLease resourceLease;
+    bool sourceCached = false;
     if (surface) {
         if (!nvSurfWaitReady(surface->getSurfaceID())) { OSAddAtomic64(1, &gCntPresentProducer); return kIOReturnTimeout; }
         if (!nvAccelSurfCopyReady(surface, head)) { OSAddAtomic64(1, &gCntPresentPublication); return kIOReturnNotReady; }
@@ -2477,7 +2529,7 @@ IOReturn NVDisplayPipe::performCandidateTransaction(IOAccelDisplayPipeTransactio
         source.width = (uint32_t)surface->getWidth(); source.height = (uint32_t)surface->getHeight();
         source.pitch = (uint32_t)surface->getBytesPerRow(); source.format = surface->getPixelFormat();
         source.capacity = md->getLength();
-        source.address = iopMapSurface(surface->getSurfaceID(), md, (uint64_t)source.pitch * source.height);
+        source.address = iopMapSurface(surface->getSurfaceID(), md, (uint64_t)source.pitch * source.height, &sourceCached);
     } else {
         if (!nvFamLock(fAccel, true)) return kIOReturnNotReady;
         NVResource *r = OSDynamicCast(NVResource, txn->getPlaneResource(0, 0));
@@ -2492,7 +2544,7 @@ IOReturn NVDisplayPipe::performCandidateTransaction(IOAccelDisplayPipeTransactio
         if (!ok) return kIOReturnUnsupported;
     }
     if (nv_frame_validate(&source) != NV_FRAME_OK) { OSAddAtomic64(1, &gCntPresentBounds); return kIOReturnOverrun; }
-    IOReturn result = presentFinal(fb, source);
+    IOReturn result = presentFinal(fb, source, sourceCached);
     if (result == kIOReturnNotReady) OSAddAtomic64(1, &gCntPresentEpoch);
     else if (result != kIOReturnSuccess) OSAddAtomic64(1, &gCntPresentCopy);
     return result;
@@ -4102,12 +4154,13 @@ static bool nvAccelCopyToScanout(IOAccelResource2 *resource)
     }
     nvFamUnlock(a);
     NVRetain holdSurface((OSObject *)surface);
+    bool sourceCached = false;
     if (surface) {
         if (!nvSurfWaitReady(surface->getSurfaceID()) || !nvAccelSurfCopyReady(surface, head)) return false;
         const uint64_t w = surface->getWidth(), h = surface->getHeight(), pitch = surface->getBytesPerRow();
         IOMemoryDescriptor *md = surface->getMemoryDescriptor();
         if (!md || w > UINT32_MAX || h > UINT32_MAX || pitch > UINT32_MAX) return false;
-        source = { pipe->iopMapSurface(surface->getSurfaceID(), md, pitch * h), md->getLength(),
+        source = { pipe->iopMapSurface(surface->getSurfaceID(), md, pitch * h, &sourceCached), md->getLength(),
             (uint32_t)w, (uint32_t)h, (uint32_t)pitch, surface->getPixelFormat() };
     }
     if (nv_frame_validate(&source) != NV_FRAME_OK) return false;
@@ -4116,7 +4169,7 @@ static bool nvAccelCopyToScanout(IOAccelResource2 *resource)
     const bool numbered = nvNextGeneration(&pipe->fNextSequence, &sequence);
     if (numbered) pipe->fTransaction.begin(nullptr, 0, sequence, pipe->fFramebufferInfo.epoch);
     IOLockUnlock(pipe->fTransactionLock);
-    return numbered && pipe->presentFinal(fb, source) == kIOReturnSuccess;
+    return numbered && pipe->presentFinal(fb, source, sourceCached) == kIOReturnSuccess;
 }
 static bool nvAccelFlipTo(IOAccelResource2 *resource)
 {

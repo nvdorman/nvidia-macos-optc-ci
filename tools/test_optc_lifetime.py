@@ -271,6 +271,7 @@ struct NVDisplayPipe : IOAccelLegacyDisplayPipe {
  NVAccel *fAccel=&accelerator;
  NVFramebufferPhase fFramebufferPhase=NVFramebufferPhase::Candidate; NVResource *fFramebufferResource=nullptr;
  NMIntelFramebufferInfo fFramebufferInfo={}; IOLock storage,*fTransactionLock=&storage; NVTransactionState fTransaction;
+ void dropHostFrameBuffer() {}
  void destroyFramebufferResource(unsigned,IOAccelResource2 *); void displayModeWillChange();
  IOReturn validateTransaction(IOAccelDisplayPipeTransaction2 *);
 };

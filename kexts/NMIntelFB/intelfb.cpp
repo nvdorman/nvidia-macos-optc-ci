@@ -226,6 +226,7 @@ class NMIntelFB : public IOFramebuffer {
     volatile UInt32 fRefreshPending = 0;
     uint8_t *fSinkMirror = nullptr;
     uint64_t fSinkMirrorEpoch = 0;
+    uintptr_t fGammaScale[3] = { 0x10000, 0x10000, 0x10000 };   // 'gslr' 'gslg' 'gslb': 1.0 in 16.16 until WindowServer sets one
     uint64_t fRefreshMinAbs = 0;
     uint64_t fRefreshNextAbs = 0;
     bool captureBootAuthority();
@@ -485,6 +486,13 @@ public:
     }
     IODeviceMemory *getVRAMRange() override { return getApertureRange(kIOFBSystemAperture); }
     IOReturn getAttribute(IOSelect attribute, uintptr_t *value) override {
+        if (attribute == kIOFBRedGammaScaleAttribute || attribute == kIOFBGreenGammaScaleAttribute ||
+            attribute == kIOFBBlueGammaScaleAttribute) {
+            const unsigned c = attribute == kIOFBRedGammaScaleAttribute ? 0 :
+                attribute == kIOFBGreenGammaScaleAttribute ? 1 : 2;
+            if (value) *value = fGammaScale[c];
+            return kIOReturnSuccess;
+        }
         if (attribute == kIOWindowServerActiveAttribute) { if (value) *value = 1; return kIOReturnSuccess; }
         return IOFramebuffer::getAttribute(attribute, value);
     }
@@ -780,15 +788,32 @@ bool NMIntelFB::prepareAperture()
 {
 #ifndef NMINTELFB_VIRTUAL
     // Pinned IOGeneralMemoryDescriptor buffer-cache field is bits 30:28.
-    // This agrees with XNU x86 initialize_screen's VM_WIMG_IO mapping.
+    // Prefer Write-Combine so full-screen redraws burst rapidly instead of serializing 2M+ UC- stores,
+    // falling back to kIOInhibitCache if firmware/PMAP rejects WC on the stolen sink.
+    constexpr IOOptionBits physicalWC = static_cast<IOOptionBits>(kIOWriteCombineCache) << 28;
     constexpr IOOptionBits physicalInhibited = static_cast<IOOptionBits>(kIOInhibitCache) << 28;
     IOAddressRange range = { fConsPhys, fRoundedBytes };
     fFirmwareMemory = IOMemoryDescriptor::withOptions(&range, 1, 0, nullptr,
-        kIOMemoryTypePhysical64 | kIODirectionInOut | kIOMemoryMapperNone | physicalInhibited);
-    if (!fFirmwareMemory) return false;
-    fSurfMap = fFirmwareMemory->map(kIOMapInhibitCache);
-    if (!fSurfMap || !fSurfMap->getVirtualAddress() || fSurfMap->getLength() < fFrameBytes ||
-        (fSurfMap->getMapOptions() & kIOMapCacheMask) != kIOMapInhibitCache) return false;
+        kIOMemoryTypePhysical64 | kIODirectionInOut | kIOMemoryMapperNone | physicalWC);
+    if (fFirmwareMemory) {
+        fSurfMap = fFirmwareMemory->map(kIOMapWriteCombineCache);
+        if (!fSurfMap || !fSurfMap->getVirtualAddress() || fSurfMap->getLength() < fFrameBytes ||
+            (fSurfMap->getMapOptions() & kIOMapCacheMask) != kIOMapWriteCombineCache) {
+            OSSafeReleaseNULL(fSurfMap);
+            OSSafeReleaseNULL(fFirmwareMemory);
+        }
+    }
+    if (!fSurfMap) {
+        fFirmwareMemory = IOMemoryDescriptor::withOptions(&range, 1, 0, nullptr,
+            kIOMemoryTypePhysical64 | kIODirectionInOut | kIOMemoryMapperNone | physicalInhibited);
+        if (!fFirmwareMemory) return false;
+        fSurfMap = fFirmwareMemory->map(kIOMapInhibitCache);
+        if (!fSurfMap || !fSurfMap->getVirtualAddress() || fSurfMap->getLength() < fFrameBytes ||
+            (fSurfMap->getMapOptions() & kIOMapCacheMask) != kIOMapInhibitCache) return false;
+    }
+    IFBLOG("sink aperture mapped %s (opts=0x%x)",
+           (fSurfMap->getMapOptions() & kIOMapCacheMask) == kIOMapWriteCombineCache ? "WC" : "UC-",
+           (unsigned)fSurfMap->getMapOptions());
 #endif
     // PAGE_SIZE alignment makes IOBufferMemoryDescriptor allocate a page-rounded
     // envelope (pinned initWithPhysicalMask), while getLength stays frameBytes.
@@ -1198,6 +1223,12 @@ IOReturn NMIntelFB::setPowerState(unsigned long ordinal, IOService *)
 
 IOReturn NMIntelFB::setAttribute(IOSelect attribute, uintptr_t value)
 {
+    if (attribute == kIOFBRedGammaScaleAttribute || attribute == kIOFBGreenGammaScaleAttribute ||
+        attribute == kIOFBBlueGammaScaleAttribute) {
+        fGammaScale[attribute == kIOFBRedGammaScaleAttribute ? 0 :
+            attribute == kIOFBGreenGammaScaleAttribute ? 1 : 2] = value;
+        return kIOReturnSuccess;
+    }
     if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
     if (attribute != kIOPowerAttribute) return IOFramebuffer::setAttribute(attribute, value);
     if (!fConsoleScanout) {

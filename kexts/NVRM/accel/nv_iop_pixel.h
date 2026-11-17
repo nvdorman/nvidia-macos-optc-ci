@@ -57,12 +57,32 @@ static inline unsigned nv_iop_unorm10_to_8(unsigned c) { return (c * 255u + 511u
  * One row of pixels from a source format into the scanout: `dst30` selects X2B10G10R10 (1) or X8R8G8B8 (0). `px` is the
  * pixel count. BGRA = 4 bytes per source pixel, l10r = 4, RGhA = 8. Returns 0, or -1 for a format it does not know.
  */
+#if defined(__clang__) || defined(__GNUC__)
+typedef unsigned long long __attribute__((__may_alias__)) nv_iop_u64_a;
+#else
+typedef unsigned long long nv_iop_u64_a;
+#endif
 static inline int nv_iop_convert_row(volatile unsigned *dp, const volatile unsigned *sp, unsigned px, unsigned srcFmt, int dst30)
 {
     unsigned i;
     if (srcFmt == NV_IOP_FMT_BGRA) {
-        if (dst30) for (i = 0; i < px; i++) dp[i] = nv_iop_bgra_to_x2b10g10r10(sp[i]);
-        else       for (i = 0; i < px; i++) dp[i] = sp[i];
+        if (dst30) {
+            for (i = 0; i < px; i++) dp[i] = nv_iop_bgra_to_x2b10g10r10(sp[i]);
+        } else {
+            i = 0;
+            if (sizeof(nv_iop_u64_a) == 8u && px >= 2u &&
+                (((unsigned long)dp & 7u) == ((unsigned long)sp & 7u))) {
+                if ((unsigned long)dp & 7u) { dp[0] = sp[0]; i = 1u; }
+                {
+                    const volatile nv_iop_u64_a *s64 = (const volatile nv_iop_u64_a *)(sp + i);
+                    volatile nv_iop_u64_a *d64 = (volatile nv_iop_u64_a *)(dp + i);
+                    const unsigned pairs = (px - i) >> 1;
+                    for (unsigned j = 0; j < pairs; j++) d64[j] = s64[j];
+                    i += pairs << 1;
+                }
+            }
+            for (; i < px; i++) dp[i] = sp[i];
+        }
     } else if (srcFmt == NV_IOP_FMT_L10R) {
         if (dst30) for (i = 0; i < px; i++) dp[i] = nv_iop_l10r_to_x2b10g10r10(sp[i]);
         else       for (i = 0; i < px; i++) dp[i] = nv_iop_l10r_to_x8r8g8b8(sp[i]);

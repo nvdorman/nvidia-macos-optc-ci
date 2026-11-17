@@ -311,7 +311,7 @@ public:
     bool fTransactionBusy = false;
     void finishTransaction(const NVTransactionState &, IOReturn);
     uint64_t fNextSequence = 0;
-    IOReturn presentFinal(IOService *, const nv_frame_span &);
+    IOReturn presentFinal(IOService *, const nv_frame_span &, bool sourceCached = false);
     IOReturn performLegacyTransaction(IOAccelDisplayPipeTransaction2 *);
     IOReturn performCandidateTransaction(IOAccelDisplayPipeTransaction2 *, IOService *, unsigned);
     IOReturn validateTransaction(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;
@@ -319,10 +319,15 @@ public:
     bool     isTransactionComplete(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;
     void     free() APPLE_KEXT_OVERRIDE;
     enum { kIopSrcSlots = 4 };
-    struct NVIopSrc { unsigned id; IOMemoryDescriptor *md; IOMemoryMap *map; } fIopSrc[kIopSrcSlots];
+    struct NVIopSrc { unsigned id; IOMemoryDescriptor *md; IOMemoryMap *map; bool cached; } fIopSrc[kIopSrcSlots];
     unsigned fIopNext;
-    const void *iopMapSurface(unsigned id, IOMemoryDescriptor *md, unsigned long long need);
+    IOBufferMemoryDescriptor *fHostFrameBuffer = nullptr;
+    void *fHostFrameKva = nullptr;
+    uint64_t fHostFrameBytes = 0;
+    const void *iopMapSurface(unsigned id, IOMemoryDescriptor *md, unsigned long long need, bool *cached = nullptr);
     void        iopDropSources();
+    bool        ensureHostFrameBuffer(uint64_t bytes);
+    void        dropHostFrameBuffer();
 };
 OSDefineMetaClassAndStructors(NVDisplayPipe, IOAccelLegacyDisplayPipe)
 class NVGLContext : public IOAccelGLContext2 {

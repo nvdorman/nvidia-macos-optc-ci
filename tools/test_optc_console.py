@@ -587,44 +587,51 @@ static void openAndModeset() {
     casePass("open_unwind_and_setup_sync");
 }
 static void diffMirrorAnd64Bit() {
-    constexpr uint32_t W = 17, H = 4, P = W * 4;
+    constexpr uint32_t W = 19, H = 4, P = W * 4;
     alignas(16) std::vector<uint32_t> src(W * H, 0x11223344u);
     alignas(16) std::vector<uint32_t> shadow(W * H, 0u);
     alignas(16) std::vector<uint32_t> sink(W * H, 0xdeadbeefu);
     alignas(16) std::vector<uint32_t> mirror(W * H, 0u);
     int mv = 0;
-    // Also test 8-byte aligned even width + pitch first:
-    constexpr uint32_t W8 = 16, P8 = W8 * 4;
+    // Also test 8-byte aligned width covering multiple 32-byte quads + trailing 8-byte pair:
+    constexpr uint32_t W8 = 18, P8 = W8 * 4;
     assert(nm_intelfb_copy_final_diff(src.data(), W8 * H * 4, P8,
         shadow.data(), W8 * H * 4, sink.data(), W8 * H * 4,
         mirror.data(), W8 * H * 4, &mv, W8, H, P8) == 1 && mv == 1);
     assert(sink[0] == 0x11223344u && sink[W8 * H - 1] == 0x11223344u);
-    // Sentinel in sink proves identical pixels do NOT issue stores to UC- sink when mv == 1:
+    assert(shadow[0] == 0x11223344u && shadow[W8 * H - 1] == 0x11223344u);
+    // Sentinels in BOTH sink AND shadow prove identical pixels do NOT issue stores to sink OR shadow when mv == 1:
     std::fill(sink.begin(), sink.end(), 0xface0000u);
+    std::fill(shadow.begin(), shadow.end(), 0xcafe0000u);
     assert(nm_intelfb_copy_final_diff(src.data(), W8 * H * 4, P8,
         shadow.data(), W8 * H * 4, sink.data(), W8 * H * 4,
         mirror.data(), W8 * H * 4, &mv, W8, H, P8) == 1 && mv == 1);
-    assert(sink[0] == 0xface0000u && sink[5] == 0xface0000u);
-    // Changing one pixel updates only its aligned 64-bit pair:
+    assert(sink[0] == 0xface0000u && sink[5] == 0xface0000u && sink[17] == 0xface0000u);
+    assert(shadow[0] == 0xcafe0000u && shadow[5] == 0xcafe0000u && shadow[17] == 0xcafe0000u);
+    // Changing one pixel in quad 0 and one in trailing pair updates ONLY those aligned 64-bit pairs in BOTH sink and shadow:
     src[5] = 0x55667788u;
+    src[17] = 0x778899aau;
     assert(nm_intelfb_copy_final_diff(src.data(), W8 * H * 4, P8,
         shadow.data(), W8 * H * 4, sink.data(), W8 * H * 4,
         mirror.data(), W8 * H * 4, &mv, W8, H, P8) == 1 && mv == 1);
-    assert(sink[5] == 0x55667788u && sink[4] == 0x11223344u && sink[0] == 0xface0000u && sink[10] == 0xface0000u);
+    assert(sink[5] == 0x55667788u && sink[4] == 0x11223344u && sink[17] == 0x778899aau && sink[16] == 0x11223344u);
+    assert(shadow[5] == 0x55667788u && shadow[4] == 0x11223344u && shadow[17] == 0x778899aau && shadow[16] == 0x11223344u);
+    assert(sink[0] == 0xface0000u && sink[10] == 0xface0000u && shadow[0] == 0xcafe0000u && shadow[10] == 0xcafe0000u);
     // Epoch reset (mv = 0) resyncs all pixels cleanly:
     mv = 0;
     assert(nm_intelfb_copy_final_diff(src.data(), W8 * H * 4, P8,
         shadow.data(), W8 * H * 4, sink.data(), W8 * H * 4,
         mirror.data(), W8 * H * 4, &mv, W8, H, P8) == 1 && mv == 1);
-    assert(sink[0] == 0x11223344u && sink[5] == 0x55667788u);
-    // Odd width fallback (17 px, trailing pixel + 4-byte pitch):
+    assert(sink[0] == 0x11223344u && sink[5] == 0x55667788u && shadow[0] == 0x11223344u && shadow[5] == 0x55667788u);
+    // Odd width fallback (19 px, trailing pixel + 4-byte pitch):
     mv = 0;
     std::fill(sink.begin(), sink.end(), 0u);
+    std::fill(shadow.begin(), shadow.end(), 0u);
     src[W * H - 1] = 0x99aabbccu;
     assert(nm_intelfb_copy_final_diff(src.data(), W * H * 4, P,
         shadow.data(), W * H * 4, sink.data(), W * H * 4,
         mirror.data(), W * H * 4, &mv, W, H, P) == 1 && mv == 1);
-    assert(sink[W * H - 1] == 0x99aabbccu);
+    assert(sink[W * H - 1] == 0x99aabbccu && shadow[W * H - 1] == 0x99aabbccu);
     // Overlap between mirror and shadow/sink/source is rejected safely:
     assert(nm_intelfb_copy_final_diff(src.data(), W8 * H * 4, P8,
         shadow.data(), W8 * H * 4, sink.data(), W8 * H * 4,
@@ -721,3 +728,18 @@ with tempfile.TemporaryDirectory(prefix="optc-console-") as directory:
     subprocess.run([str(executable)], check=True,
                    env={**os.environ, "ASAN_OPTIONS": "halt_on_error=1",
                         "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1"})
+    for need in (
+        "kIOWriteCombineCache",
+        "kIOFBRedGammaScaleAttribute",
+        "kIOFBGreenGammaScaleAttribute",
+        "kIOFBBlueGammaScaleAttribute",
+        "fGammaScale[3] = { 0x10000, 0x10000, 0x10000 }",
+    ):
+        assert need in SOURCE, f"NMIntelFB missing expected feature: {need}"
+    accel_src = (ROOT / "kexts/NVRM/accel/nvrm-accel.cpp").read_text()
+    for need in (
+        "presentSource = x->hostStage;",
+        "q.sourceKva = presentSource.address;",
+    ):
+        assert need in accel_src, f"NVAccel missing cached-host present contract: {need}"
+    assert "q.sourceKva = target.address" not in accel_src, "NMIntelFB must never read uncached BAR1 target!"

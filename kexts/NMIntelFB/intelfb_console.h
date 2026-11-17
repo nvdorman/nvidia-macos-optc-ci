@@ -339,16 +339,34 @@ static inline int nm_intelfb_copy_final_diff(const void *source, uint64_t source
             volatile nm_intelfb_u64_a *dst64 = (volatile nm_intelfb_u64_a *)dRow;
             volatile nm_intelfb_u64_a *out64 = oRow ? (volatile nm_intelfb_u64_a *)oRow : 0;
             nm_intelfb_u64_a *mir64 = mRow ? (nm_intelfb_u64_a *)mRow : 0;
-            for (uint32_t i = 0; i < pairs; ++i) {
-                const uint64_t w = src64[i];
-                if (updateShadow) dst64[i] = w;
-                if (mir64) {
+            if (mir64) {
+                uint32_t i = 0;
+                if (valid) {
+                    const uint32_t quads = pairs & ~3u;
+                    for (; i < quads; i += 4u) {
+                        const uint64_t w0 = src64[i], w1 = src64[i + 1u], w2 = src64[i + 2u], w3 = src64[i + 3u];
+                        if ((mir64[i] ^ w0) | (mir64[i + 1u] ^ w1) |
+                            (mir64[i + 2u] ^ w2) | (mir64[i + 3u] ^ w3)) {
+                            if (mir64[i] != w0) { mir64[i] = w0; if (updateShadow) dst64[i] = w0; if (out64) out64[i] = w0; }
+                            if (mir64[i + 1u] != w1) { mir64[i + 1u] = w1; if (updateShadow) dst64[i + 1u] = w1; if (out64) out64[i + 1u] = w1; }
+                            if (mir64[i + 2u] != w2) { mir64[i + 2u] = w2; if (updateShadow) dst64[i + 2u] = w2; if (out64) out64[i + 2u] = w2; }
+                            if (mir64[i + 3u] != w3) { mir64[i + 3u] = w3; if (updateShadow) dst64[i + 3u] = w3; if (out64) out64[i + 3u] = w3; }
+                        }
+                    }
+                }
+                for (; i < pairs; ++i) {
+                    const uint64_t w = src64[i];
                     if (!valid || mir64[i] != w) {
                         mir64[i] = w;
+                        if (updateShadow) dst64[i] = w;
                         if (out64) out64[i] = w;
                     }
-                } else if (out64) {
-                    out64[i] = w;
+                }
+            } else {
+                for (uint32_t i = 0; i < pairs; ++i) {
+                    const uint64_t w = src64[i];
+                    if (updateShadow) dst64[i] = w;
+                    if (out64) out64[i] = w;
                 }
             }
             x = pairs << 1;
@@ -360,14 +378,15 @@ static inline int nm_intelfb_copy_final_diff(const void *source, uint64_t source
             nm_intelfb_u32_a *mir = mRow ? (nm_intelfb_u32_a *)mRow : 0;
             for (; x < width; ++x) {
                 const uint32_t pixel = src[x];
-                if (updateShadow) dst[x] = pixel;
                 if (mir) {
                     if (!valid || mir[x] != pixel) {
                         mir[x] = pixel;
+                        if (updateShadow) dst[x] = pixel;
                         if (out) out[x] = pixel;
                     }
-                } else if (out) {
-                    out[x] = pixel;
+                } else {
+                    if (updateShadow) dst[x] = pixel;
+                    if (out) out[x] = pixel;
                 }
             }
         }

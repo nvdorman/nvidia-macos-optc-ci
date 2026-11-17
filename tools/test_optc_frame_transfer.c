@@ -10,9 +10,9 @@ static void passed(const char *id) { printf("OPTC_CASE {\"id\":\"%s\",\"result\"
 int main(void)
 {
     const size_t size = 16384000;
-    uint32_t *source = malloc(size), *target = malloc(size + 8), *panel = malloc(size);
+    uint32_t *source = malloc(size + 8), *target = malloc(size + 16), *panel = malloc(size);
     assert(source && target && panel);
-    for (size_t i = 0; i < size / 4; ++i) source[i] = 0xff000000u | (uint32_t)i;
+    for (size_t i = 0; i < (size + 8) / 4; ++i) source[i] = 0xff000000u | (uint32_t)i;
     struct nv_frame_span src = { source, size, 2560, 1600, 10240, NV_IOP_FMT_BGRA };
     struct nv_frame_span dst = { target + 1, size, 2560, 1600, 10240, NV_IOP_FMT_BGRA };
     struct nv_frame_span sink = { panel, size, 2560, 1600, 10240, NV_IOP_FMT_BGRA };
@@ -24,6 +24,22 @@ int main(void)
     assert(!memcmp(dst.address, panel, size));
     assert(memcmp(source, panel, size));
     passed("final_target_dataflow");
+    /* Exercise both 8-byte aligned fast path and shared-4-mod-8 leading/trailing pixel fixup. */
+    for (size_t i = 0; i < (size + 8) / 4; ++i) source[i] = 0xaa000000u ^ (uint32_t)i;
+    struct nv_frame_span alignedDst = { target + 2, size, 2560, 1600, 10240, NV_IOP_FMT_BGRA };
+    target[1] = 0x11223344; target[size / 4 + 2] = 0x55667788;
+    assert(nv_frame_populate(&src, &alignedDst) == NV_FRAME_OK);
+    assert(!memcmp(source, target + 2, size));
+    assert(target[1] == 0x11223344 && target[size / 4 + 2] == 0x55667788);
+    struct nv_frame_span oddSrc = { source + 1, 2559u * 4u, 2559, 1, 2559u * 4u, NV_IOP_FMT_BGRA };
+    struct nv_frame_span oddDst = { target + 1, 2559u * 4u, 2559, 1, 2559u * 4u, NV_IOP_FMT_BGRA };
+    target[0] = 0xdeadbeefu; target[1 + 2559] = 0xcafebabeu;
+    assert(nv_frame_populate(&oddSrc, &oddDst) == NV_FRAME_OK);
+    assert(!memcmp(source + 1, target + 1, 2559u * 4u));
+    assert(target[0] == 0xdeadbeefu && target[1 + 2559] == 0xcafebabeu);
+    passed("bgra_64bit_alignment");
+    target[size / 4 + 1] = 0x89abcdef;
+    target[0] = 0x12345678;
     memset((void *)dst.address, 0x5a, size);
     dst.capacity = size - 1;
     assert(nv_frame_populate(&src, &dst) == NV_FRAME_BOUNDS);
